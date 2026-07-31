@@ -276,84 +276,111 @@ class TestBankTransactionRule(ERPNextTestSuite, AccountsTestMixin):
 					doc.insert()
 
 	# --- _run_rule_evaluation ---
-	# TC2: rule-based auto-match. These are the only backend tests covering the rule
-	# engine stamping a suggested match onto an unreconciled bank transaction, which is
-	# what the reconciliation workbench renders as its suggestion.
 
-	def _insert_submitted_transaction(self, description, deposit=500.0):
-		"""Insert AND submit a Bank Transaction that ``_run_rule_evaluation`` will pick up.
+	def test_run_rule_evaluation_stamps_matched_rule(self):
+		"""A submitted, unreconciled transaction is stamped with the rule that matches it.
 
-		The evaluator selects on ``{"status": "Unreconciled", "docstatus": 1}`` and both
-		halves of that filter need care:
-
-		* ``status`` defaults to "Pending"; only ``before_submit`` -> ``set_status``
-		  promotes it, so the document must be submitted and not merely inserted.
-		* ``set_status`` derives the status from ``unallocated_amount``, so a zero-amount
-		  transaction would land on "Reconciled" and be skipped. The deposit must stay
-		  non-zero, which ``evaluate_rule`` also relies on as the transaction amount.
-
-		``currency`` cannot simply be left out: it has no DocType default but the session
-		default currency is applied on insert, which need not match the bank account and
-		would trip ``validate_currency``. It is therefore resolved through exactly the
-		lookup that validator uses - the bank GL account's own ``account_currency`` - so
-		the two can never disagree.
-
-		``company`` is omitted on purpose: it is read-only and fetched from
-		``bank_account.company``, and that fetch is what makes the company check in
-		``evaluate_rule`` succeed.
+		This and the priority test below are the only backend coverage of the rule engine
+		stamping a suggested match onto an unreconciled bank transaction, which is what the
+		reconciliation workbench renders as its suggestion.
 		"""
-		doc = frappe.get_doc(
+		# The token is regenerated on every run and appears in both the rule condition and the
+		# description. The evaluator loads every rule on the site, with no company filter, so
+		# this is what keeps the transaction matchable by this test's rule alone.
+		token = f"btr-match-{frappe.generate_hash(length=8)}"
+		rule = self._rule("auto_match", [{"check": "Contains", "value": token}], priority=11)
+		rule.insert()
+
+		transaction = frappe.get_doc(
 			{
 				"doctype": "Bank Transaction",
 				"date": "2026-01-15",
-				"deposit": deposit,
-				"description": description,
-				"bank_account": self.bank_account,
+				"description": f"NEFT CR REF {token} settled",
+				# set_status() derives the status from unallocated_amount, so a zero-amount
+				# transaction would submit as "Reconciled" and be filtered out. evaluate_rule
+				# also reads this as the transaction amount.
+				"deposit": 250,
+				# insert() back-fills an unset currency from the session defaults, which need not
+				# be the bank account's currency - validate_currency then rejects the save. It is
+				# resolved through exactly the lookup that validator uses, the bank GL account's
+				# own account_currency, so the two can never disagree.
 				"currency": frappe.get_cached_value("Account", self.bank, "account_currency"),
+				# company is omitted on purpose: it is read-only and fetched from bank_account,
+				# and that fetch is what makes the company check in evaluate_rule succeed.
+				"bank_account": self.bank_account,
 			}
 		).insert()
-		doc.submit()
-		return doc
+		# status defaults to "Pending"; only before_submit -> set_status promotes it to
+		# "Unreconciled", so the document has to be submitted and not merely inserted.
+		transaction.submit()
 
-	def test_run_rule_evaluation_stamps_matched_rule(self):
-		# The hashed token keeps the transaction matchable by this test's rules alone:
-		# the evaluator loads every rule on the site, with no company filter.
-		token = f"btr-match-{frappe.generate_hash(length=8)}"
-		rule = self._rule("auto_match", [{"check": "Contains", "value": token}], priority=1)
-		rule.insert()
-		transaction = self._insert_submitted_transaction(f"Card payout {token} settled")
+		# Assert the filters the evaluator selects on, so a green run below cannot be vacuous.
+		self.assertEqual(transaction.docstatus, 1)
+		self.assertEqual(transaction.status, "Unreconciled")
+		self.assertEqual(transaction.company, self.company)
+		self.assertEqual(transaction.is_rule_evaluated, 0)
 
-		# The whitelisted run_rule_evaluation only enqueues a background job, so the
-		# private synchronous entry point is the one that can be asserted on inline.
+		# The whitelisted run_rule_evaluation() only checks a permission and then enqueues a
+		# background job, so the private synchronous entry point is the one a test can assert on.
 		_run_rule_evaluation()
 
-		# The evaluator writes through frappe.db.set_value and never updates the
-		# in-memory document, so both fields have to be re-read from the database.
-		matched_rule, is_rule_evaluated = frappe.db.get_value(
-			"Bank Transaction", transaction.name, ["matched_transaction_rule", "is_rule_evaluated"]
+		# The evaluator writes through frappe.db.set_value and never updates the in-memory
+		# document, so both fields have to be re-read from the database.
+		evaluated = frappe.db.get_value(
+			"Bank Transaction",
+			transaction.name,
+			["matched_transaction_rule", "is_rule_evaluated"],
+			as_dict=True,
 		)
-		self.assertEqual(matched_rule, rule.name)
+		self.assertEqual(evaluated.matched_transaction_rule, rule.name)
 		# is_rule_evaluated is a Check (smallint) column - compare against 1, not True.
-		self.assertEqual(is_rule_evaluated, 1)
+		self.assertEqual(evaluated.is_rule_evaluated, 1)
 
 	def test_run_rule_evaluation_lower_priority_number_wins(self):
+		"""Of two matching rules, the one with the lower priority number is the one stamped."""
 		token = f"btr-priority-{frappe.generate_hash(length=8)}"
-		# Both rules match the same transaction and the insertion order is deliberately
-		# INVERTED against priority: the higher priority number is inserted first. The
-		# evaluator orders rules by "priority asc" and breaks on the first match, so only
-		# a genuinely priority-ordered evaluation can stamp the second-inserted rule.
-		# Inserting the lower number first - or leaving priority to before_insert, which
-		# back-fills it in insertion order - would make the assertion hold under plain
-		# creation ordering too, and prove nothing. Keep the inversion.
-		ignored_rule = self._rule("prio_high", [{"check": "Contains", "value": token}], priority=9)
-		ignored_rule.insert()
-		winning_rule = self._rule("prio_low", [{"check": "Contains", "value": token}], priority=1)
-		winning_rule.insert()
-		transaction = self._insert_submitted_transaction(f"Retail {token} debit")
+		# Both rules match the same transaction and the insertion order is deliberately INVERTED
+		# against priority: the higher priority number is inserted FIRST. The evaluator orders
+		# rules by "priority asc" and breaks on the first match, so only a genuinely
+		# priority-ordered evaluation can stamp the second-inserted rule. Inserting the lower
+		# number first - or leaving priority to before_insert, which back-fills it in insertion
+		# order - would make the assertion below hold under plain creation ordering too, and
+		# prove nothing. Do not "tidy" the inversion away.
+		runner_up = self._rule("prio_high", [{"check": "Contains", "value": token}], priority=91)
+		runner_up.insert()
+		winner = self._rule("prio_low", [{"check": "Contains", "value": token}], priority=21)
+		winner.insert()
+		self.assertLess(winner.priority, runner_up.priority)
+
+		transaction = frappe.get_doc(
+			{
+				"doctype": "Bank Transaction",
+				"date": "2026-01-15",
+				"description": f"ACH DR REF {token} debit",
+				"withdrawal": 175,
+				"currency": frappe.get_cached_value("Account", self.bank, "account_currency"),
+				"bank_account": self.bank_account,
+			}
+		).insert()
+		transaction.submit()
+
+		# Guard this fixture's eligibility too: the evaluator only looks at submitted,
+		# "Unreconciled", not-yet-evaluated transactions.
+		self.assertEqual(transaction.docstatus, 1)
+		self.assertEqual(transaction.status, "Unreconciled")
+		self.assertEqual(transaction.is_rule_evaluated, 0)
+		# Both rules match on their own, so only the priority order can decide which is stamped.
+		self.assertTrue(runner_up.evaluate_rule(transaction))
+		self.assertTrue(winner.evaluate_rule(transaction))
 
 		_run_rule_evaluation()
 
-		self.assertEqual(
-			frappe.db.get_value("Bank Transaction", transaction.name, "matched_transaction_rule"),
-			winning_rule.name,
+		evaluated = frappe.db.get_value(
+			"Bank Transaction",
+			transaction.name,
+			["matched_transaction_rule", "is_rule_evaluated"],
+			as_dict=True,
 		)
+		self.assertEqual(evaluated.matched_transaction_rule, winner.name)
+		self.assertNotEqual(evaluated.matched_transaction_rule, runner_up.name)
+		self.assertEqual(evaluated.is_rule_evaluated, 1)
