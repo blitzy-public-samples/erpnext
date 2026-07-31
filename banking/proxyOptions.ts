@@ -1,7 +1,6 @@
 import { readFileSync } from 'node:fs';
-// Type-only import (required by `verbatimModuleSyntax`) so the proxy `router`
-// callback parameter below can be annotated instead of falling back to an
-// implicit `any`, which `strict` rejects with TS7006.
+// Keep this import type-only under `verbatimModuleSyntax` so the annotation is
+// erased and the proxy's runtime imports and behavior remain unchanged.
 import type { IncomingMessage } from 'node:http';
 
 const common_site_config = JSON.parse(

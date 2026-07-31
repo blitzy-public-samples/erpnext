@@ -85,19 +85,7 @@ export const bankRecActionLog = atomWithStorage<ActionLog[]>('bank-rec-action-lo
     getOnInit: true,
 })
 
-/**
- * Error / import-failure UI state. `bankRecErrorDialogAtom` holds the raw, UNMODIFIED `FrappeError`
- * behind the dismissible error dialog - `null` renders nothing, mirroring the
- * `bankRecUnreconcileModalAtom` idiom above - so `getErrorMessages` can surface the server's own
- * text verbatim. `bankRecImportFailuresAtom` maps Bank Statement Import Log name to the synchronous
- * import failure observed for it, backing the per-file "failed" badge (the DocType persists no
- * error field of its own).
- *
- * Both are deliberately plain in-memory atoms, NOT storage-backed like their neighbours above: a
- * stale error dialog or per-file failure marker must not survive a page reload. The error atom is
- * shared by all three dialog mount points (reconciliation workbench, CSV statement-import step,
- * statement-importer list page) across two route trees, which is what guarantees those surfaces can
- * never show conflicting error state.
- */
+// Keep transient reconciliation errors in memory so stale dialogs and per-file
+// failure markers do not survive a page reload.
 export const bankRecErrorDialogAtom = atom<FrappeError | null>(null)
 export const bankRecImportFailuresAtom = atom<Record<string, FrappeError>>({})
