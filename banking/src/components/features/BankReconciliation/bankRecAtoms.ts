@@ -7,6 +7,7 @@ import { UnreconciledTransaction } from "./utils";
 import { BankTransaction } from "@/types/Accounts/BankTransaction";
 import { PaymentEntry } from "@/types/Accounts/PaymentEntry";
 import { JournalEntry } from "@/types/Accounts/JournalEntry";
+import { FrappeError } from "frappe-react-sdk";
 
 export interface SelectedBank extends Pick<BankAccount, 'name' | 'bank' | 'is_credit_card' | 'company' | 'account_name' | 'bank_account_no' | 'account' | 'account_type' | 'integration_id' | 'is_default' | 'last_integration_date'> {
     logo?: string,
@@ -83,3 +84,20 @@ const actionLogStorage = createJSONStorage<ActionLog[]>(() => sessionStorage)
 export const bankRecActionLog = atomWithStorage<ActionLog[]>('bank-rec-action-log', [], actionLogStorage, {
     getOnInit: true,
 })
+
+/**
+ * Error / import-failure UI state. `bankRecErrorDialogAtom` holds the raw, UNMODIFIED `FrappeError`
+ * behind the dismissible error dialog - `null` renders nothing, mirroring the
+ * `bankRecUnreconcileModalAtom` idiom above - so `getErrorMessages` can surface the server's own
+ * text verbatim. `bankRecImportFailuresAtom` maps Bank Statement Import Log name to the synchronous
+ * import failure observed for it, backing the per-file "failed" badge (the DocType persists no
+ * error field of its own).
+ *
+ * Both are deliberately plain in-memory atoms, NOT storage-backed like their neighbours above: a
+ * stale error dialog or per-file failure marker must not survive a page reload. The error atom is
+ * shared by all three dialog mount points (reconciliation workbench, CSV statement-import step,
+ * statement-importer list page) across two route trees, which is what guarantees those surfaces can
+ * never show conflicting error state.
+ */
+export const bankRecErrorDialogAtom = atom<FrappeError | null>(null)
+export const bankRecImportFailuresAtom = atom<Record<string, FrappeError>>({})
