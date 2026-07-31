@@ -1,4 +1,4 @@
-import { ActionLog, bankRecActionLog, bankRecAmountFilter, bankRecDateAtom, bankRecMatchFilters, bankRecSearchText, bankRecSelectedTransactionAtom, bankRecTransactionTypeFilter, bankRecUnreconcileModalAtom, SelectedBank, selectedBankAccountAtom } from './bankRecAtoms'
+import { ActionLog, bankRecActionLog, bankRecAmountFilter, bankRecDateAtom, bankRecErrorDialogAtom, bankRecMatchFilters, bankRecSearchText, bankRecSelectedTransactionAtom, bankRecTransactionTypeFilter, bankRecUnreconcileModalAtom, SelectedBank, selectedBankAccountAtom } from './bankRecAtoms'
 import { useAtom, useAtomValue, useSetAtom } from 'jotai'
 import { useMemo } from 'react'
 import { SWRConfiguration, useFrappeGetCall, useFrappeGetDoc, useFrappePostCall, useSWRConfig } from 'frappe-react-sdk'
@@ -228,6 +228,14 @@ export const useReconcileTransaction = () => {
 
     const addToActionLog = useUpdateActionLog()
 
+    const selectedBank = useAtomValue(selectedBankAccountAtom)
+
+    const dates = useAtomValue(bankRecDateAtom)
+
+    const { mutate } = useSWRConfig()
+
+    const setBankRecErrorDialog = useSetAtom(bankRecErrorDialogAtom)
+
     const reconcileTransaction = (transaction: UnreconciledTransaction, voucher: LinkedPayment) => {
 
         call({
@@ -273,6 +281,12 @@ export const useReconcileTransaction = () => {
                 duration: 5000,
                 description: getErrorMessage(error)
             })
+            // Route the raw (unmodified) Frappe error to the shared dialog atom so it surfaces verbatim in the
+            // dismissible BankRecErrorDialog, then revalidate the transaction caches so a stale client is corrected (FM1/FM3).
+            // Nothing is mutated optimistically - the server rolls the whole request back and remains the sole source of truth.
+            setBankRecErrorDialog(error)
+            mutate(`bank-reconciliation-unreconciled-transactions-${selectedBank?.name}-${dates.fromDate}-${dates.toDate}`)
+            mutate(`bank-reconciliation-bank-transactions-${selectedBank?.name}-${dates.fromDate}-${dates.toDate}`)
         })
     }
 
