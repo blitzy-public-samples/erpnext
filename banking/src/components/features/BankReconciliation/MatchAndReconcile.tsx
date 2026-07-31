@@ -26,6 +26,7 @@ import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/componen
 import TransferModal from "./TransferModal"
 import BankEntryModal from "./BankEntryModal"
 import RecordPaymentModal from "./RecordPaymentModal"
+import BankRecErrorDialog from "./BankRecErrorDialog"
 import SelectedTransactionsTable from "./SelectedTransactionsTable"
 import MatchFilters from "./MatchFilters"
 import { useHotkeys } from "react-hotkeys-hook"
@@ -66,6 +67,12 @@ const MatchAndReconcile = ({ contentHeight }: { contentHeight: number }) => {
         <TransferModal />
         <BankEntryModal />
         <RecordPaymentModal />
+        {/* Shared dismissible error dialog for confirm/post failures (FM1/FM3). Mounting it
+            unconditionally is free: it renders `null` unless `bankRecErrorDialogAtom` holds an
+            error, exactly like the three modals above. The statement-importer surfaces mount the
+            very same atom from a different route tree, so one atom drives every mount site and
+            the two surfaces can never show conflicting error state. */}
+        <BankRecErrorDialog />
     </>
 }
 
@@ -335,6 +342,16 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
 
     const currency = transaction.currency ?? selectedBank?.account_currency ?? getCompanyCurrency(selectedBank?.company ?? '')
 
+    // Advisory currency-mismatch predicate (Gap D4 / FM5). Mirrored from the server rather than
+    // designed: `BankTransaction.validate_currency` (bank_transaction.py:65-82) resolves
+    // `Bank Account.account` -> `Account.account_currency` and throws when it differs from the
+    // transaction currency. `bank_account.get_list` attaches `account_currency` to each row through
+    // that exact same lookup, so comparing the two values here cannot disagree with the server.
+    // Both sides are optional (`account_currency` is not a native Bank Account field, it is derived
+    // at query time), so an absent value on either side means "nothing to compare" rather than a
+    // mismatch. ADVISORY ONLY - see the badge below, which deliberately does not gate Reconcile.
+    const isCurrencyMismatch = Boolean(transaction.currency && selectedBank?.account_currency && transaction.currency !== selectedBank.account_currency)
+
     const handleSelectTransaction = (event: React.MouseEvent<HTMLDivElement>) => {
         // If the user is pressing the shift key, add/remove the transaction from the selected transactions
         if (event.shiftKey) {
@@ -367,6 +384,38 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
                             theme="violet"
                             title={_("Matched by rule")}>
                             <ZapIcon className="w-4 h-4" /> {transaction.matched_transaction_rule}</Badge>}
+
+                        {/* Non-blocking currency-mismatch indicator (Gap D4 / FM5). It is the INDICATOR
+                            that is non-blocking: Reconcile is deliberately left enabled, because the
+                            server - not this badge - decides whether a post is allowed.
+                            `theme="orange"` is used because Badge declares no `amber` theme; `subtle` +
+                            `orange` resolves to the `ink-amber-*` / `surface-amber-*` tokens this advisory
+                            calls for, so no new variant and no raw colour value is introduced. The LOCAL
+                            TooltipProvider is required, not optional: this row has no provider ancestor
+                            (the only global one lives in App.tsx), and Radix's Tooltip.Root throws
+                            without one.
+
+                            The copy deliberately does NOT promise a server rejection. `validate_currency`
+                            (bank_transaction.py:65-82) is reached from `validate()`, but the reconcile path
+                            calls `save()` on an already-submitted document, which Frappe runs as
+                            `update_after_submit` - a path that never invokes `validate()`. Runtime
+                            verification confirmed it: posting a EUR transaction against a USD account
+                            returned HTTP 200 and committed the reconciliation. The mismatch itself is still
+                            worth surfacing (the amount is posted unconverted), so the warning stays, but
+                            asserting a protection that does not exist would mislead the reviewer. The
+                            backend gap is recorded here and deliberately left unfixed - bank_transaction.py
+                            is outside this change's scope. */}
+                        {isCurrencyMismatch && <TooltipProvider>
+                            <Tooltip>
+                                <TooltipTrigger>
+                                    <Badge variant="subtle" theme="orange" size="sm">
+                                        <AlertCircleIcon /> {currency}</Badge>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">
+                                    {_("Transaction currency {0} differs from the bank account currency {1}. The amount is reconciled without conversion, so check this match before confirming.", [currency, selectedBank?.account_currency ?? ''])}
+                                </TooltipContent>
+                            </Tooltip>
+                        </TooltipProvider>}
                     </div>
                     <span className="text-sm wrap-anywhere" title={transaction.description}>{transaction.description}</span>
                 </div>
@@ -858,12 +907,43 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
 
     const { reconcileTransaction, loading } = useReconcileTransaction()
 
+    // Already-reconciled guard (Gap D1 / FM3 / TC5), read off the server rather than designed. The
+    // authoritative check is the FIRST statement of `add_payment_entries`, the first method the
+    // posting endpoint invokes: `if 0.0 >= self.unallocated_amount: frappe.throw("... already fully
+    // reconciled")` (bank_transaction.py:160-161). `set_status` (bank_transaction.py:84-91) derives
+    // the status field purely from `docstatus` and `unallocated_amount`, so the two signals are
+    // strictly co-derived and `status === 'Reconciled'` holds exactly when `unallocated_amount <= 0`;
+    // testing both is belt-and-braces against a partially populated row, and both fields already
+    // arrive in the endpoint payload so no extra data is fetched.
+    //
+    // This is a UX AFFORDANCE ONLY - the server check stays authoritative and nothing is mutated
+    // optimistically. It is not theoretical either: `get_bank_transactions` filters on
+    // `unallocated_amount > 0` alone and never on `status`, so a row whose status has already advanced
+    // while its unallocated amount has not is served straight into this list - runtime-verified. A
+    // stale client is likelier still because the bank-account query disables focus/stale
+    // revalidation. An attempt that slips through surfaces the server's own throw in
+    // BankRecErrorDialog while the reconcile hook revalidates the affected caches, which is also
+    // runtime-verified (HTTP 417 ValidationError, rendered verbatim, nothing written).
+    const transactionUnderReview = selectedTransaction?.[0]
+    const isAlreadyReconciled = transactionUnderReview
+        ? transactionUnderReview.status === 'Reconciled' || (transactionUnderReview.unallocated_amount ?? 0) <= 0
+        : false
+
     const onClick = () => {
         if (!selectedTransaction) {
             return
         }
         reconcileTransaction(selectedTransaction[0], voucher)
     }
+
+    // Extracted so the tooltip scaffolding below can wrap it only when there is actually a reason to
+    // explain, without duplicating the control. `variant`, `theme` and the loading label are unchanged
+    // from the original; only `disabled` gained the already-reconciled predicate, and `loading` is
+    // retained because that is what covers double-click / in-flight duplication.
+    const reconcileButton = <Button
+        variant={isSuggested || amountMatches ? "solid" : "outline"}
+        theme={isSuggested || amountMatches ? "green" : "gray"}
+        onClick={onClick} disabled={loading || isAlreadyReconciled}>{loading ? <><Loader2 className="w-4 h-4 animate-spin" /> {_("Reconciling")}...</> : `${_("Reconcile")}`}</Button>
 
     return <div className="py-1 px-1">
         <div
@@ -925,10 +1005,33 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
                     </TooltipProvider>
                 </div>
                 <div>
-                    <Button
-                        variant={isSuggested || amountMatches ? "solid" : "outline"}
-                        theme={isSuggested || amountMatches ? "green" : "gray"}
-                        onClick={onClick} disabled={loading}>{loading ? <><Loader2 className="w-4 h-4 animate-spin" /> {_("Reconciling")}...</> : `${_("Reconcile")}`}</Button>
+                    {/* The tooltip scaffolding is mounted ONLY when the guard actually fires. Gating just
+                        the TooltipContent is not enough: Radix's Tooltip.Root still opens on hover and
+                        stamps `aria-describedby` on the trigger, so an enabled button ended up pointing
+                        screen readers at an id that was never rendered - caught in runtime a11y
+                        verification. Mounting the whole Tooltip conditionally removes the dangling
+                        reference, and it also means the enabled path renders exactly the markup it did
+                        before this change.
+                        For the disabled case the wrapping <span> is required, because pointer events never
+                        fire on a disabled control (Button carries `disabled:pointer-events-none`), so the
+                        reason has to be anchored to an enabled element to stay discoverable - the state is
+                        therefore never communicated by appearance alone. `asChild` makes that span the
+                        trigger itself; a bare TooltipTrigger would render its own <button> and nest a
+                        button inside a button. The loading case needs no tooltip: its label already says
+                        so. A LOCAL TooltipProvider is required because the provider above closes before
+                        this button. */}
+                    {isAlreadyReconciled
+                        ? <TooltipProvider>
+                            <Tooltip>
+                                <TooltipTrigger asChild>
+                                    <span className="inline-flex">{reconcileButton}</span>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">
+                                    {_("This bank transaction is already fully reconciled, so it cannot be reconciled again.")}
+                                </TooltipContent>
+                            </Tooltip>
+                        </TooltipProvider>
+                        : reconcileButton}
                 </div>
             </div>
 
