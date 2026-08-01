@@ -2,7 +2,7 @@ import _ from '@/lib/translate'
 import { GetStatementDetailsResponse } from '../import_utils'
 import { flt, formatCurrency } from '@/lib/numbers'
 import { formatDate } from '@/lib/date'
-import { bankRecDateAtom } from '../../BankReconciliation/bankRecAtoms'
+import { bankRecDateAtom, bankRecErrorDialogAtom, bankRecImportFailuresAtom } from '../../BankReconciliation/bankRecAtoms'
 import { AlertCircleIcon, ChevronLeftIcon, ChevronRightIcon, ExternalLinkIcon, InfoIcon, Loader2Icon } from 'lucide-react'
 import { H2, H3, Paragraph } from '@/components/ui/typography'
 import { FileTypeIcon } from '@/components/ui/file-dropzone'
@@ -11,7 +11,7 @@ import { Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, Tabl
 import { Separator } from '@/components/ui/separator'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { useFrappeEventListener, useFrappePostCall } from 'frappe-react-sdk'
+import { useFrappeEventListener, useFrappePostCall, type FrappeError } from 'frappe-react-sdk'
 import { toast } from 'sonner'
 import ErrorBanner from '@/components/ui/error-banner'
 import { Link, useNavigate } from 'react-router'
@@ -25,6 +25,7 @@ import { BankStatementImportLog } from '@/types/Accounts/BankStatementImportLog'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
+import BankRecErrorDialog from '../../BankReconciliation/BankRecErrorDialog'
 
 const parseDateFormat = (dateFormat: string) => {
 
@@ -60,6 +61,12 @@ const StatementDetails = ({ data }: Props) => {
 
     const setDates = useSetAtom(bankRecDateAtom)
 
+    // Both setters are obtained here, at the top of the component body, because hooks may
+    // never be called from inside the import promise's callbacks (see onImport below).
+    const setErrorDialog = useSetAtom(bankRecErrorDialogAtom)
+
+    const setImportFailures = useSetAtom(bankRecImportFailuresAtom)
+
     const direction = useDirection()
 
     const onImport = () => {
@@ -77,8 +84,14 @@ const StatementDetails = ({ data }: Props) => {
             }
             toast.success(_("Bank statement imported."))
             navigate(`/`)
-        }).catch(() => {
+        }).catch((importError: FrappeError) => {
+            // The rejection used to be swallowed, discarding the server's own message. The import
+            // rolls back server-side and the log persists neither an error nor a failed status, so
+            // the error is passed UNMODIFIED to the shared dialog (surfacing the backend's throw
+            // verbatim) and recorded against this log so the importer list can flag the file.
             toast.error(_("There was an error while importing the bank statement."))
+            setErrorDialog(importError)
+            setImportFailures((previousFailures) => ({ ...previousFailures, [data.doc.name]: importError }))
         })
 
     }
@@ -101,6 +114,9 @@ const StatementDetails = ({ data }: Props) => {
 
     return (
         <div className='flex flex-col gap-4'>
+            {/* The importer sits in a different route tree from the reconciliation page, so it needs
+                its own mount of the shared dialog. It renders nothing until the atom holds an error. */}
+            <BankRecErrorDialog />
             <div className='flex flex-col gap-4'>
                 <div className='flex justify-between items-center'>
                     <Button size='sm' variant='outline' asChild>
