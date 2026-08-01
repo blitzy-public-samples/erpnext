@@ -1,5 +1,6 @@
 import BankPicker from "@/components/features/BankReconciliation/BankPicker"
-import { selectedBankAccountAtom } from "@/components/features/BankReconciliation/bankRecAtoms"
+import { bankRecImportFailuresAtom, selectedBankAccountAtom } from "@/components/features/BankReconciliation/bankRecAtoms"
+import BankRecErrorDialog from "@/components/features/BankReconciliation/BankRecErrorDialog"
 import CompanySelector from "@/components/features/BankReconciliation/CompanySelector"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -154,6 +155,10 @@ const BankStatementImporter = () => {
                 {selectedBankAccount && <StatementImportLog />}
             </div>
 
+            {/* This list route is a different route tree from both the reconciliation page and the
+                import detail route, so it needs its own mount of the shared, atom-driven error
+                dialog. One atom drives every mount, and it renders nothing until an error is set. */}
+            <BankRecErrorDialog />
         </div>
     )
 }
@@ -219,6 +224,12 @@ const StatementImportLog = () => {
 
     const bankAccount = useAtomValue(selectedBankAccountAtom)
 
+    // Drives the third, "Failed" state of the per-row status badge below. The import log persists
+    // no error field and its status never advances past "Not Started" when the synchronous import
+    // rolls back, so the observed rejection - recorded against the log's name by the import step -
+    // is the only failure signal available. Read here, never inside the row map: it is a hook.
+    const importFailures = useAtomValue(bankRecImportFailuresAtom)
+
     const { data, error } = useFrappeGetDocList<BankStatementImportLog>("Bank Statement Import Log", {
         fields: ["name", "file", "status", "number_of_transactions", "start_date", "end_date", "closing_balance", "creation"],
         filters: [["bank_account", "=", bankAccount?.name ?? ""]],
@@ -260,7 +271,7 @@ const StatementImportLog = () => {
                         {data?.map((item) => (
                             <TableRow key={item.name} onClick={() => onViewDetails(item.name)} className="cursor-pointer hover:bg-surface-gray-2">
                                 <TableCell>{formatDate(item.creation, 'Do MMM YYYY')}</TableCell>
-                                <TableCell><Badge theme={item.status === "Completed" ? "green" : "gray"}>{item.status}</Badge></TableCell>
+                                <TableCell><Badge theme={importFailures[item.name] ? "red" : item.status === "Completed" ? "green" : "gray"}>{importFailures[item.name] ? _("Failed") : item.status}</Badge></TableCell>
                                 <TableCell>
                                     {item.start_date && item.end_date ? (
                                         <span>{formatDate(item.start_date, 'Do MMM YYYY')} to {formatDate(item.end_date, 'Do MMM YYYY')}</span>
