@@ -411,7 +411,13 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
                                     <Badge variant="subtle" theme="orange" size="sm">
                                         <AlertCircleIcon /> {currency}</Badge>
                                 </TooltipTrigger>
-                                <TooltipContent side="top">
+                                {/* TooltipContent is `w-fit` with no intrinsic maximum, so this two-sentence
+                                    advisory laid out as a single ~1050px line that Radix then clamped flush
+                                    against the viewport edge, breaching the page gutter. `max-w-sm` with
+                                    balanced wrapping is the constraint the design system already uses for
+                                    long tooltip copy (see ui/list-view.tsx), so it is reused verbatim rather
+                                    than inventing a width or touching the boundary primitive. */}
+                                <TooltipContent side="top" className="max-w-sm text-balance wrap-break-word">
                                     {_("Transaction currency {0} differs from the bank account currency {1}. The amount is reconciled without conversion, so check this match before confirming.", [currency, selectedBank?.account_currency ?? ''])}
                                 </TooltipContent>
                             </Tooltip>
@@ -1023,10 +1029,32 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
                     {isAlreadyReconciled
                         ? <TooltipProvider>
                             <Tooltip>
+                                {/* `tabIndex={0}` on the span below is what makes the reason reachable without a
+                                    mouse. A disabled <button> is removed from the tab order, and the wrapping
+                                    span is not focusable by default, so the explanation was previously
+                                    discoverable by hover ONLY - keyboard and screen-reader users got a
+                                    greyed-out control with no stated cause, and Radix never stamped
+                                    `aria-describedby` because the trigger never received focus. Making the span
+                                    focusable puts it in the natural tab order, opens the tooltip on focus and
+                                    wires up `aria-describedby`. It does NOT make the control activatable: the
+                                    Button keeps its real `disabled` attribute, and a span has no default
+                                    activation behaviour, so Enter/Space do nothing. The focus ring reuses the
+                                    same `shadow-focus-gray` token and `rounded` radius the Button itself uses
+                                    (see ui/button.tsx), so the indicator is visually identical to focusing an
+                                    enabled control. The comment sits outside TooltipTrigger because `asChild`
+                                    renders through Radix's Slot, which requires exactly one child. */}
                                 <TooltipTrigger asChild>
-                                    <span className="inline-flex">{reconcileButton}</span>
+                                    <span tabIndex={0} className="inline-flex rounded outline-none focus-visible:shadow-focus-gray">{reconcileButton}</span>
                                 </TooltipTrigger>
-                                <TooltipContent side="top">
+                                {/* `align="end"` is required, not decorative. This trigger sits at the far right
+                                    of the voucher card, so a centre-aligned 24rem tooltip overhangs the viewport
+                                    and Radix - whose collision padding is zero - can only shift it until its
+                                    edge is flush with the window, breaching the page gutter every other element
+                                    respects. End-aligning pins its right edge to the trigger's own right edge,
+                                    which is already inset from the panel, so it lands inside the gutter without
+                                    introducing a raw pixel offset. `align` is the prop the design system
+                                    already uses for this (see BankClearanceSummary.tsx and ui/list-view.tsx). */}
+                                <TooltipContent side="top" align="end" className="max-w-sm text-balance wrap-break-word">
                                     {_("This bank transaction is already fully reconciled, so it cannot be reconciled again.")}
                                 </TooltipContent>
                             </Tooltip>
