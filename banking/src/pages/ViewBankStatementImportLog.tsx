@@ -22,10 +22,19 @@ const ViewBankStatementImportLog = () => {
 
     const direction = useDirection()
 
-    if (!data || !data.message) {
-        return null
-    }
-
+    /*
+     * GUARD ORDER IS LOAD-BEARING. These three checks previously ran in the opposite order, with
+     * the `!data` bail-out first, and that made the two branches below unreachable in exactly the
+     * cases they exist for: a failed request returns no data, so `!data` was true and the component
+     * returned null BEFORE the error branch could render, and the loading branch was dead for the
+     * same reason.
+     *
+     * The practical consequence was the FM2 failure that matters most here. A malformed or empty
+     * statement file fails while `get_statement_details` parses it, so opening that import log
+     * rendered a completely blank page - no message, no explanation, no way back - while the
+     * backend's own error sat unused in `error`. Loading and error are transient states that must be
+     * reported; "no data and nothing wrong" is the only case that legitimately renders nothing.
+     */
     if (isLoading) {
         return <div>Loading...</div>
     }
@@ -43,6 +52,11 @@ const ViewBankStatementImportLog = () => {
             <ErrorBanner error={error} />
         </div>
     }
+
+    if (!data || !data.message) {
+        return null
+    }
+
     const isPdf = data.message.doc.file?.toLowerCase().endsWith('.pdf')
 
     if (isPdf) {

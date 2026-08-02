@@ -121,9 +121,15 @@ export const TEST_ALTERNATE_AMOUNT = 8750
  * The base transaction's `reference_number` and the suggested voucher's `reference_no`, so they form
  * a full reference match.
  *
- * NEVER make a `reference_no` empty. The partial-match term is
- * `transaction.reference_number?.includes(reference_no)`, and `includes('')` is ALWAYS `true`, so an
- * empty value would make every voucher a partial match.
+ * A blank `reference_no` is a first-class case, NOT something to avoid. `get_linked_payments` unions
+ * four voucher types and two of them - Purchase Invoice and Sales Invoice - select
+ * `ConstantColumn("")` for this column, while the Journal Entry branch selects
+ * `Max(je.cheque_no)`, which is NULL when no row in the group carries a cheque number. Fixtures
+ * that could only produce a non-blank reference could not express the majority of the rows this
+ * endpoint actually returns, and so could not detect a grader that mistakes a blank for agreement -
+ * which is precisely the defect `matchVoucherReference` now prevents. Use
+ * {@link makeBlankReferenceLinkedPayment} and {@link makeNullReferenceLinkedPayment} to model those
+ * rows faithfully.
  */
 export const TEST_REFERENCE_NUMBER = 'NEFT/2024/000145'
 
@@ -344,8 +350,10 @@ export const makeLinkedPayment = (overrides: Partial<LinkedPayment> = {}): Linke
  * transaction. Deriving rather than restating is the point: this stays suggested by construction even
  * for a transaction whose amount or date a suite overrode.
  *
- * `reference_no` falls back with `||`, not `??`: an empty `reference_number` must not propagate into
- * an empty `reference_no`, which `??` would happily do.
+ * `reference_no` falls back with `||`, not `??`, so a transaction whose own `reference_number` is
+ * blank still yields a voucher that genuinely agrees on SOMETHING. That keeps this builder's
+ * contract honest - it promises a suggested voucher - and it is why the blank and null reference
+ * cases have their own builders below rather than being reached by overriding this one.
  */
 export const makeSuggestedLinkedPayment = (
 	transaction: UnreconciledTransaction,
@@ -377,6 +385,54 @@ export const makeAlternateLinkedPayment = (overrides: Partial<LinkedPayment> = {
 		paid_amount: TEST_ALTERNATE_AMOUNT,
 		reference_no: TEST_ALTERNATE_REFERENCE_NUMBER,
 		reference_date: TEST_ALTERNATE_DATE,
+		posting_date: TEST_ALTERNATE_DATE,
+		party_type: 'Supplier',
+		party: 'Globex Supplies',
+		...overrides
+	})
+
+/**
+ * An INVOICE row exactly as `get_linked_payments` returns one: both reference columns are the
+ * literal empty string, because the Purchase Invoice and Sales Invoice branches select
+ * `ConstantColumn("")` for each.
+ *
+ * The amount deliberately AGREES with {@link makeUnreconciledTransaction}, which is what makes this
+ * fixture worth having. Amount agreement alone must NOT promote a voucher to "suggested": the
+ * blank reference has to contribute nothing. Under the previous inline comparison it contributed a
+ * spurious partial match - `''.includes` aside, `includes('')` is always true - and the row was
+ * presented in green as though the rule engine had proposed it.
+ */
+export const makeBlankReferenceLinkedPayment = (overrides: Partial<LinkedPayment> = {}): LinkedPayment =>
+	makeLinkedPayment({
+		rank: 1,
+		doctype: 'Purchase Invoice',
+		name: 'ACC-PINV-2024-00001',
+		paid_amount: TEST_TRANSACTION_AMOUNT,
+		reference_no: '',
+		reference_date: '',
+		posting_date: TEST_ALTERNATE_DATE,
+		party_type: 'Supplier',
+		party: 'Globex Supplies',
+		...overrides
+	})
+
+/**
+ * A JOURNAL ENTRY row whose reference columns are NULL rather than empty, which is what
+ * `Max(je.cheque_no)` yields when no row in the group carries a cheque number. Distinct from
+ * {@link makeBlankReferenceLinkedPayment} because `null` and `''` reach a naive comparison
+ * differently - `null === undefined` is false while `'' === ''` is true - so both shapes have to be
+ * covered to prove the grader treats "absent" uniformly.
+ *
+ * The amount agrees here too, for the same reason.
+ */
+export const makeNullReferenceLinkedPayment = (overrides: Partial<LinkedPayment> = {}): LinkedPayment =>
+	makeLinkedPayment({
+		rank: 1,
+		doctype: 'Journal Entry',
+		name: 'ACC-JV-2024-00002',
+		paid_amount: TEST_TRANSACTION_AMOUNT,
+		reference_no: null,
+		reference_date: null,
 		posting_date: TEST_ALTERNATE_DATE,
 		party_type: 'Supplier',
 		party: 'Globex Supplies',
@@ -584,24 +640,30 @@ export const makeMessageOnlyError = (
 	})
 
 /**
- * Builds the value held by `bankRecImportFailuresAtom`, whose type is
- * `Record<string, ImportAttemptStatus>` keyed by import-log NAME.
+ * Builds the value held by `bankRecImportFailuresAtom`, whose type is `ImportAttemptMarkers` —
+ * `Record<bankAccountName, Record<importLogName, ImportAttemptStatus>>`.
+ *
+ * NESTED BY BANK ACCOUNT, deliberately, because that is the shape the atom actually has. The
+ * importer list is a per-bank query with a per-bank row limit, so a marker's visibility and its
+ * lifetime are both properties of one account; a flat map made the retention cap count markers
+ * from accounts whose rows were not even on screen. A fixture that flattened this would let a
+ * suite pass against a shape the application no longer uses.
  *
  * This map supplements — and never overrides — the document, because `Bank Statement Import
  * Log` has only two status values and no error field, so an import that rolls back persists
  * nothing at all. The marker is what the client established about ONE attempt, and it holds
- * no error object: `'failed'` means the server was asked and reported a status other than
- * `Completed`, while `'unknown'` means no status could be obtained. An authoritative
- * `Completed` always wins over either, so a suite asserting the badge must supply the log's
- * own `status` as well as the marker.
+ * no error object: `'failed'` means the SERVER refused and a follow-up read confirmed the log is
+ * still not `Completed`, while `'unknown'` means nothing observed amounts to the server saying so.
+ * An authoritative `Completed` always wins over either, so a suite asserting the badge must supply
+ * the log's own `status` as well as the marker.
  *
- * Accepts the log itself rather than a bare name so the key cannot drift from the row it
- * marks.
+ * Accepts the log itself rather than a bare name so neither key can drift from the row it marks —
+ * the bank key is read off the log's own `bank_account`.
  */
 export const makeImportFailures = (
 	log: BankStatementImportLog,
 	attempt: ImportAttemptStatus = 'failed'
-): Record<string, ImportAttemptStatus> => ({ [log.name]: attempt })
+): Record<string, Record<string, ImportAttemptStatus>> => ({ [log.bank_account]: { [log.name]: attempt } })
 
 /* Every suite mocks the SDK through {@link createFrappeSDKMock}, so none hand-rolls a module mock or
  * omits a symbol. The `vi.mock('frappe-react-sdk', () => createFrappeSDKMock())` line must stay
@@ -1194,25 +1256,32 @@ export const emitFrappeEvent = (eventName: string, eventData: unknown): void => 
  * The value carried by {@link FrappeContextMock}.
  *
  * A real context with a real default is required because the SPA reads it as
- * `useContext(FrappeContext) as FrappeConfig` and immediately destructures a member — six
- * files do so across eleven sites. With the library's own `null` default, or with a
- * non-context stand-in, the first lazily loaded modal body to mount would throw.
+ * `useContext(FrappeContext) as FrappeConfig` and immediately DESTRUCTURES a member. With the
+ * library's own `null` default, or with a non-context stand-in, the first lazily loaded modal
+ * body to mount would throw before rendering anything.
  *
- * The members the SPA actually invokes are `call.get` (five sites), `db.setValue` and
- * `db.deleteDoc` (two each) and `file.uploadFile` (three). The remaining members mirror
- * the real `FrappeCall` and `FrappeDB` surfaces so that a component reaching for one finds
- * a spy instead of `undefined`.
+ * WHICH modules do that is deliberately not tallied here, because a hand-maintained count goes
+ * stale the moment a call site moves and then misinforms the next reader. Regenerate it instead:
  *
- * ALL TWELVE reject when unconfigured. Every one is an imperative operation reached from a
- * user-event handler — `call.get` from a party change (`RecordPaymentModalContent.tsx:141`),
- * `db.setValue`/`db.deleteDoc` from rule-list actions inside `toast.promise`
- * (`RuleList.tsx:105,145,167`), `file.uploadFile` from a submit handler — so not one of them
- * runs during mount, and a rejection can only ever surface once a test drives the flow it
- * left unconfigured. The three read-shaped members (`db.getDoc`, `db.getDocList`,
- * `db.getCount`) reject for the same reason as the rest: an unconfigured `[]` or `0` is
- * indistinguishable from a real answer, so it could satisfy an assertion by accident. Only the
- * four SWR-backed READ HOOKS keep empty-data defaults, because a component must be able to
- * mount before a suite has configured anything.
+ *     grep -rn 'useContext(FrappeContext)' src/ | grep -v src/test/
+ *
+ * The MEMBERS those modules reach for are `call.get`, `db.getDoc`, `db.getCount`, `db.setValue`,
+ * `db.deleteDoc` and `file.uploadFile` (the last reached through a `file: frappeFile` alias), and
+ * that list is the part worth writing down, because it is what this mock has to satisfy. Naming the modules themselves is left to the command above
+ * on purpose: the set changed during this very piece of work - the reconciliation hook layer
+ * joined it once the rule-evaluation watcher began counting unevaluated transactions - which is
+ * exactly how a written-down tally turns into misinformation. The rest of the surface is mirrored
+ * anyway so that a component reaching for one finds a spy rather than `undefined`.
+ *
+ * EVERY imperative member below rejects when unconfigured - all four `call.*`, all seven `db.*`
+ * and `file.uploadFile`. Each is reached from a user-event handler rather than from mount: a
+ * party change, a rule-list action inside `toast.promise`, a submit handler, the import step's
+ * own document-method call. So none of them runs while a component is simply rendered, and a
+ * rejection can only surface once a test drives the flow it left unconfigured. The read-shaped
+ * members (`db.getDoc`, `db.getDocList`, `db.getCount`) reject for the same reason as the rest:
+ * an unconfigured `[]` or `0` is indistinguishable from a real answer and could satisfy an
+ * assertion by accident. Only the SWR-backed READ HOOKS keep empty-data defaults, because a
+ * component must be able to mount before a suite has configured anything.
  */
 export const frappeContextValue = {
 	call: {

@@ -1,5 +1,5 @@
 import BankPicker from "@/components/features/BankReconciliation/BankPicker"
-import { bankRecImportFailuresAtom, selectedBankAccountAtom, type ImportAttemptStatus } from "@/components/features/BankReconciliation/bankRecAtoms"
+import { bankRecErrorDialogAtom, bankRecImportFailuresAtom, bankRecPreImportFailuresAtom, getImportAttempt, selectedBankAccountAtom, withCompletedImportAttemptsRetired, type ImportAttemptStatus } from "@/components/features/BankReconciliation/bankRecAtoms"
 import BankRecErrorDialog from "@/components/features/BankReconciliation/BankRecErrorDialog"
 import CompanySelector from "@/components/features/BankReconciliation/CompanySelector"
 import { Badge } from "@/components/ui/badge"
@@ -12,6 +12,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { H3, Paragraph } from "@/components/ui/typography"
+import { toDisplayError } from "@/components/features/BankReconciliation/utils"
 import { useCurrentCompany } from "@/hooks/useCurrentCompany"
 import { formatDate } from "@/lib/date"
 import { flt, formatCurrency } from "@/lib/numbers"
@@ -19,7 +20,7 @@ import _ from "@/lib/translate"
 import { cn } from "@/lib/utils"
 import { BankStatementImportLog } from "@/types/Accounts/BankStatementImportLog"
 import { useFrappeCreateDoc, useFrappeFileUpload, useFrappeGetDocList, useFrappeUpdateDoc } from "frappe-react-sdk"
-import { useAtom, useAtomValue } from "jotai"
+import { useAtom, useAtomValue, useSetAtom } from "jotai"
 import { ListIcon, Loader2Icon } from "lucide-react"
 import { useEffect, useState } from "react"
 import { useNavigate } from "react-router"
@@ -31,6 +32,11 @@ const BankStatementImporter = () => {
 
     const [selectedBankAccount] = useAtom(selectedBankAccountAtom)
 
+    const setErrorDialog = useSetAtom(bankRecErrorDialogAtom)
+
+    // FM2 pre-log failures: keyed by file name, because no import log exists to key them by.
+    const [preImportFailures, setPreImportFailures] = useAtom(bankRecPreImportFailuresAtom)
+
     const [files, setFiles] = useState<File[]>([])
     const [password, setPassword] = useState("")
 
@@ -41,6 +47,10 @@ const BankStatementImporter = () => {
     const { updateDoc, error: updateError } = useFrappeUpdateDoc()
 
     const isPdf = files[0]?.name?.toLowerCase().endsWith(".pdf") ?? false
+
+    // Whether any failure has already been attributed to a specific file. Used only to keep the
+    // unattributed hook banners from repeating a message the per-file surface already shows.
+    const hasAttributedFailure = Object.keys(preImportFailures).length > 0
 
     const onUpload = () => {
 
@@ -55,6 +65,17 @@ const BankStatementImporter = () => {
         const ensurePassword = isPdf && password
             ? updateDoc("Bank Account", selectedBankAccount.name, { statement_password: password })
             : Promise.resolve()
+
+        const fileName = files[0]?.name ?? ""
+
+        // A retry supersedes whatever the previous attempt observed, so the stale marker goes
+        // before the request does rather than after it resolves.
+        setPreImportFailures((previous) => {
+            if (previous[fileName] === undefined) {
+                return previous
+            }
+            return Object.fromEntries(Object.entries(previous).filter(([name]) => name !== fileName))
+        })
 
         ensurePassword.then(() => upload(files[0], {
             isPrivate: true,
@@ -71,15 +92,64 @@ const BankStatementImporter = () => {
                 })
         }).then((doc) => {
             navigate(`/statement-importer/${doc.name}`)
+        }).catch((uploadError: unknown) => {
+            /*
+             * FM2, pre-log case. This chain can fail while saving the statement password, while
+             * uploading the file, or while creating the import log - and in every one of those cases
+             * NO import log exists yet. There is therefore no document to carry a status and no row
+             * for the importer list to render, so the log-keyed markers used elsewhere cannot
+             * represent this failure at all. It is recorded against the FILE NAME instead, which is
+             * the only identifier the attempt has, and surfaced next to the upload control.
+             *
+             * Without this handler the rejection was unhandled: the inline banners below did light
+             * up from the hooks' own error state, but the promise still rejected into nothing, and a
+             * failure in the password step - which no banner covers - was invisible.
+             *
+             * Normalised through the shared layer so a genuine server refusal (a rejected file type,
+             * a permission failure) reaches the user verbatim, while a lost response becomes
+             * outcome-indeterminate copy rather than the SDK's internal TypeError text.
+             */
+            const displayError = toDisplayError(uploadError)
+            setErrorDialog(displayError)
+            setPreImportFailures((previous) => ({ ...previous, [fileName]: displayError }))
         })
     }
 
     return (
         <div className="flex px-4">
             <div className="w-[52%]">
-                {error && <ErrorBanner error={error} />}
-                {createError && <ErrorBanner error={createError} />}
-                {updateError && <ErrorBanner error={updateError} />}
+                {/*
+                  * Each of these three is an SDK hook's OWN error object. For a response-less
+                  * rejection that object is not a Frappe envelope at all - `frappe-js-sdk` reads
+                  * `error.response.data` unguarded, so what reaches the banner is a raw
+                  * `TypeError: Cannot read properties of undefined (reading 'data')`. Rendering it
+                  * verbatim showed the SDK's own implementation detail to the user, which is why
+                  * every one is normalised through the SAME layer the reconciliation seam uses: a
+                  * genuine envelope passes through BY IDENTITY, keeping the server's wording,
+                  * title and severity, while a lost response becomes outcome-indeterminate
+                  * transport copy.
+                  *
+                  * They are also suppressed once a failure has been attributed to a FILE below,
+                  * because that surface renders the same normalised envelope WITH the file name -
+                  * showing both would print the identical message twice.
+                  */}
+                {!hasAttributedFailure && error && <ErrorBanner error={toDisplayError(error)} />}
+                {!hasAttributedFailure && createError && <ErrorBanner error={toDisplayError(createError)} />}
+                {!hasAttributedFailure && updateError && <ErrorBanner error={toDisplayError(updateError)} />}
+
+                {/*
+                  * FM2, pre-log case. Named per file, because a failure before the import log exists
+                  * has no document and therefore no row in the list on the right. Rendered from the
+                  * same shared ErrorBanner as everything else, so a server refusal keeps its own
+                  * wording and severity, and a lost response reads as indeterminate rather than as
+                  * a definite failure.
+                  */}
+                {Object.entries(preImportFailures).map(([failedFileName, failedError]) => (
+                    <div key={failedFileName} className="flex flex-col gap-1 py-1">
+                        <span className="text-p-sm text-ink-gray-7">{_("{0} could not be uploaded.", [failedFileName])}</span>
+                        <ErrorBanner error={failedError} />
+                    </div>
+                ))}
                 <div className="py-2 flex flex-col gap-6">
                     <div className="flex flex-col gap-2">
                         <Label>{_("Company")}<span className="text-ink-red-3">*</span></Label>
@@ -275,8 +345,11 @@ const StatementImportLog = () => {
     // `Completed` has its attempt marker dropped, so a marker cannot outlive the condition it
     // described - including one recorded as `unknown` for an import that had in fact succeeded.
     // The map is rebuilt only when something actually needs removing, so this cannot loop.
+    //
+    // Scoped to the bank this list actually queried: a per-account list is evidence about that
+    // account's logs and about nothing else, so it must not reach into another account's markers.
     useEffect(() => {
-        if (!data) {
+        if (!data || !bankAccount) {
             return
         }
 
@@ -286,16 +359,8 @@ const StatementImportLog = () => {
             return
         }
 
-        setImportFailures((previousAttempts) => {
-            const stale = completed.filter((name) => previousAttempts[name] !== undefined)
-
-            if (stale.length === 0) {
-                return previousAttempts
-            }
-
-            return Object.fromEntries(Object.entries(previousAttempts).filter(([name]) => !stale.includes(name)))
-        })
-    }, [data, setImportFailures])
+        setImportFailures((previousAttempts) => withCompletedImportAttemptsRetired(previousAttempts, bankAccount.name, completed))
+    }, [data, bankAccount, setImportFailures])
 
     const navigate = useNavigate()
 
@@ -307,7 +372,12 @@ const StatementImportLog = () => {
         <div className="flex flex-col gap-4">
             <H3 className="text-base">{_("Previous Imports")}</H3>
 
-            {error && <ErrorBanner error={error} />}
+            {/*
+              * Normalised for the same reason as the upload banners: if this list query loses its
+              * response, the SDK hands back its own `TypeError` rather than a Frappe envelope, and
+              * that must not be what the user reads.
+              */}
+            {error && <ErrorBanner error={toDisplayError(error)} />}
 
             {data && data.length > 0 ? (
 
@@ -326,7 +396,7 @@ const StatementImportLog = () => {
                         {data?.map((item) => (
                             <TableRow key={item.name} onClick={() => onViewDetails(item.name)} className="cursor-pointer hover:bg-surface-gray-2">
                                 <TableCell>{formatDate(item.creation, 'Do MMM YYYY')}</TableCell>
-                                <TableCell><ImportLogStatusBadge status={item.status} attempt={importFailures[item.name]} /></TableCell>
+                                <TableCell><ImportLogStatusBadge status={item.status} attempt={getImportAttempt(importFailures, bankAccount?.name, item.name)} /></TableCell>
                                 <TableCell>
                                     {item.start_date && item.end_date ? (
                                         <span>{formatDate(item.start_date, 'Do MMM YYYY')} to {formatDate(item.end_date, 'Do MMM YYYY')}</span>

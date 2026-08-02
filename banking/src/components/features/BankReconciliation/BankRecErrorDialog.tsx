@@ -7,12 +7,9 @@ import {
 	AlertDialogHeader,
 	AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import { Paragraph } from "@/components/ui/typography"
-import { getErrorMessages } from "@/lib/frappe"
+import ErrorBanner from "@/components/ui/error-banner"
 import { useAtom } from "jotai"
-import { AlertCircle } from "lucide-react"
-import { useEffect, useMemo, useRef } from "react"
+import { useEffect, useRef } from "react"
 import { bankRecErrorDialogAtom } from "./bankRecAtoms"
 import _ from "@/lib/translate"
 
@@ -20,36 +17,30 @@ import _ from "@/lib/translate"
 const FOCUSABLE_SELECTOR = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
 
 /**
- * Collapses Frappe's two placeholder server titles into a friendly heading — byte-for-byte
- * the rule `ui/error-banner.tsx:20-23` applies — so this dialog's heading behaviour matches
- * every inline banner in the SPA: a SPECIFIC server title survives verbatim and only the
- * generic `Message` / `Error` placeholders are replaced.
- */
-const parseHeading = (title?: string) => {
-	if (title === 'Message' || title === 'Error') {
-		return _("There was an error.")
-	}
-	return title
-}
-
-/**
  * Shared, dismissible error dialog for the Bank Reconciliation and Bank Statement Importer
  * surfaces. Takes no props: one shared atom drives every mount site across both route trees,
  * so the two surfaces can never show conflicting error state.
  *
- * The server's own words are surfaced UNMODIFIED and UNPARAPHRASED, resolved through the same
- * shared parser (`getErrorMessages`) and presented with the same design-system `Alert`
- * primitives, severity rule and heading rule every inline `ErrorBanner` uses. The severity is
- * the SERVER'S — `indicator === 'yellow'` gives amber, anything else red — so this component
- * makes no judgement of its own.
+ * This component is deliberately nothing but alert-dialog chrome, focus management and a
+ * Dismiss control. The error itself is rendered by the SHARED `ErrorBanner`, passed the atom's
+ * value COMPLETELY UNMODIFIED and with `overrideHeading` left unset, so the parser
+ * (`getErrorMessages`), the severity rule (`indicator === 'yellow'` -> amber, else red), the
+ * heading rule and the message rendering are the SAME single implementation the ~20 inline
+ * banner call sites use. Composing rather than restating is what guarantees this dialog and an
+ * inline banner can never disagree about the same rejection, and it means the server's own
+ * words - for example `"Bank Transaction {0} is already fully reconciled"` - reach the user
+ * verbatim with no client paraphrasing and no severity judgement of our own.
  *
- * It renders each message as TEXT rather than delegating to `ui/error-banner.tsx`, and that is
- * a security requirement (CWE-79) rather than a style preference: the banner renders through
- * `ui/markdown.tsx`, which runs `rehype-raw`, so raw HTML in a message would become live DOM.
- * Error text is wholly server-controlled and reaches the user at the exact moment something has
- * already gone wrong, so no markup path exists from here at all. The cost is that Frappe's own
- * inline markup (for example the `frappe.bold()` wrappers in the currency-mismatch throw) shows
- * literally; every value in the message still reaches the reader intact.
+ * SAFETY OF THAT COMPOSITION. `ErrorBanner` renders each parsed message through
+ * `ui/markdown.tsx`, which runs `rehypeRaw`; error text is wholly server-controlled and
+ * arrives at the exact moment something has already gone wrong. That path is safe because the
+ * renderer applies an allow-list sanitiser AFTER `rehypeRaw`: scripts, styles, frames,
+ * embedded objects, media, form controls, every `on*` handler, `style`, and - specifically to
+ * close CWE-451 UI redress, since this application's utility classes are compiled into the
+ * shipped stylesheet - `class` and `id` are all removed, and links survive only when they
+ * point back at this application. Frappe's own inline `frappe.bold()` markup therefore still
+ * renders as emphasis, which is precisely the shared behaviour a bespoke text-only renderer
+ * here would have lost.
  *
  * Dismissing clears the dialog atom and nothing else - it issues no request, triggers no
  * revalidation and raises no notification, because the calling hook owns revalidation.
@@ -66,11 +57,6 @@ const BankRecErrorDialog = () => {
 	const lastFocusedRef = useRef<HTMLElement | null>(null)
 	const invokerRef = useRef<HTMLElement | null>(null)
 	const invokerRegionRef = useRef<HTMLElement | null>(null)
-
-	// Parsed with the SAME shared parser the inline banners use (`_server_messages` ->
-	// `_error_message` -> `exception` -> bare `message`), so what this dialog shows and what a
-	// banner would have shown for the same rejection can never diverge.
-	const messages = useMemo(() => getErrorMessages(error), [error])
 
 	// The invoking control cannot be read from `document.activeElement` at the moment this
 	// dialog opens. The actions that fail here are asynchronous, and the control that starts
@@ -167,7 +153,46 @@ const BankRecErrorDialog = () => {
 			{/* Radix marks the rest of the page inert but does not emit `aria-modal`, so the
 				modal semantics are declared explicitly here. The focus trap, Escape handling
 				and `role="alertdialog"` all remain Radix's. */}
-			<AlertDialogContent aria-modal="true" className="min-w-2xl" onOpenAutoFocus={onOpenAutoFocus} onCloseAutoFocus={onCloseAutoFocus}>
+			{/* WIDTH: no unconditional MINIMUM width. `min-w-*` beats the primitive's own
+				`max-w-[calc(100%-2rem)]` in the CSS cascade, which forced a fixed 672px dialog
+				onto every viewport and pushed ~300px of the server's message off-screen on a
+				phone - the one message the user most needs to read. Widening through
+				`max-width` instead leaves the primitive's ladder intact and simply adds a rung
+				above it, so the dialog always fits: below 640px the gutter rule governs, from
+				640px the primitive's own `sm:max-w-lg` (512px) does, and from 768px this
+				`md:max-w-2xl` (672px) does - each value comfortably inside its own range.
+
+				The `data-[size=default]:` qualifier is REQUIRED rather than cosmetic. The
+				primitive's class is attribute-qualified, so it carries higher specificity than a
+				bare `md:max-w-2xl` would and would win at every width; matching the qualifier
+				puts both classes on equal specificity, which leaves source order to decide -
+				and Tailwind always emits `sm` before `md`. The rendered desktop width is
+				therefore unchanged at 2xl, exactly as before.
+
+				HEIGHT: `max-h-[90vh]` is the bound `ui/dialog.tsx` already applies to the
+				ordinary dialog primitive. An arbitrarily long or multi-message backend error
+				would otherwise grow the dialog past the viewport and carry the only Dismiss
+				control off-screen with it.
+
+				`grid-rows-[auto_minmax(0,1fr)_auto]` is what makes that bound actually bite,
+				and it is REQUIRED rather than belt-and-braces. The primitive is `display:
+				grid` with IMPLICIT rows, and a `max-height` on a grid container does not
+				shrink an `auto` track: the middle track keeps its full content height, so the
+				message row below is handed a box equal to its own content, its
+				`overflow-y-auto` never activates (`scrollHeight === clientHeight`), and the
+				surplus - footer and all - paints outside the clamped box. Measured before this
+				track constraint was added: at 375x812 the box clamped correctly to 731px while
+				the content ran to 2723px and Dismiss rendered 1952px below the fold,
+				unreachable by any pointer; at 1440x900 it was 335px below the fold. Naming
+				three tracks pins the header and footer at their natural heights and lets ONLY
+				the middle one shrink, which is why Dismiss now stays on screen at every
+				height. The count is exact because this dialog renders exactly three children,
+				unconditionally: header, message region, footer.
+
+				Radix marks the rest of the page inert but does not emit `aria-modal`, so the
+				modal semantics are declared explicitly here. The focus trap, Escape handling
+				and `role="alertdialog"` all remain Radix's. */}
+			<AlertDialogContent aria-modal="true" className="max-h-[90vh] grid-rows-[auto_minmax(0,1fr)_auto] data-[size=default]:md:max-w-2xl" onOpenAutoFocus={onOpenAutoFocus} onCloseAutoFocus={onCloseAutoFocus}>
 				<AlertDialogHeader>
 					{/* This chrome is deliberately outcome-NEUTRAL. It is rendered
 					    unconditionally, before the rejection has been inspected, and a
@@ -181,20 +206,19 @@ const BankRecErrorDialog = () => {
 						{_("Review the details below, then dismiss this message to continue. The server remains the authority on what was recorded.")}
 					</AlertDialogDescription>
 				</AlertDialogHeader>
-				{/* Every message the server sent, in its own words and in its own order, as inert
-					text. `whitespace-pre-line` keeps any line breaks the server intended and
-					`wrap-anywhere` stops an unbroken reference number from overflowing the dialog. */}
-				<Alert theme={messages[0]?.indicator === 'yellow' ? 'amber' : "red"}>
-					<AlertCircle />
-					<AlertTitle>{parseHeading(messages[0]?.title)}</AlertTitle>
-					<AlertDescription>
-						{messages.map((serverMessage, index) => (
-							<Paragraph key={index} className="whitespace-pre-line wrap-anywhere">
-								{serverMessage.message}
-							</Paragraph>
-						))}
-					</AlertDescription>
-				</Alert>
+				{/* The SHARED banner, handed the server's envelope untouched. `overrideHeading`
+					is deliberately unset so the server's own title survives.
+
+					This is the row that scrolls, and it takes BOTH halves to work. The named
+					`minmax(0,1fr)` track above lets the row shrink below its content instead of
+					sizing to it; `min-h-0` then lets this item shrink inside that track, since
+					a grid item's automatic minimum size would otherwise still be its content;
+					and `overflow-y-auto` gives the overflow somewhere to go. The result is that
+					the header AND the Dismiss control stay on screen however much text the
+					server sent, and only the message itself scrolls. */}
+				<div className="min-h-0 overflow-y-auto">
+					<ErrorBanner error={error} />
+				</div>
 				<AlertDialogFooter>
 					<AlertDialogAction ref={dismissRef} onClick={dismiss}>
 						{_("Dismiss")}

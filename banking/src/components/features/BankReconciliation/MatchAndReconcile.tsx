@@ -6,7 +6,7 @@ import { getCompanyCurrency } from "@/lib/company"
 import ErrorBanner from "@/components/ui/error-banner"
 import { Separator } from "@/components/ui/separator"
 import Fuse from 'fuse.js'
-import { getSearchResults, LinkedPayment, UnreconciledTransaction, useGetRuleForTransaction, useGetUnreconciledTransactions, useGetVouchersForTransaction, useIsTransactionWithdrawal, useReconcileTransaction, useTransactionSearch } from "./utils"
+import { getSearchResults, LinkedPayment, matchVoucherDate, matchVoucherReference, UnreconciledTransaction, useGetRuleForTransaction, useGetUnreconciledTransactions, useGetVouchersForTransaction, useIsTransactionWithdrawal, useReconcileTransaction, useSelectedBankAccountCurrency, useTransactionSearch } from "./utils"
 import { Input } from "@/components/ui/input"
 import { AlertCircleIcon, ArrowDownRight, ArrowRightIcon, ArrowRightLeft, ArrowUpRight, BadgeCheck, ChevronDown, DollarSign, Landmark, LandmarkIcon, ListIcon, Loader2, Receipt, ReceiptIcon, Search, User, XCircle, ZapIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -128,7 +128,13 @@ function VirtualizedListBody<T>({
 const UnreconciledTransactions = ({ contentHeight }: { contentHeight: number }) => {
     const bankAccount = useAtomValue(selectedBankAccountAtom)
 
-    const currency = bankAccount?.account_currency ?? getCompanyCurrency(bankAccount?.company ?? '')
+    // Read once here, for the whole list, and handed down to every row. The hook shares the bank
+    // picker's SWR entry rather than issuing its own request, but a subscription per virtualised row
+    // would still be pointless churn when every row is describing the SAME account. Sourcing it here
+    // also guarantees the amount filter below and the rows' currency indicators can never disagree.
+    const freshAccountCurrency = useSelectedBankAccountCurrency()
+
+    const currency = freshAccountCurrency ?? bankAccount?.account_currency ?? getCompanyCurrency(bankAccount?.company ?? '')
     const currencySymbol = getCurrencySymbol(currency)
     const formatInfo = getCurrencyFormatInfo(currency)
     const groupSeparator = formatInfo.group_sep || ","
@@ -284,7 +290,7 @@ const UnreconciledTransactions = ({ contentHeight }: { contentHeight: number }) 
             estimateSize={74}
             getItemKey={(transaction) => transaction.name}
         >
-            {(transaction) => <UnreconciledTransactionItem transaction={transaction} />}
+            {(transaction) => <UnreconciledTransactionItem transaction={transaction} accountCurrency={freshAccountCurrency} />}
         </VirtualizedListBody>
 
     </div>
@@ -325,7 +331,7 @@ const UnreconciledTransactionsLoadingState = () => {
     </div>
 }
 
-const UnreconciledTransactionItem = ({ transaction }: { transaction: UnreconciledTransaction }) => {
+const UnreconciledTransactionItem = ({ transaction, accountCurrency }: { transaction: UnreconciledTransaction, accountCurrency?: string }) => {
 
     const selectedBank = useAtomValue(selectedBankAccountAtom)
 
@@ -335,24 +341,37 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
 
     const isSelected = selectedTransaction?.some((t) => t.name === transaction.name)
 
-    const currency = transaction.currency ?? selectedBank?.account_currency ?? getCompanyCurrency(selectedBank?.company ?? '')
+    const currency = transaction.currency ?? accountCurrency ?? selectedBank?.account_currency ?? getCompanyCurrency(selectedBank?.company ?? '')
 
-    // Compares the transaction currency against the account currency `bank_account.get_list`
-    // attaches to each bank account. Either value may be absent, so an absent one means "nothing to
-    // compare" rather than a mismatch.
-    const isCurrencyMismatch = Boolean(transaction.currency && selectedBank?.account_currency && transaction.currency !== selectedBank.account_currency)
+    // Compares the transaction currency against the account currency the SERVER'S CURRENT
+    // bank-account list reports for the selected account (`accountCurrency`, sourced from
+    // `useSelectedBankAccountCurrency` by the list above). It deliberately does NOT fall back to
+    // `selectedBank.account_currency` for this decision, even though the display currency above
+    // does: that value is a `localStorage` snapshot of the account row as it looked when it was last
+    // picked, and `account_currency` is derived by the endpoint from the linked `Account` rather than
+    // stored on `Bank Account` - so the snapshot can name a currency the account no longer uses.
+    // Deciding this from stale data can invent a mismatch or hide a real one, and a warning that is
+    // wrong in either direction is worse than no warning. Either side may legitimately be absent
+    // (`currency` is optional on the transaction, and the endpoint cannot always derive one), and an
+    // absent value means "nothing to compare" rather than a mismatch - so no advisory is shown until
+    // both values are actually known.
+    const isCurrencyMismatch = Boolean(transaction.currency && accountCurrency && transaction.currency !== accountCurrency)
 
     // The advisory is authored once and consumed twice - as the badge's tooltip for pointer users and
     // as the row's own accessible description for keyboard and screen-reader users - so the two can
-    // never drift apart. The copy states only what is known for certain: that the two currencies
-    // differ, and that the server decides the outcome. It deliberately promises NEITHER a successful
-    // unconverted posting NOR a rejection, because FM5 makes the backend the authority on what
-    // actually happens and this indicator is advisory only. (A mismatch is not in fact always
-    // refused: `reconcile_vouchers` saves an already-submitted document, so Frappe routes it through
-    // `update_after_submit` and `validate_currency` never runs.)
+    // never drift apart.
+    //
+    // The copy states ONLY what this client has observed: the two currency codes differ, and this
+    // indicator does not stop the reconciliation. It makes no claim about what the server will do
+    // with the mismatch, because the server does not in fact check it on this path -
+    // `validate_currency` is invoked from `validate()`, and `reconcile_vouchers` saves a document
+    // that is already submitted, which Frappe routes through `update_after_submit`, so `validate()`
+    // never runs. Telling the reviewer their currencies would be "validated" would therefore be
+    // describing a check that does not happen here. FM5 keeps the backend the authority on the
+    // outcome; where the backend asserts nothing, this indicator asserts nothing on its behalf.
     const currencyAdvisoryId = useId()
     const currencyAdvisory = isCurrencyMismatch
-        ? _("Transaction currency {0} differs from the bank account currency {1}. The server validates the currencies and decides whether this reconciliation is accepted, so review the match before confirming.", [currency, selectedBank?.account_currency ?? ''])
+        ? _("Transaction currency {0} differs from the bank account currency {1}. This is an advisory check made here only and does not block the reconciliation - review the match before confirming.", [currency, accountCurrency ?? ''])
         : ''
 
     const handleSelectTransaction = (event: React.MouseEvent<HTMLDivElement>) => {
@@ -893,7 +912,7 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
     const selectedBank = useAtomValue(selectedBankAccountAtom)
     const selectedTransaction = useAtomValue(bankRecSelectedTransactionAtom(selectedBank?.name || ''))
 
-    const { amountMatches, postingDateMatches, referenceDateMatches, referenceMatchesFull, referenceMatchesPartial, isSuggested } = useMemo(() => {
+    const { amountMatches, postingDateMatches, referenceDateMatches, referenceMatchesFull, referenceMatchesPartial, isSuggested, referenceLabel } = useMemo(() => {
 
         const transaction = selectedTransaction?.[0]
 
@@ -904,24 +923,49 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
         // Whether this is suggested or not - depends on the above scores
 
         const amountMatches = voucher.paid_amount === transaction?.unallocated_amount
-        const postingDateMatches = voucher.posting_date === transaction?.date
-        const referenceDateMatches = voucher.reference_date === transaction?.date
-        const referenceMatchesFull = voucher.reference_no === transaction?.reference_number || voucher.reference_no === transaction?.description
 
-        const referenceMatchesPartial = transaction?.reference_number?.includes(voucher.reference_no) || transaction?.description?.includes(voucher.reference_no)
+        // Dates and references are graded by the shared predicates in `./utils` rather than
+        // compared inline, because a raw comparison cannot tell "these agree" apart from
+        // "neither side has a value". Two of the four voucher types `get_linked_payments`
+        // unions supply `reference_no`/`reference_date` as a constant empty string and a third
+        // can supply NULL, and `BankTransaction.date`/`reference_number`/`description` are all
+        // optional - so blank-versus-blank was reading as a match, and `includes('')` (always
+        // true) scored EVERY blank-reference invoice as a partial match against EVERY
+        // transaction. That fed the `isSuggested` disjunction below and promoted an
+        // amount-only coincidence to a green, solid-button "suggested" row.
+        const postingDateMatches = matchVoucherDate(voucher.posting_date, transaction?.date)
+        const referenceDateMatches = matchVoucherDate(voucher.reference_date, transaction?.date)
 
+        const referenceMatch = matchVoucherReference(voucher.reference_no, [transaction?.reference_number, transaction?.description])
+        const referenceMatchesFull = referenceMatch === 'full'
+        const referenceMatchesPartial = referenceMatch === 'partial'
 
-        const isSuggested = amountMatches && (postingDateMatches || referenceDateMatches || referenceMatchesPartial) && index === 0
+        // Any genuine reference agreement counts here, exactly as before: under the previous
+        // inline comparison an exact match implied the partial one too (a string contains
+        // itself), so testing `!== 'none'` preserves that behaviour now that the two grades
+        // are mutually exclusive.
+        const isSuggested = amountMatches && (postingDateMatches || referenceDateMatches || referenceMatch !== 'none') && index === 0
 
-        return { isSelected: false, amountMatches, postingDateMatches, referenceDateMatches, referenceMatchesFull, referenceMatchesPartial, isSuggested: isSuggested }
+        // The trimmed reference, used to decide whether the reference row is rendered at all -
+        // a whitespace-only value must not paint an empty label with a "No Match" badge beside
+        // it.
+        const referenceLabel = (voucher.reference_no ?? '').trim()
+
+        return { isSelected: false, amountMatches, postingDateMatches, referenceDateMatches, referenceMatchesFull, referenceMatchesPartial, isSuggested: isSuggested, referenceLabel }
 
     }, [voucher, selectedTransaction, index])
 
-    const { reconcileTransaction, loading } = useReconcileTransaction()
+    const { reconcileTransaction, loading, isSettling } = useReconcileTransaction()
 
     // Mirrors the backend guard that refuses a post once `unallocated_amount <= 0`; `status` is
     // tested alongside it because the server derives the two from each other. The server remains
     // authoritative - this only stops the affordance offering an action that cannot succeed.
+    //
+    // It reads the SELECTION, which the reconcile hook rebuilds from the server's own refreshed rows
+    // after a rejection - so once an attempt has been refused, this predicate is evaluating the
+    // server's current `status` / `unallocated_amount` rather than the snapshot the attempt was made
+    // against. That is what turns the guard from a first-load-only check into one that also catches
+    // the stale-client case in FM3.
     const transactionUnderReview = selectedTransaction?.[0]
     const isAlreadyReconciled = transactionUnderReview
         ? transactionUnderReview.status === 'Reconciled' || (transactionUnderReview.unallocated_amount ?? 0) <= 0
@@ -934,10 +978,16 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
         reconcileTransaction(selectedTransaction[0], voucher)
     }
 
+    // `isSettling` covers a strictly wider window than `loading`: it stays raised past the point the
+    // request settles, until a rejected attempt has been reconciled against the server and this
+    // row's guard is reading refreshed state. Gating the control on it is what stops a second post
+    // being fired at a snapshot the client has just been told is unreliable. The label still keys off
+    // `loading` alone, so "Reconciling" is only ever shown while something is genuinely being
+    // attempted; the verify window gets its own wording rather than borrowing that claim.
     const reconcileButton = <Button
         variant={isSuggested || amountMatches ? "solid" : "outline"}
         theme={isSuggested || amountMatches ? "green" : "gray"}
-        onClick={onClick} disabled={loading || isAlreadyReconciled}>{loading ? <><Loader2 className="w-4 h-4 animate-spin" /> {_("Reconciling")}...</> : `${_("Reconcile")}`}</Button>
+        onClick={onClick} disabled={loading || isSettling || isAlreadyReconciled}>{loading ? <><Loader2 className="w-4 h-4 animate-spin" /> {_("Reconciling")}...</> : isSettling ? <><Loader2 className="w-4 h-4 animate-spin" /> {_("Checking")}...</> : `${_("Reconcile")}`}</Button>
 
     return <div className="py-1 px-1">
         <div
@@ -975,15 +1025,21 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
                                 <div className="text-base font-medium flex items-center gap-1">{formatDate(voucher.posting_date)} {postingDateMatches ? <MatchBadge matchType="full" label={_("Posting date matches the selected transaction")} /> : <MatchBadge matchType="none" label={_("Posting date does not match the selected transaction")} />}</div>
                             </div>
 
-                            {voucher.reference_date && <div className="flex flex-col gap-1 min-w-24">
+                            {/* Trimmed, because the invoice branches of `get_linked_payments`
+                                supply a constant empty string here and the Journal Entry branch
+                                can supply NULL - neither of which should reach `formatDate`. */}
+                            {voucher.reference_date?.trim() && <div className="flex flex-col gap-1 min-w-24">
                                 <div className="text-xs text-ink-gray-6">{_("Reference Date")}</div>
                                 <div className="text-base font-medium flex items-center gap-1">{formatDate(voucher.reference_date)} {referenceDateMatches ? <MatchBadge matchType="full" label={_("Reference date matches the selected transaction")} /> : <MatchBadge matchType="none" label={_("Reference date does not match the selected transaction")} />}</div>
                             </div>}
 
                         </div>
-                        {voucher.reference_no && <div className="flex items-start gap-1">
+                        {/* Same reasoning as the reference date: a blank or whitespace-only
+                            reference is not rendered at all, so no voucher is ever labelled
+                            with an empty reference and a grade beside it. */}
+                        {referenceLabel && <div className="flex items-start gap-1">
                             <span className="text-p-base">
-                                {voucher.reference_no}
+                                {referenceLabel}
                                 &nbsp;&nbsp;
                                 <Tooltip>
                                     <TooltipTrigger>
