@@ -128,9 +128,16 @@ const ReconcileProgress = () => {
 
     const { data: unreconciledTransactions, } = useGetUnreconciledTransactions()
 
-    const reconciledCount = (totalCount ?? 0) - (unreconciledTransactions?.message?.length ?? 0)
+    // The two inputs are independently cached - the total is a document count keyed by SWR itself,
+    // the remainder comes from the unreconciled-transactions key - so one can refresh while the
+    // other is still serving its previous value. The unreconciled set is always a subset of the
+    // total, which means their difference is only ever negative while the two are momentarily out
+    // of step; clamping keeps the rendered figure impossible to read as a real number of
+    // reconciliations (a bare subtraction briefly showed "-2 / 2 reconciled"). No extra
+    // revalidation is issued here: the derived value is hardened instead.
+    const reconciledCount = Math.max(0, (totalCount ?? 0) - (unreconciledTransactions?.message?.length ?? 0))
 
-    const progress = (totalCount ? reconciledCount / totalCount : 0) * 100
+    const progress = Math.min(100, (totalCount ? reconciledCount / totalCount : 0) * 100)
 
     return <div className="w-[18%] flex flex-col gap-1 items-end">
         <div className="w-full">

@@ -47,7 +47,12 @@ import '@testing-library/jest-dom/vitest'
 // `globals: true` exposes the Vitest API at runtime but does not TYPE it —
 // `tsconfig.app.json` declares no `types` array and adding one is out of bounds — so
 // every Vitest symbol must be imported explicitly.
-import { afterEach, vi } from 'vitest'
+import { afterEach, beforeEach, vi } from 'vitest'
+
+// Imported so the shared teardown below can reset the `frappe-react-sdk` spies without any
+// suite having to opt in. Importing this executes no application code - it declares fixtures
+// and `vi.fn` spies only.
+import { resetFrappeSDKMock } from './factories'
 import { cleanup } from '@testing-library/react'
 
 /* ── 1. Fixture identity ─────────────────────────────────────────────────────────── */
@@ -114,16 +119,20 @@ const CSRF_TOKEN = 'test-csrf-token'
 const TEST_ROLES = ['System Manager', 'Accounts Manager', 'Accounts User']
 
 /**
- * Granted uniformly across all eight arrays because this harness models a fully
- * privileged Administrator. Sourced from the working tree: the reconciliation and import
- * core plus the voucher types a manual override may link to; the DocTypes reached through
- * Frappe SDK document hooks (Account, Accounts Settings, Bank Account Balance, Bank
- * Statement Import Log, Bank Transaction, Bank Transaction Rule, Party Type); and the
- * DocTypes passed to `LinkFieldCombobox`, which calls `canCreateDocument(doctype)` at
- * `src/components/common/LinkFieldCombobox.tsx:130` (Company, Cost Center, Mode of
- * Payment, Payment Entry Deduction).
+ * The bounded universe of DocTypes this harness models. Sourced from the working tree: the
+ * reconciliation and import core plus the voucher types a manual override may link to; the
+ * DocTypes reached through Frappe SDK document hooks (Account, Accounts Settings, Bank
+ * Account Balance, Bank Statement Import Log, Bank Transaction, Bank Transaction Rule,
+ * Party Type); and the DocTypes passed to `LinkFieldCombobox`, which calls
+ * `canCreateDocument(doctype)` at `src/components/common/LinkFieldCombobox.tsx:130`
+ * (Company, Cost Center, Mode of Payment, Payment Entry Deduction).
+ *
+ * Membership of this list is NOT itself a grant. What each `can_*` array contains is
+ * DERIVED below from the real DocPerm rows and DocType flags, exactly as the server
+ * derives them, so the harness reproduces production authorisation rather than asserting
+ * a blanket one.
  */
-const PERMITTED_DOCTYPES = [
+const MODELLED_DOCTYPES = [
 	'Bank Transaction',
 	'Bank Transaction Rule',
 	'Bank Statement Import Log',
@@ -143,6 +152,232 @@ const PERMITTED_DOCTYPES = [
 	'Party Type',
 	'File'
 ]
+
+/**
+ * The DocType flags `build_permissions` branches on (`frappe/frappe/utils/user.py`).
+ * Transcribed from `tabDocType` on a provisioned site, so only the non-default values are
+ * listed and every omission means "0":
+ *
+ *   • `Payment Entry Deduction` is the only child table (`istable`), which is why it
+ *     reaches NO array — Frappe excludes child tables from create/write/read/search, and
+ *     it carries no DocPerm rows of its own either.
+ *   • `Accounts Settings` is the only Single (`issingle`), so it can be written but never
+ *     "created".
+ *   • `Party Type` is the only `in_create` DocType, so it is writable and readable but is
+ *     excluded from `can_create` — which is exactly why `LinkFieldCombobox` must not offer
+ *     to create one.
+ *   • `read_only` is 0 for all eighteen, so the `all_read` / no-list-view-link branch of
+ *     the server's algorithm is unreachable here and is deliberately not modelled.
+ */
+const DOCTYPE_FLAGS: Record<string, { istable?: boolean, issingle?: boolean, in_create?: boolean, allow_import?: boolean }> = {
+	'Account': { allow_import: true },
+	'Accounts Settings': { issingle: true },
+	'Bank': { allow_import: true },
+	'Bank Account': { allow_import: true },
+	'Bank Account Balance': {},
+	'Bank Statement Import Log': {},
+	'Bank Transaction': { allow_import: true },
+	'Bank Transaction Rule': {},
+	'Company': { allow_import: true },
+	'Cost Center': { allow_import: true },
+	'File': { allow_import: true },
+	'Journal Entry': { allow_import: true },
+	'Mode of Payment': { allow_import: true },
+	'Party Type': { in_create: true },
+	'Payment Entry': { allow_import: true },
+	'Payment Entry Deduction': { istable: true },
+	'Purchase Invoice': { allow_import: true },
+	'Sales Invoice': { allow_import: true }
+}
+
+/**
+ * The rights `build_permissions` consults on the way to the eight arrays
+ * `src/lib/permissions.ts` reads.
+ *
+ * `submit`, `amend`, `report`, `print`, `email`, `share` and `select` are deliberately NOT
+ * modelled: none of those eight arrays is derived from them, so including them would be
+ * unused fixture surface — the same reasoning applied elsewhere in this file.
+ */
+type DocPermRight = 'read' | 'write' | 'create' | 'delete' | 'cancel' | 'import' | 'export'
+
+interface DocPermRow {
+	doctype: string
+	role: string
+	rights: Set<DocPermRight>
+}
+
+/** Declares one DocPerm row; only the GRANTED rights are named, every omission is a zero. */
+const perm = (doctype: string, role: string, granted: string): DocPermRow => ({
+	doctype,
+	role,
+	rights: new Set(granted.split(' ').filter(Boolean) as DocPermRight[])
+})
+
+/**
+ * The authoritative DocPerm rows for the three modelled roles, read from `tabDocPerm` on a
+ * provisioned site rather than invented.
+ *
+ * Two DocTypes ship a second, narrower Accounts Manager row upstream (Purchase Invoice and
+ * Sales Invoice each have a read+write-only row alongside the full one). Those pairs are
+ * merged here by union, which is precisely what the server's own `build_perm_map` does when
+ * it ORs every matching row together — so one row per (DocType, role) pair is faithful, not
+ * a simplification.
+ *
+ * The asymmetries that matter for this SPA are visible directly in the data: `Bank
+ * Statement Import Log` and `Bank` are granted to System Manager ONLY, `Bank Account` has
+ * no System Manager row at all, `Accounts User` gets read-only Company / Cost Center /
+ * Mode of Payment, and only five DocTypes grant `cancel` to anyone.
+ */
+const DOCPERM_ROWS: DocPermRow[] = [
+	perm('Account', 'Accounts Manager', 'read write create delete import export'),
+	perm('Account', 'Accounts User', 'read write create delete import export'),
+	perm('Accounts Settings', 'Accounts Manager', 'read write create'),
+	perm('Bank', 'System Manager', 'read write create delete export'),
+	perm('Bank Account', 'Accounts Manager', 'read write create delete import export'),
+	perm('Bank Account', 'Accounts User', 'read write create delete export'),
+	perm('Bank Account Balance', 'Accounts Manager', 'read write create delete export'),
+	perm('Bank Account Balance', 'Accounts User', 'read write create delete export'),
+	perm('Bank Account Balance', 'System Manager', 'read write create delete export'),
+	perm('Bank Statement Import Log', 'System Manager', 'read write create delete export'),
+	perm('Bank Transaction', 'Accounts Manager', 'read write create delete cancel export'),
+	perm('Bank Transaction', 'Accounts User', 'read write create delete export'),
+	perm('Bank Transaction', 'System Manager', 'read write create delete cancel export'),
+	perm('Bank Transaction Rule', 'Accounts Manager', 'read write create delete export'),
+	perm('Bank Transaction Rule', 'Accounts User', 'read write create delete export'),
+	perm('Bank Transaction Rule', 'System Manager', 'read write create delete export'),
+	perm('Company', 'Accounts Manager', 'read write create delete export'),
+	perm('Company', 'Accounts User', 'read'),
+	perm('Company', 'System Manager', 'read write create delete'),
+	perm('Cost Center', 'Accounts Manager', 'read write create delete'),
+	perm('Cost Center', 'Accounts User', 'read'),
+	perm('File', 'System Manager', 'read write create delete import export'),
+	perm('Journal Entry', 'Accounts Manager', 'read write create delete cancel import export'),
+	perm('Journal Entry', 'Accounts User', 'read write create delete cancel'),
+	perm('Mode of Payment', 'Accounts Manager', 'read write create'),
+	perm('Mode of Payment', 'Accounts User', 'read'),
+	perm('Party Type', 'Accounts Manager', 'read export'),
+	perm('Party Type', 'Accounts User', 'read export'),
+	perm('Party Type', 'System Manager', 'read export'),
+	perm('Payment Entry', 'Accounts Manager', 'read write create delete cancel import export'),
+	perm('Payment Entry', 'Accounts User', 'read write create delete cancel import export'),
+	perm('Purchase Invoice', 'Accounts Manager', 'read write create delete cancel'),
+	perm('Purchase Invoice', 'Accounts User', 'read write create cancel'),
+	perm('Sales Invoice', 'Accounts Manager', 'read write create delete cancel'),
+	perm('Sales Invoice', 'Accounts User', 'read write create')
+]
+
+/** The eight arrays `src/lib/permissions.ts` indexes, and nothing else. */
+export interface UserPermissionArrays {
+	can_read: string[]
+	can_write: string[]
+	can_create: string[]
+	can_delete: string[]
+	can_cancel: string[]
+	can_search: string[]
+	can_import: string[]
+	can_export: string[]
+}
+
+/**
+ * Derives the eight `can_*` arrays for a set of roles, following the server's own
+ * `build_permissions` algorithm (`frappe/frappe/utils/user.py`) step for step:
+ *
+ *  1. Rights are OR-ed across every DocPerm row whose role the user holds.
+ *  2. Child tables are excluded from create / write / read / search entirely.
+ *  3. `create && !issingle` places a DocType in `can_create`, or in the internal
+ *     `in_create` bucket when the DocType is `in_create`; otherwise `write` places it in
+ *     `can_write`; otherwise `read` places it in `can_read`.
+ *  4. `cancel` and `delete` are independent of that chain.
+ *  5. `import` and `export` require read, write or create first.
+ *  6. `can_search` needs read, write or create and a non-child DocType; Singles and
+ *     read-only DocTypes are excluded for every user EXCEPT Administrator, which is the
+ *     one place the fixture identity changes the result.
+ *  7. The buckets cascade upward: `can_write += can_create + in_create`, then
+ *     `can_read += can_write`.
+ *  8. A System Manager additionally gains `can_import` for every importable DocType —
+ *     applied here across the modelled universe, which is what keeps the fixture bounded.
+ *
+ * DocShare and Property Setter contributions are omitted: the harness seeds neither, so
+ * both would add empty sets.
+ *
+ * This is what replaces the previous blanket grant, and it is why a suite can now write a
+ * meaningful NEGATIVE authorisation test: the arrays genuinely differ per role, so
+ * `installRoleProfile(['Accounts User'])` really cannot read `Bank Statement Import Log`.
+ */
+export const buildUserPermissions = (roles: string[], userName: string = TEST_USER): UserPermissionArrays => {
+	const held = new Set(roles)
+
+	const canCreate: string[] = []
+	const inCreate: string[] = []
+	const canWrite: string[] = []
+	const canRead: string[] = []
+	const canDelete: string[] = []
+	const canCancel: string[] = []
+	const canSearch: string[] = []
+	const canImport: string[] = []
+	const canExport: string[] = []
+
+	MODELLED_DOCTYPES.forEach((doctype) => {
+		const flags = DOCTYPE_FLAGS[doctype] ?? {}
+
+		const granted = new Set<DocPermRight>()
+		DOCPERM_ROWS.forEach((row) => {
+			if (row.doctype === doctype && held.has(row.role)) {
+				row.rights.forEach((right) => granted.add(right))
+			}
+		})
+
+		if (!flags.istable) {
+			if (granted.has('create') && !flags.issingle) {
+				(flags.in_create ? inCreate : canCreate).push(doctype)
+			} else if (granted.has('write')) {
+				canWrite.push(doctype)
+			} else if (granted.has('read')) {
+				canRead.push(doctype)
+			}
+		}
+
+		if (granted.has('cancel')) {
+			canCancel.push(doctype)
+		}
+
+		if (granted.has('delete')) {
+			canDelete.push(doctype)
+		}
+
+		if (granted.has('read') || granted.has('write') || granted.has('create')) {
+			if (granted.has('import')) {
+				canImport.push(doctype)
+			}
+
+			if (granted.has('export')) {
+				canExport.push(doctype)
+			}
+
+			if (!flags.istable && (userName === 'Administrator' || !flags.issingle)) {
+				canSearch.push(doctype)
+			}
+		}
+	})
+
+	const write = [...canWrite, ...canCreate, ...inCreate]
+	const read = [...canRead, ...write]
+
+	const importable = held.has('System Manager')
+		? Array.from(new Set([...canImport, ...MODELLED_DOCTYPES.filter((doctype) => DOCTYPE_FLAGS[doctype]?.allow_import)]))
+		: canImport
+
+	return {
+		can_read: read,
+		can_write: write,
+		can_create: canCreate,
+		can_delete: canDelete,
+		can_cancel: canCancel,
+		can_search: canSearch,
+		can_import: importable,
+		can_export: canExport
+	}
+}
 
 /* ── 3. `locals`, derived from `boot.docs` exactly as production derives it ───────────
  * `namespace/sync.js:51-63` reduces to one rule:
@@ -214,6 +449,35 @@ BOOT_DOCUMENTS.forEach(addToLocals)
  * blob, restricted to the fields the SPA actually reads.
  * ────────────────────────────────────────────────────────────────────────────────── */
 
+/**
+ * Builds `boot.user`. A FACTORY rather than a literal for two reasons: every array is a
+ * fresh object, so a test that mutates one cannot leak into another test or into a sibling
+ * array; and {@link installRoleProfile} can rebuild the whole profile for a different role
+ * set without hand-assembling it.
+ */
+function createUserProfile(roles: string[], userName: string) {
+	return {
+		/** The decisive render gate at `src/App.tsx:45`. */
+		name: userName,
+		/** `hasRole()` — `src/lib/permissions.ts:76-78`. */
+		roles: [...roles],
+
+		/**
+		 * `useCurrentCompany()` reads `company` at `src/hooks/useCurrentCompany.ts:4`
+		 * (module load) and `:8` (render); `getUserDateFormat()` reads `date_format` at
+		 * `src/lib/date.ts:21` and calls `.toUpperCase()` on it unguarded.
+		 */
+		defaults: {
+			company: TEST_COMPANY,
+			date_format: DEFAULT_DATE_FORMAT
+		},
+
+		// The eight arrays behind `src/lib/permissions.ts`, DERIVED from the DocPerm rows
+		// above rather than granted wholesale.
+		...buildUserPermissions(roles, userName)
+	}
+}
+
 const boot = {
 	/** `src/App.tsx:41` passes this to `FrappeProvider` as `siteName`. */
 	sitename: 'test.localhost',
@@ -273,40 +537,19 @@ const boot = {
 		link_field_results_limit: '10'
 	},
 
-	user: {
-		/** The decisive render gate at `src/App.tsx:45`. */
-		name: TEST_USER,
-		/** `hasRole()` — `src/lib/permissions.ts:76-78`. */
-		roles: TEST_ROLES,
-
-		/**
-		 * `useCurrentCompany()` reads `company` at `src/hooks/useCurrentCompany.ts:4`
-		 * (module load) and `:8` (render); `getUserDateFormat()` reads `date_format` at
-		 * `src/lib/date.ts:21` and calls `.toUpperCase()` on it unguarded.
-		 */
-		defaults: {
-			company: TEST_COMPANY,
-			date_format: DEFAULT_DATE_FORMAT
-		},
-
-		// The eight arrays behind `src/lib/permissions.ts`. Fresh copies each, so a test
-		// that mutates one list cannot leak into the others.
-		can_read: [...PERMITTED_DOCTYPES],
-		can_write: [...PERMITTED_DOCTYPES],
-		can_create: [...PERMITTED_DOCTYPES],
-		can_delete: [...PERMITTED_DOCTYPES],
-		can_cancel: [...PERMITTED_DOCTYPES],
-		can_search: [...PERMITTED_DOCTYPES],
-		can_import: [...PERMITTED_DOCTYPES],
-		can_export: [...PERMITTED_DOCTYPES]
-	}
+	user: createUserProfile(TEST_ROLES, TEST_USER)
 }
 
 /* ── 5. Install `window.frappe` ──────────────────────────────────────────────────────
  * No cast needed: `src/vite-env.d.ts:3-6` already types `Window.frappe` as `any`.
  * ────────────────────────────────────────────────────────────────────────────────── */
 
-window.frappe = {
+/**
+ * The `frappe` namespace object, held in a const so {@link resetHarnessState} can restore
+ * it - and reset the mutable maps inside it - rather than leaving a test's pollution in
+ * place for the next one.
+ */
+const frappeNamespace = {
 	boot,
 
 	/**
@@ -333,10 +576,12 @@ window.frappe = {
 	},
 
 	/** `namespace/namespace.js:18-22` provides these namespaces in production. */
-	flags: {},
-	settings: {},
-	defaults: {}
+	flags: {} as Record<string, unknown>,
+	settings: {} as Record<string, unknown>,
+	defaults: {} as Record<string, unknown>
 }
+
+window.frappe = frappeNamespace
 
 /* ── 6. Install the BARE globals ─────────────────────────────────────────────────────
  * `src/lib/currency.ts:3` evaluates `if (frappe.boot)` on the bare identifier, so an
@@ -366,6 +611,86 @@ globalScope.csrf_token = CSRF_TOKEN
 
 document.cookie = `user_id=${TEST_USER}`
 
+/* ── 7b. Per-test reconstruction of the Frappe runtime ───────────────────────────────
+ * Everything above is installed once, synchronously, at module scope - that ordering is
+ * load-bearing and is preserved exactly (see the file header). What follows ADDS a rebuild
+ * of the same state around every test, because installing once is not isolation: boot
+ * data, the eight permission arrays, `locals`, the translation map and the cookie are all
+ * mutable objects reachable from any test through a global, so one test narrowing a
+ * permission array or stamping a document into `locals` would otherwise change the
+ * environment every later test runs in.
+ * ────────────────────────────────────────────────────────────────────────────────── */
+
+/** Pristine copies taken before any test can touch them, so restoration cannot drift. */
+const PRISTINE_SYSDEFAULTS = structuredClone(boot.sysdefaults)
+const PRISTINE_BOOT_DOCUMENTS = structuredClone(BOOT_DOCUMENTS)
+
+/**
+ * Rebuilds `locals` from a document set using the production rule, clearing whatever was
+ * there first. The object IDENTITY is preserved rather than replaced, so any module that
+ * captured the global still sees the rebuilt contents.
+ */
+const rebuildLocals = (docs: LocalsDocument[]): void => {
+	Object.keys(LOCALS).forEach((doctype) => {
+		delete LOCALS[doctype]
+	})
+
+	LOCALS.DocType = {}
+	docs.forEach(addToLocals)
+}
+
+/**
+ * Installs a role profile, deriving the eight `can_*` arrays from the real DocPerm rows.
+ *
+ * This is the affordance that makes a NEGATIVE authorisation test possible, which the
+ * previous blanket grant could not express:
+ *
+ *     installRoleProfile(['Accounts User'])   // cannot read Bank Statement Import Log
+ *     installRoleProfile([])                  // every array empty: denied by default
+ *     installRoleProfile(TEST_ROLES, 'accountant@example.com')
+ *
+ * The second argument also lets a suite stop modelling the superuser: `Administrator` is
+ * the one identity the server's own algorithm treats specially (it keeps Singles in
+ * `can_search`), so passing an ordinary user name exercises the same path a real reviewer
+ * would. The cookie is re-set to match, because `src/App.tsx:18-19` gates rendering on it.
+ *
+ * The default profile is restored before and after every test, so a suite calling this
+ * cannot leak its narrowed profile into another test.
+ */
+export const installRoleProfile = (roles: string[], userName: string = TEST_USER): void => {
+	boot.user = createUserProfile(roles, userName)
+	document.cookie = `user_id=${userName}`
+}
+
+/**
+ * Restores the whole harness to its as-installed state: the default role profile and its
+ * derived permission arrays, a fresh `sysdefaults`, a fresh document set with `locals`
+ * rebuilt from those very documents (so the two cannot disagree), empty translation and
+ * namespace maps, and the three bare globals plus the cookie re-pointed at them.
+ */
+const resetHarnessState = (): void => {
+	installRoleProfile(TEST_ROLES, TEST_USER)
+
+	boot.sysdefaults = structuredClone(PRISTINE_SYSDEFAULTS)
+
+	const docs = structuredClone(PRISTINE_BOOT_DOCUMENTS)
+	boot.docs = docs
+	rebuildLocals(docs)
+
+	frappeNamespace.boot = boot
+	frappeNamespace._messages = {}
+	frappeNamespace.flags = {}
+	frappeNamespace.settings = {}
+	frappeNamespace.defaults = {}
+
+	window.frappe = frappeNamespace
+	globalScope.frappe = frappeNamespace
+	globalScope.locals = LOCALS
+	globalScope.csrf_token = CSRF_TOKEN
+}
+
+beforeEach(resetHarnessState)
+
 /* ── 8. Browser APIs jsdom does not implement ────────────────────────────────────── */
 
 /**
@@ -377,12 +702,12 @@ document.cookie = `user_id=${TEST_USER}`
  *   • `src/hooks/use-mobile.ts:9-15` queries `(max-width: 767px)` and attaches the same
  *     listener pair.
  *
- * `matches: false` is deliberate on both counts: it resolves the theme to `Light`
- * (theme-provider line 44) and keeps `useIsMobile()` on the desktop branch — the only
- * branch the reconciliation workbench supports, since
- * `src/pages/BankReconciliation.tsx` otherwise renders a "not supported on mobile" empty
- * state. Echoing the caller's `query` back as `media` keeps the object faithful to the
- * real interface.
+ * `matches: false` resolves the theme to `Light` (theme-provider line 44). It does NOT
+ * decide the mobile branch: `useIsMobile()` derives that from `window.innerWidth`, which
+ * jsdom defaults to 1024 — above the 768 breakpoint — so the reconciliation workbench
+ * renders its desktop layout rather than the "not supported on mobile" empty state.
+ * Echoing the caller's `query` back as `media` keeps the object faithful to the real
+ * interface.
  */
 const createMediaQueryList = (query: string) => ({
 	matches: false,
@@ -396,7 +721,13 @@ const createMediaQueryList = (query: string) => ({
 	dispatchEvent: vi.fn()
 })
 
-window.matchMedia = vi.fn(createMediaQueryList)
+/**
+ * Held in a named binding so the teardown below can discard the call history it accumulates,
+ * together with any per-test `mockImplementationOnce` a suite installed.
+ */
+const matchMediaMock = vi.fn(createMediaQueryList)
+
+window.matchMedia = matchMediaMock
 
 /**
  * `ResizeObserver` is required by the Radix primitives the design system is built on and
@@ -470,8 +801,21 @@ Element.prototype.releasePointerCapture = function releasePointerCapture(): void
 
 afterEach(() => {
 	// Unmount anything React Testing Library rendered, so the next test starts from an
-	// empty document instead of inheriting the previous test's tree.
+	// empty document instead of inheriting the previous test's tree. It runs FIRST because
+	// React effect cleanups fire during unmount and some of them still touch the SDK spies,
+	// whose calls would otherwise land in freshly cleared history.
 	cleanup()
+
+	// Automatic rather than opt-in: the realtime-listener stub records callbacks in a
+	// module-level map that React's unmount cleanup does not remove, and a forgotten reset
+	// let one test's recorded calls and per-test implementations govern the next. Because it
+	// also discards per-test implementations, install those from a suite's own `beforeEach`
+	// (or inside the test) rather than at `describe` or module scope.
+	resetFrappeSDKMock()
+
+	// `mockReset`, not `mockClear`, so a per-test override is discarded along with the history.
+	matchMediaMock.mockReset()
+	matchMediaMock.mockImplementation(createMediaQueryList)
 
 	// The SPA persists reconciliation UI state outside React: `atomWithStorage` backs
 	// `bank-rec-selected-bank`, `bank-rec-date`, `bank-rec-match-filters` and
@@ -482,6 +826,13 @@ afterEach(() => {
 	// each test file, so no global store reset is attempted here.
 	localStorage.clear()
 	sessionStorage.clear()
+
+	// Rebuild the Frappe runtime AFTER the test as well as before it. Doing both ends is
+	// deliberate: `beforeEach` protects the test that is about to run, while this call makes
+	// sure nothing a test installed - a narrowed permission array, a synced document, a
+	// translation override, a changed identity cookie - is still observable to anything that
+	// inspects the environment between tests, or to a `beforeAll` in a later suite.
+	resetHarnessState()
 })
 
 /* ── LIVE VERIFICATION ───────────────────────────────────────────────────────────────
@@ -500,8 +851,8 @@ afterEach(() => {
  *   • `boot.time_zone` is an OBJECT `{ system, user }`, not a string — matching the two
  *     separate reads at `date.ts:142-143`.
  *   • `boot.docs` is an array, and `locals`' top-level keys are exactly the doctypes it
- *     contains. That is why `LOCALS` above is derived from `BOOT_DOCS` through the same
- *     `add_to_locals` rule the app itself uses: the two cannot drift apart.
+ *     contains, which is why `LOCALS` above is derived from `BOOT_DOCS` through the same
+ *     `add_to_locals` rule the app itself uses rather than being written out separately.
  *   • `frappe.model.sync` and `frappe.model.add_to_locals` are functions and `_messages`
  *     is an object, so the stubs here occupy the same slots the app expects.
  *   • `matchMedia`, `ResizeObserver`, `scrollIntoView`, `hasPointerCapture`,
@@ -516,11 +867,33 @@ afterEach(() => {
  * and `float_precision: '3'` is also `numbers.ts:53`'s own fallback. `_messages` stays
  * `{}` on purpose so `_()` returns the literal string and assertions read plainly.
  *
- * Permission arrays: the live Administrator's `can_cancel` excludes Bank Account, Bank
- * Transaction Rule and Bank Statement Import Log, and its `can_import` excludes the latter
- * two. This harness grants every array the full list so no test is blocked by an unrelated
- * permission gate; a test asserting a DENIED permission must narrow the relevant array
- * itself rather than rely on this default.
+ * Permission arrays: DERIVED, not granted. `DOCPERM_ROWS` and `DOCTYPE_FLAGS` above are
+ * transcribed from `tabDocPerm` and `tabDocType` on a provisioned site, and
+ * `buildUserPermissions` reproduces the server's own `build_permissions` algorithm over
+ * them, so the harness reproduces production authorisation instead of asserting a blanket
+ * one. The derivation is what makes the live asymmetries appear by themselves rather than
+ * having to be remembered:
+ *   • `can_cancel` contains exactly five DocTypes — Bank Transaction, Journal Entry,
+ *     Payment Entry, Purchase Invoice, Sales Invoice — so Bank Account, Bank Transaction
+ *     Rule and Bank Statement Import Log are absent, matching the live Administrator.
+ *   • `can_import` excludes Bank Transaction Rule and Bank Statement Import Log, again
+ *     matching the live payload: neither DocType grants `import` and neither is
+ *     `allow_import`, so the System Manager expansion cannot reach them either.
+ *   • `Payment Entry Deduction` reaches NO array, because a child table is excluded from
+ *     create/write/read/search and carries no DocPerm rows of its own.
+ *   • `Accounts Settings` is writable but not creatable (Single), and `Party Type` is
+ *     writable and readable but not creatable (`in_create`) — which is exactly why
+ *     `LinkFieldCombobox` must not offer to create either one.
+ * The System Manager import expansion is applied across the MODELLED universe rather than
+ * every importable DocType on a site, which keeps the fixture bounded; that is the single
+ * deliberate narrowing, and it changes no array the SPA reads.
+ *
+ * A test asserting a DENIED permission no longer has to hand-narrow an array: call
+ * `installRoleProfile([])` for denied-by-default, or `installRoleProfile(['Accounts User'])`
+ * for a genuinely narrower role, and pass a non-Administrator user name to stop modelling
+ * the superuser. Both the default profile and every other piece of mutable runtime state
+ * are reconstructed before AND after every test, so no suite can leak a profile into
+ * another.
  *
  * Noted, deliberately not stubbed: the real `frappe.model.sync` stamps `__last_sync_on`
  * onto each synced document, and a live `locals` also carries `Country` and
@@ -532,4 +905,3 @@ afterEach(() => {
  * at runtime. Both spellings are therefore stubbed above — one mirrors what the page
  * publishes, the other what its code reads.
  */
-

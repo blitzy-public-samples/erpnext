@@ -17,59 +17,32 @@ import { useDebounceCallback } from 'usehooks-ts'
 import Fuse from 'fuse.js'
 
 /**
- * The subset of Frappe's error envelope that {@link resolveDisplayError} inspects.
- * `_error_message` is absent from the SDK's published `FrappeError` type but is present on
- * some responses and is read by the shared parser, so it is declared here rather than
- * reached for with a type-suppression directive. Every member is optional because a
- * rejection is not always a server envelope at all.
+ * Narrows an `unknown` rejection reason to "this came back from Frappe". A promise can reject
+ * with anything at all, so the reason is narrowed before any envelope field is dereferenced.
+ * Membership is tested with `in`, so nothing is copied, rewritten or coerced: a genuine
+ * envelope is recognised and then used exactly as the server sent it.
  */
-type FrappeErrorEnvelope = Partial<Pick<FrappeError, '_server_messages' | 'exception' | 'httpStatus'>> & {
-    _error_message?: string
-}
+const isFrappeErrorEnvelope = (reason: unknown): reason is FrappeError =>
+    typeof reason === 'object' && reason !== null &&
+    ('_server_messages' in reason || '_error_message' in reason || 'exception' in reason || 'httpStatus' in reason)
 
 /**
- * Single normalisation layer deciding what a user-facing surface is allowed to render for a
- * rejected call. Every surface that displays a reconciliation failure - the dismissible
- * dialog and the transient toast - resolves through this one function, so the two can never
- * disagree about what the user is told.
+ * The single layer every surface displaying a rejected call resolves through, so the dismissible
+ * dialog and the transient toast can never disagree. A server envelope is returned BY IDENTITY -
+ * not cloned, reshaped or stripped - which keeps the server's own text and severity reaching the
+ * user verbatim. A substitute is produced only when the rejection carries no envelope at all,
+ * meaning the request never reached the server: `frappe-js-sdk` reads `error.response.data`
+ * without a guard, so its own `TypeError` becomes the rejection value, and there is no server
+ * text to preserve in that case.
  *
- * The default - and overwhelmingly common - path returns the error COMPLETELY UNMODIFIED,
- * which is what keeps the server's own text reaching the user verbatim with no client-side
- * paraphrasing and no client-side severity decision. A substitute is produced in exactly two
- * situations, and in both of them there is no server text to preserve, so the verbatim
- * contract is never weakened:
- *
- *  1. The rejection carries no Frappe envelope whatsoever, which means the request never
- *     reached the server. `frappe-js-sdk` reads `error.response.data` without a guard, so a
- *     transport failure makes its own `TypeError` the rejection value; rendering that put a
- *     raw JavaScript engine string ("Cannot read properties of undefined") in front of the
- *     user, which is not user-facing copy and does not satisfy FM1's requirement for a
- *     dismissible error surface. A translated connectivity message replaces it.
- *  2. The envelope is present but its `_server_messages` cannot be parsed. The shared parser
- *     calls `JSON.parse` on that field without a guard, so a malformed value throws during
- *     render and takes the React tree down instead of degrading. Dropping just that one field
- *     lets the parser fall through to `_error_message`, `exception` and finally `message` -
- *     all of which are still the server's own words.
- *
- * Pure: nothing here retries, refetches, mutates application state or truncates server text.
+ * Pure and idempotent: nothing here retries, refetches, mutates application state or
+ * truncates server text, and resolving an already-resolved error returns the same value.
  */
-export const resolveDisplayError = (error: FrappeError): FrappeError => {
-    const envelope: FrappeErrorEnvelope = error
-
-    if (!envelope._server_messages && !envelope._error_message && !envelope.exception && envelope.httpStatus === undefined) {
-        return {
-            ...error,
-            message: _('Could not reach the server, so nothing was posted. Check your connection and try again.')
-        }
-    }
-
-    try {
-        getErrorMessage(error)
-    } catch {
-        return { ...error, _server_messages: undefined }
-    }
-
-    return error
+const toDisplayError = (reason: unknown): FrappeError => isFrappeErrorEnvelope(reason) ? reason : {
+    httpStatus: 0,
+    httpStatusText: 'Network Error',
+    message: _('Could not reach the server, so nothing was posted. Check your connection and try again.'),
+    exception: ''
 }
 
 export const useGetAccountOpeningBalance = () => {
@@ -292,14 +265,6 @@ export const useReconcileTransaction = () => {
 
     const setBankRecErrorDialog = useSetAtom(bankRecErrorDialogAtom)
 
-    // Needed to rebuild the existing get_linked_payments cache key on the rejection path - the same
-    // key `useGetVouchersForTransaction` builds, so no new cache-key family is introduced.
-    const matchFilters = useAtomValue(bankRecMatchFilters)
-
-    // Used to re-read the selection from the server's own refreshed payload after a rejection. Held
-    // here at the top of the hook because rules-of-hooks forbids calling it inside the callback.
-    const setSelectedTransaction = useSetAtom(bankRecSelectedTransactionAtom(selectedBank?.name || ''))
-
     const reconcileTransaction = (transaction: UnreconciledTransaction, voucher: LinkedPayment) => {
 
         call({
@@ -339,43 +304,28 @@ export const useReconcileTransaction = () => {
                     backgroundColor: "rgb(0, 138, 46)"
                 }
             })
-        }).catch((error) => {
-            console.error(error)
-            // The toast is a user-facing surface too, so its description resolves through the same
-            // normalisation layer as the dialog. Without this a transport failure showed the raw
-            // JavaScript engine string "Cannot read properties of undefined (reading 'data')" here,
-            // because the SDK's own TypeError becomes the rejection value when there is no response.
+        }).catch((reason: unknown) => {
+            console.error(reason)
+            // Stored raw so the shared dialog parses the server's own envelope; only a rejection that
+            // never reached the server is substituted, and then there is no server text to preserve.
+            // The dialog and the toast read the same resolved value, so they cannot disagree. State
+            // work happens before the toast so nothing can stop the dialog from opening.
+            const displayError = toDisplayError(reason)
+            setBankRecErrorDialog(displayError)
+            // Only the two transaction-list keys are revalidated, because between them they own every
+            // `status` / `unallocated_amount` the confirm affordance reads. Both are EXISTING families,
+            // so no sixth cache key appears. Nothing is mutated optimistically and no selection state is
+            // written - the server rolls the whole request back and stays the sole source of truth.
+            // Settled with `allSettled` so a refresh that fails in turn is observed rather than escaping
+            // as an unhandled rejection.
+            void Promise.allSettled([
+                mutate(`bank-reconciliation-unreconciled-transactions-${selectedBank?.name}-${dates.fromDate}-${dates.toDate}`),
+                mutate(`bank-reconciliation-bank-transactions-${selectedBank?.name}-${dates.fromDate}-${dates.toDate}`)
+            ])
             toast.error(_("Error"), {
                 duration: 5000,
-                description: getErrorMessage(resolveDisplayError(error))
+                description: getErrorMessage(displayError)
             })
-            // Route the raw (unmodified) Frappe error to the shared dialog atom so it surfaces verbatim in the
-            // dismissible BankRecErrorDialog, then revalidate the transaction caches so a stale client is corrected (FM1/FM3).
-            // Nothing is mutated optimistically - the server rolls the whole request back and remains the sole source of truth.
-            setBankRecErrorDialog(error)
-            // FM3 requires a stale-client rejection to "refresh status", so EVERY cache family that feeds the
-            // confirm affordance is revalidated - not just the two transaction lists. The voucher pane that owns
-            // the Reconcile button is fed by get_linked_payments, and the balance strip by the closing balance;
-            // leaving either stale left the user facing the identical enabled Reconcile that had just failed.
-            // All four keys below are the EXISTING families built by useGetUnreconciledTransactions,
-            // useGetBankTransactions, useGetVouchersForTransaction and useGetAccountClosingBalance, and all four
-            // are already revalidated by the success path - so no sixth cache-key family is introduced.
-            mutate(`bank-reconciliation-bank-transactions-${selectedBank?.name}-${dates.fromDate}-${dates.toDate}`)
-            mutate(`bank-reconciliation-vouchers-${transaction.name}-${dates.fromDate}-${dates.toDate}-${matchFilters.join(',')}`)
-            mutate(`bank-reconciliation-account-closing-balance-${selectedBank?.name}-${dates.toDate}`)
-            // Re-read the selection from SERVER TRUTH ONLY, strictly after the refetch has resolved: every
-            // selected row is replaced by the row the server just returned, and any row the server no longer
-            // reports as unreconciled is dropped from the selection. This is the opposite of an optimistic
-            // mutation - no value is ever guessed, and it is the same read-back the success path performs above.
-            // It is also what makes the already-reconciled guard in MatchAndReconcile.tsx, which reads this atom,
-            // re-evaluate against current server state instead of the pre-rejection snapshot.
-            mutate(`bank-reconciliation-unreconciled-transactions-${selectedBank?.name}-${dates.fromDate}-${dates.toDate}`)
-                .then((res) => {
-                    const refreshedTransactions: UnreconciledTransaction[] = res?.message ?? []
-                    setSelectedTransaction((currentSelection) => currentSelection
-                        .map((selected) => refreshedTransactions.find((refreshed) => refreshed.name === selected.name))
-                        .filter((refreshed): refreshed is UnreconciledTransaction => Boolean(refreshed)))
-                })
         })
     }
 

@@ -1,5 +1,5 @@
 import BankPicker from "@/components/features/BankReconciliation/BankPicker"
-import { bankRecImportFailuresAtom, selectedBankAccountAtom } from "@/components/features/BankReconciliation/bankRecAtoms"
+import { bankRecImportFailuresAtom, selectedBankAccountAtom, type ImportAttemptStatus } from "@/components/features/BankReconciliation/bankRecAtoms"
 import BankRecErrorDialog from "@/components/features/BankReconciliation/BankRecErrorDialog"
 import CompanySelector from "@/components/features/BankReconciliation/CompanySelector"
 import { Badge } from "@/components/ui/badge"
@@ -21,7 +21,7 @@ import { BankStatementImportLog } from "@/types/Accounts/BankStatementImportLog"
 import { useFrappeCreateDoc, useFrappeFileUpload, useFrappeGetDocList, useFrappeUpdateDoc } from "frappe-react-sdk"
 import { useAtom, useAtomValue } from "jotai"
 import { ListIcon, Loader2Icon } from "lucide-react"
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { useNavigate } from "react-router"
 
 
@@ -155,9 +155,6 @@ const BankStatementImporter = () => {
                 {selectedBankAccount && <StatementImportLog />}
             </div>
 
-            {/* This list route is a different route tree from both the reconciliation page and the
-                import detail route, so it needs its own mount of the shared, atom-driven error
-                dialog. One atom drives every mount, and it renders nothing until an error is set. */}
             <BankRecErrorDialog />
         </div>
     )
@@ -220,15 +217,47 @@ const StatementInstructions = () => {
     </Dialog>
 }
 
+/**
+ * Per-row status chip.
+ *
+ * AUTHORITATIVE SERVER STATUS WINS. When the fetched log says `Completed`, that is what renders
+ * regardless of anything the client observed: the client marker is an observation of one attempt,
+ * while the document is the record. A marker is consulted only for a log the server has NOT
+ * reported as completed, and `unknown` is rendered distinctly from `failed` because "the client
+ * could not establish what happened" is not the same claim as "the import did not happen".
+ */
+const ImportLogStatusBadge = ({ status, attempt }: { status?: BankStatementImportLog['status'], attempt?: ImportAttemptStatus }) => {
+
+    if (status === "Completed") {
+        return <Badge theme="green">{_("Completed")}</Badge>
+    }
+
+    if (attempt === 'failed') {
+        // Solid, not the subtle default: subtle red renders this 12px label at 4.41:1 in dark mode,
+        // below the WCAG AA 4.5:1 floor for normal text, while solid red clears it in both themes.
+        return <Badge variant="solid" theme="red">{_("Failed")}</Badge>
+    }
+
+    if (attempt === 'unknown') {
+        // `orange` is the compound variant that resolves to the amber surface tokens; the Badge
+        // primitive exposes no literal `amber` theme.
+        return <Badge theme="orange">{_("Unknown")}</Badge>
+    }
+
+    return <Badge theme="gray">{status}</Badge>
+}
+
 const StatementImportLog = () => {
 
     const bankAccount = useAtomValue(selectedBankAccountAtom)
 
-    // Drives the third, "Failed" state of the per-row status badge below. The import log persists
-    // no error field and its status never advances past "Not Started" when the synchronous import
-    // rolls back, so the observed rejection - recorded against the log's name by the import step -
-    // is the only failure signal available. Read here, never inside the row map: it is a hook.
-    const importFailures = useAtomValue(bankRecImportFailuresAtom)
+    // Drives the "Failed" and "Unknown" states of the per-row status badge below. The import log
+    // persists no error field and its status never advances past "Not Started" when a synchronous
+    // import rolls back, so an attempt the server confirms as not-completed is the only failure
+    // signal available. The marker never overrides an authoritative `Completed` - see
+    // `ImportLogStatusBadge` - and the setter is held so server truth can retire a stale marker.
+    // Read here, never inside the row map: it is a hook.
+    const [importFailures, setImportFailures] = useAtom(bankRecImportFailuresAtom)
 
     const { data, error } = useFrappeGetDocList<BankStatementImportLog>("Bank Statement Import Log", {
         fields: ["name", "file", "status", "number_of_transactions", "start_date", "end_date", "closing_balance", "creation"],
@@ -241,6 +270,32 @@ const StatementImportLog = () => {
     }, bankAccount ? undefined : null, {
         revalidateOnFocus: false
     })
+
+    // Server truth RETIRES client markers: every log this freshly fetched list reports as
+    // `Completed` has its attempt marker dropped, so a marker cannot outlive the condition it
+    // described - including one recorded as `unknown` for an import that had in fact succeeded.
+    // The map is rebuilt only when something actually needs removing, so this cannot loop.
+    useEffect(() => {
+        if (!data) {
+            return
+        }
+
+        const completed = data.filter((log) => log.status === "Completed").map((log) => log.name)
+
+        if (completed.length === 0) {
+            return
+        }
+
+        setImportFailures((previousAttempts) => {
+            const stale = completed.filter((name) => previousAttempts[name] !== undefined)
+
+            if (stale.length === 0) {
+                return previousAttempts
+            }
+
+            return Object.fromEntries(Object.entries(previousAttempts).filter(([name]) => !stale.includes(name)))
+        })
+    }, [data, setImportFailures])
 
     const navigate = useNavigate()
 
@@ -271,7 +326,7 @@ const StatementImportLog = () => {
                         {data?.map((item) => (
                             <TableRow key={item.name} onClick={() => onViewDetails(item.name)} className="cursor-pointer hover:bg-surface-gray-2">
                                 <TableCell>{formatDate(item.creation, 'Do MMM YYYY')}</TableCell>
-                                <TableCell><Badge theme={importFailures[item.name] ? "red" : item.status === "Completed" ? "green" : "gray"}>{importFailures[item.name] ? _("Failed") : item.status}</Badge></TableCell>
+                                <TableCell><ImportLogStatusBadge status={item.status} attempt={importFailures[item.name]} /></TableCell>
                                 <TableCell>
                                     {item.start_date && item.end_date ? (
                                         <span>{formatDate(item.start_date, 'Do MMM YYYY')} to {formatDate(item.end_date, 'Do MMM YYYY')}</span>

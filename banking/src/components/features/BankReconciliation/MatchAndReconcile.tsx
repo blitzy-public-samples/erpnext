@@ -1,7 +1,7 @@
 import { useAtom, useAtomValue, useSetAtom } from "jotai"
 import { bankRecAmountFilter, bankRecDateAtom, bankRecRecordJournalEntryModalAtom, bankRecRecordPaymentModalAtom, bankRecSelectedTransactionAtom, bankRecTransactionTypeFilter, bankRecTransferModalAtom, selectedBankAccountAtom } from "./bankRecAtoms"
 import { H4 } from "@/components/ui/typography"
-import { useMemo, useRef } from "react"
+import { useId, useMemo, useRef } from "react"
 import { getCompanyCurrency } from "@/lib/company"
 import ErrorBanner from "@/components/ui/error-banner"
 import { Separator } from "@/components/ui/separator"
@@ -67,11 +67,6 @@ const MatchAndReconcile = ({ contentHeight }: { contentHeight: number }) => {
         <TransferModal />
         <BankEntryModal />
         <RecordPaymentModal />
-        {/* Shared dismissible error dialog for confirm/post failures (FM1/FM3). Mounting it
-            unconditionally is free: it renders `null` unless `bankRecErrorDialogAtom` holds an
-            error, exactly like the three modals above. The statement-importer surfaces mount the
-            very same atom from a different route tree, so one atom drives every mount site and
-            the two surfaces can never show conflicting error state. */}
         <BankRecErrorDialog />
     </>
 }
@@ -342,15 +337,23 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
 
     const currency = transaction.currency ?? selectedBank?.account_currency ?? getCompanyCurrency(selectedBank?.company ?? '')
 
-    // Advisory currency-mismatch predicate (Gap D4 / FM5). Mirrored from the server rather than
-    // designed: `BankTransaction.validate_currency` (bank_transaction.py:65-82) resolves
-    // `Bank Account.account` -> `Account.account_currency` and throws when it differs from the
-    // transaction currency. `bank_account.get_list` attaches `account_currency` to each row through
-    // that exact same lookup, so comparing the two values here cannot disagree with the server.
-    // Both sides are optional (`account_currency` is not a native Bank Account field, it is derived
-    // at query time), so an absent value on either side means "nothing to compare" rather than a
-    // mismatch. ADVISORY ONLY - see the badge below, which deliberately does not gate Reconcile.
+    // Compares the transaction currency against the account currency `bank_account.get_list`
+    // attaches to each bank account. Either value may be absent, so an absent one means "nothing to
+    // compare" rather than a mismatch.
     const isCurrencyMismatch = Boolean(transaction.currency && selectedBank?.account_currency && transaction.currency !== selectedBank.account_currency)
+
+    // The advisory is authored once and consumed twice - as the badge's tooltip for pointer users and
+    // as the row's own accessible description for keyboard and screen-reader users - so the two can
+    // never drift apart. The copy states only what is known for certain: that the two currencies
+    // differ, and that the server decides the outcome. It deliberately promises NEITHER a successful
+    // unconverted posting NOR a rejection, because FM5 makes the backend the authority on what
+    // actually happens and this indicator is advisory only. (A mismatch is not in fact always
+    // refused: `reconcile_vouchers` saves an already-submitted document, so Frappe routes it through
+    // `update_after_submit` and `validate_currency` never runs.)
+    const currencyAdvisoryId = useId()
+    const currencyAdvisory = isCurrencyMismatch
+        ? _("Transaction currency {0} differs from the bank account currency {1}. The server validates the currencies and decides whether this reconciliation is accepted, so review the match before confirming.", [currency, selectedBank?.account_currency ?? ''])
+        : ''
 
     const handleSelectTransaction = (event: React.MouseEvent<HTMLDivElement>) => {
         // If the user is pressing the shift key, add/remove the transaction from the selected transactions
@@ -367,6 +370,10 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
         )}
             role='button'
             tabIndex={0}
+            // The row is the ONLY interactive element here, so the currency advisory is attached as
+            // the row's own description rather than to a second control inside it. Focusing or
+            // reading the row therefore announces the reason, with no extra tab stop to traverse.
+            aria-describedby={isCurrencyMismatch ? currencyAdvisoryId : undefined}
             onClick={handleSelectTransaction}>
             <div className="flex justify-between items-start w-full">
                 <div className="space-y-1 overflow-hidden whitespace-pre-wrap">
@@ -385,43 +392,36 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
                             title={_("Matched by rule")}>
                             <ZapIcon className="w-4 h-4" /> {transaction.matched_transaction_rule}</Badge>}
 
-                        {/* Non-blocking currency-mismatch indicator (Gap D4 / FM5). It is the INDICATOR
-                            that is non-blocking: Reconcile is deliberately left enabled, because the
-                            server - not this badge - decides whether a post is allowed.
-                            `theme="orange"` is used because Badge declares no `amber` theme; `subtle` +
-                            `orange` resolves to the `ink-amber-*` / `surface-amber-*` tokens this advisory
-                            calls for, so no new variant and no raw colour value is introduced. The LOCAL
-                            TooltipProvider is required, not optional: this row has no provider ancestor
-                            (the only global one lives in App.tsx), and Radix's Tooltip.Root throws
-                            without one.
+                        {/* Advisory only: Reconcile is deliberately left enabled, because the server -
+                            not this badge - decides whether a post is allowed. `theme="orange"` is used
+                            because Badge declares no `amber` theme, and `subtle` + `orange` is what
+                            resolves to the amber tokens this warning calls for.
 
-                            The copy deliberately does NOT promise a server rejection. `validate_currency`
-                            (bank_transaction.py:65-82) is reached from `validate()`, but the reconcile path
-                            calls `save()` on an already-submitted document, which Frappe runs as
-                            `update_after_submit` - a path that never invokes `validate()`. Runtime
-                            verification confirmed it: posting a EUR transaction against a USD account
-                            returned HTTP 200 and committed the reconciliation. The mismatch itself is still
-                            worth surfacing (the amount is posted unconverted), so the warning stays, but
-                            asserting a protection that does not exist would mislead the reviewer. The
-                            backend gap is recorded here and deliberately left unfixed - bank_transaction.py
-                            is outside this change's scope. */}
-                        {isCurrencyMismatch && <TooltipProvider>
-                            <Tooltip>
-                                <TooltipTrigger>
-                                    <Badge variant="subtle" theme="orange" size="sm">
-                                        <AlertCircleIcon /> {currency}</Badge>
-                                </TooltipTrigger>
-                                {/* TooltipContent is `w-fit` with no intrinsic maximum, so this two-sentence
-                                    advisory laid out as a single ~1050px line that Radix then clamped flush
-                                    against the viewport edge, breaching the page gutter. `max-w-sm` with
-                                    balanced wrapping is the constraint the design system already uses for
-                                    long tooltip copy (see ui/list-view.tsx), so it is reused verbatim rather
-                                    than inventing a width or touching the boundary primitive. */}
-                                <TooltipContent side="top" className="max-w-sm text-balance wrap-break-word">
-                                    {_("Transaction currency {0} differs from the bank account currency {1}. The amount is reconciled without conversion, so check this match before confirming.", [currency, selectedBank?.account_currency ?? ''])}
-                                </TooltipContent>
-                            </Tooltip>
-                        </TooltipProvider>}
+                            `TooltipTrigger asChild` is REQUIRED, not stylistic. This row is itself a
+                            focusable `role="button"`, and a bare TooltipTrigger renders its own native
+                            <button>, which would nest an interactive control inside an interactive
+                            control and add a second tab stop to every mismatched row. `asChild` makes
+                            the Badge - a plain <span> - the trigger, so the indicator stays
+                            non-interactive; the same pattern is used for the reconcile button's tooltip
+                            further down this file. Because a <span> cannot take focus, the tooltip alone
+                            would be hover-only, so the advisory is ALSO published as the `sr-only`
+                            description the row points at with `aria-describedby` - one shared string, so
+                            the two can never disagree. No LOCAL TooltipProvider is needed: App.tsx wraps
+                            the whole router in one. */}
+                        {isCurrencyMismatch && <Tooltip>
+                            <TooltipTrigger asChild>
+                                <Badge variant="subtle" theme="orange" size="sm">
+                                    <AlertCircleIcon /> {currency}</Badge>
+                            </TooltipTrigger>
+                            {/* TooltipContent is `w-fit` with no intrinsic maximum, so this two-sentence
+                                advisory laid out as a single ~1050px line that Radix then clamped flush
+                                against the viewport edge, breaching the page gutter. `max-w-sm` with
+                                balanced wrapping is the constraint the design system already uses for long
+                                tooltip copy (see ui/list-view.tsx). */}
+                            <TooltipContent side="top" className="max-w-sm text-balance wrap-break-word">
+                                {currencyAdvisory}
+                            </TooltipContent>
+                        </Tooltip>}
                     </div>
                     <span className="text-sm wrap-anywhere" title={transaction.description}>{transaction.description}</span>
                 </div>
@@ -432,6 +432,12 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
                 </div>
             </div>
         </div>
+        {/* The advisory text the row points at. It sits OUTSIDE the row element on purpose: a
+            description nested inside the row would also be walked when the row's accessible NAME is
+            computed from its contents, so the same sentence would be announced twice. `sr-only` is
+            the utility this codebase already uses for text meant only for assistive technology
+            (see the search and amount-filter labels above), and it keeps the visual row unchanged. */}
+        {isCurrencyMismatch && <span id={currencyAdvisoryId} className="sr-only">{currencyAdvisory}</span>}
     </div>
 }
 
@@ -913,23 +919,9 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
 
     const { reconcileTransaction, loading } = useReconcileTransaction()
 
-    // Already-reconciled guard (Gap D1 / FM3 / TC5), read off the server rather than designed. The
-    // authoritative check is the FIRST statement of `add_payment_entries`, the first method the
-    // posting endpoint invokes: `if 0.0 >= self.unallocated_amount: frappe.throw("... already fully
-    // reconciled")` (bank_transaction.py:160-161). `set_status` (bank_transaction.py:84-91) derives
-    // the status field purely from `docstatus` and `unallocated_amount`, so the two signals are
-    // strictly co-derived and `status === 'Reconciled'` holds exactly when `unallocated_amount <= 0`;
-    // testing both is belt-and-braces against a partially populated row, and both fields already
-    // arrive in the endpoint payload so no extra data is fetched.
-    //
-    // This is a UX AFFORDANCE ONLY - the server check stays authoritative and nothing is mutated
-    // optimistically. It is not theoretical either: `get_bank_transactions` filters on
-    // `unallocated_amount > 0` alone and never on `status`, so a row whose status has already advanced
-    // while its unallocated amount has not is served straight into this list - runtime-verified. A
-    // stale client is likelier still because the bank-account query disables focus/stale
-    // revalidation. An attempt that slips through surfaces the server's own throw in
-    // BankRecErrorDialog while the reconcile hook revalidates the affected caches, which is also
-    // runtime-verified (HTTP 417 ValidationError, rendered verbatim, nothing written).
+    // Mirrors the backend guard that refuses a post once `unallocated_amount <= 0`; `status` is
+    // tested alongside it because the server derives the two from each other. The server remains
+    // authoritative - this only stops the affordance offering an action that cannot succeed.
     const transactionUnderReview = selectedTransaction?.[0]
     const isAlreadyReconciled = transactionUnderReview
         ? transactionUnderReview.status === 'Reconciled' || (transactionUnderReview.unallocated_amount ?? 0) <= 0
@@ -942,10 +934,6 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
         reconcileTransaction(selectedTransaction[0], voucher)
     }
 
-    // Extracted so the tooltip scaffolding below can wrap it only when there is actually a reason to
-    // explain, without duplicating the control. `variant`, `theme` and the loading label are unchanged
-    // from the original; only `disabled` gained the already-reconciled predicate, and `loading` is
-    // retained because that is what covers double-click / in-flight duplication.
     const reconcileButton = <Button
         variant={isSuggested || amountMatches ? "solid" : "outline"}
         theme={isSuggested || amountMatches ? "green" : "gray"}
@@ -1011,54 +999,21 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
                     </TooltipProvider>
                 </div>
                 <div>
-                    {/* The tooltip scaffolding is mounted ONLY when the guard actually fires. Gating just
-                        the TooltipContent is not enough: Radix's Tooltip.Root still opens on hover and
-                        stamps `aria-describedby` on the trigger, so an enabled button ended up pointing
-                        screen readers at an id that was never rendered - caught in runtime a11y
-                        verification. Mounting the whole Tooltip conditionally removes the dangling
-                        reference, and it also means the enabled path renders exactly the markup it did
-                        before this change.
-                        For the disabled case the wrapping <span> is required, because pointer events never
-                        fire on a disabled control (Button carries `disabled:pointer-events-none`), so the
-                        reason has to be anchored to an enabled element to stay discoverable - the state is
-                        therefore never communicated by appearance alone. `asChild` makes that span the
-                        trigger itself; a bare TooltipTrigger would render its own <button> and nest a
-                        button inside a button. The loading case needs no tooltip: its label already says
-                        so. A LOCAL TooltipProvider is required because the provider above closes before
-                        this button. */}
+                    {/* A disabled control emits no pointer or focus events, so the reason is anchored to a
+                        focusable wrapper span rather than to the Button, keeping it discoverable by mouse
+                        and keyboard alike. The Tooltip is mounted only when the guard fires, so the enabled
+                        path never stamps an `aria-describedby` pointing at content that is not rendered. */}
                     {isAlreadyReconciled
-                        ? <TooltipProvider>
-                            <Tooltip>
-                                {/* `tabIndex={0}` on the span below is what makes the reason reachable without a
-                                    mouse. A disabled <button> is removed from the tab order, and the wrapping
-                                    span is not focusable by default, so the explanation was previously
-                                    discoverable by hover ONLY - keyboard and screen-reader users got a
-                                    greyed-out control with no stated cause, and Radix never stamped
-                                    `aria-describedby` because the trigger never received focus. Making the span
-                                    focusable puts it in the natural tab order, opens the tooltip on focus and
-                                    wires up `aria-describedby`. It does NOT make the control activatable: the
-                                    Button keeps its real `disabled` attribute, and a span has no default
-                                    activation behaviour, so Enter/Space do nothing. The focus ring reuses the
-                                    same `shadow-focus-gray` token and `rounded` radius the Button itself uses
-                                    (see ui/button.tsx), so the indicator is visually identical to focusing an
-                                    enabled control. The comment sits outside TooltipTrigger because `asChild`
-                                    renders through Radix's Slot, which requires exactly one child. */}
-                                <TooltipTrigger asChild>
-                                    <span tabIndex={0} className="inline-flex rounded outline-none focus-visible:shadow-focus-gray">{reconcileButton}</span>
-                                </TooltipTrigger>
-                                {/* `align="end"` is required, not decorative. This trigger sits at the far right
-                                    of the voucher card, so a centre-aligned 24rem tooltip overhangs the viewport
-                                    and Radix - whose collision padding is zero - can only shift it until its
-                                    edge is flush with the window, breaching the page gutter every other element
-                                    respects. End-aligning pins its right edge to the trigger's own right edge,
-                                    which is already inset from the panel, so it lands inside the gutter without
-                                    introducing a raw pixel offset. `align` is the prop the design system
-                                    already uses for this (see BankClearanceSummary.tsx and ui/list-view.tsx). */}
-                                <TooltipContent side="top" align="end" className="max-w-sm text-balance wrap-break-word">
-                                    {_("This bank transaction is already fully reconciled, so it cannot be reconciled again.")}
-                                </TooltipContent>
-                            </Tooltip>
-                        </TooltipProvider>
+                        ? <Tooltip>
+                            <TooltipTrigger asChild>
+                                <span tabIndex={0} className="inline-flex rounded outline-none focus-visible:shadow-focus-gray">{reconcileButton}</span>
+                            </TooltipTrigger>
+                            {/* End-aligned so the tooltip stays inside the page gutter at the far right of
+                                the voucher card. */}
+                            <TooltipContent side="top" align="end" className="max-w-sm text-balance wrap-break-word">
+                                {_("This bank transaction is already fully reconciled, so it cannot be reconciled again.")}
+                            </TooltipContent>
+                        </Tooltip>
                         : reconcileButton}
                 </div>
             </div>

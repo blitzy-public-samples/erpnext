@@ -2,7 +2,7 @@ import _ from '@/lib/translate'
 import { GetStatementDetailsResponse } from '../import_utils'
 import { flt, formatCurrency } from '@/lib/numbers'
 import { formatDate } from '@/lib/date'
-import { bankRecDateAtom, bankRecErrorDialogAtom, bankRecImportFailuresAtom } from '../../BankReconciliation/bankRecAtoms'
+import { bankRecDateAtom, bankRecErrorDialogAtom, bankRecImportFailuresAtom, type ImportAttemptStatus } from '../../BankReconciliation/bankRecAtoms'
 import { AlertCircleIcon, ChevronLeftIcon, ChevronRightIcon, ExternalLinkIcon, InfoIcon, Loader2Icon } from 'lucide-react'
 import { H2, H3, Paragraph } from '@/components/ui/typography'
 import { FileTypeIcon } from '@/components/ui/file-dropzone'
@@ -11,11 +11,11 @@ import { Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, Tabl
 import { Separator } from '@/components/ui/separator'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { useFrappeEventListener, useFrappePostCall, type FrappeError } from 'frappe-react-sdk'
+import { FrappeContext, useFrappeEventListener, useFrappePostCall, type FrappeConfig, type FrappeError } from 'frappe-react-sdk'
 import { toast } from 'sonner'
 import ErrorBanner from '@/components/ui/error-banner'
 import { Link, useNavigate } from 'react-router'
-import { useMemo, useState } from 'react'
+import { useContext, useMemo, useState } from 'react'
 import { Progress } from '@/components/ui/progress'
 import { useSetAtom } from 'jotai'
 import { useDirection } from '@/components/ui/direction'
@@ -26,6 +26,12 @@ import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import BankRecErrorDialog from '../../BankReconciliation/BankRecErrorDialog'
+
+/**
+ * How many per-file import-failure markers `bankRecImportFailuresAtom` retains, matched to the
+ * page size the importer list queries with so the cap can never hide a badge that has a row.
+ */
+const IMPORT_FAILURE_LIMIT = 10
 
 const parseDateFormat = (dateFormat: string) => {
 
@@ -61,37 +67,119 @@ const StatementDetails = ({ data }: Props) => {
 
     const setDates = useSetAtom(bankRecDateAtom)
 
-    // Both setters are obtained here, at the top of the component body, because hooks may
-    // never be called from inside the import promise's callbacks (see onImport below).
     const setErrorDialog = useSetAtom(bankRecErrorDialogAtom)
 
     const setImportFailures = useSetAtom(bankRecImportFailuresAtom)
 
+    // The authoritative read used to confirm what the server actually recorded for this import
+    // log after a rejection. `db.getDoc` rather than a cache revalidation because this component
+    // is passed no `mutate`, and it is the same imperative-read pattern the rest of the SPA uses.
+    const { db } = useContext(FrappeContext) as FrappeConfig
+
     const direction = useDirection()
 
+    /** Retires this log's attempt marker. A marker must never outlive the condition it described. */
+    const clearImportAttempt = () => {
+        setImportFailures((previousAttempts) => {
+            if (previousAttempts[data.doc.name] === undefined) {
+                return previousAttempts
+            }
+            return Object.fromEntries(Object.entries(previousAttempts).filter(([name]) => name !== data.doc.name))
+        })
+    }
+
+    /**
+     * Applies the outcome of an import the server has CONFIRMED as completed. Extracted so the
+     * rejection path can run the identical continuation when its authoritative re-read shows the
+     * import did complete after all - the two paths must not be allowed to drift apart.
+     */
+    const onImportCompleted = (doc?: BankStatementImportLog) => {
+        if (doc && doc.start_date && doc.end_date) {
+            setDates({
+                fromDate: doc.start_date,
+                toDate: doc.end_date,
+            })
+        }
+        clearImportAttempt()
+        toast.success(_("Bank statement imported."))
+        navigate(`/`)
+    }
+
+    /**
+     * Handles a rejected import ATTEMPT.
+     *
+     * A rejection is not by itself evidence that the import did not happen: the request may have
+     * been received and committed with only the response lost. The server is therefore asked what
+     * the log actually says before anything is recorded or shown, and its answer decides:
+     *
+     *  - status `Completed`  -> server truth wins outright. No error is surfaced, no marker is
+     *    written, any earlier marker is retired, and the success continuation runs.
+     *  - any other status    -> the server positively reported the import as not completed, so
+     *    the attempt is marked `failed` and the backend's own message is shown.
+     *  - no status obtainable -> the outcome is genuinely unknown, so it is marked `unknown`
+     *    rather than asserted as a failure.
+     *
+     * Nothing here creates a transaction: only the server-side import does that.
+     */
+    const recordImportRejection = async (importError: FrappeError): Promise<void> => {
+        let confirmedLog: BankStatementImportLog | undefined
+        try {
+            confirmedLog = await db.getDoc<BankStatementImportLog>('Bank Statement Import Log', data.doc.name)
+        } catch (confirmationError) {
+            // The confirmation itself failed, so the outcome stays unknown rather than being guessed.
+            console.error(confirmationError)
+        }
+
+        // Only a status the server actually reported counts as confirmation. A response that
+        // carries no status is treated exactly like no response at all.
+        const confirmedStatus = confirmedLog?.status
+
+        if (confirmedStatus === 'Completed') {
+            // The freshly fetched log is passed rather than the local copy: it is the document the
+            // import wrote, so it is the one carrying the resolved statement date range.
+            onImportCompleted(confirmedLog)
+            return
+        }
+
+        // The rejection is handed to the shared dialog UNMODIFIED, so the backend's own message,
+        // title and severity indicator reach the user verbatim. Untrusted markup inside it is
+        // neutralised at the rendering boundary, not by rewriting the envelope here.
+        toast.error(_("There was an error while importing the bank statement."))
+        setErrorDialog(importError)
+        // Bounded, oldest-first: the map is capped at the same page size the importer list queries
+        // with, so it can never grow past the rows that could display it.
+        const attempt: ImportAttemptStatus = confirmedStatus === undefined ? 'unknown' : 'failed'
+        setImportFailures((previousAttempts) => {
+            if (previousAttempts[data.doc.name] === attempt) {
+                return previousAttempts
+            }
+            const names = Object.keys(previousAttempts).filter((name) => name !== data.doc.name)
+            const retained = names.slice(Math.max(0, names.length + 1 - IMPORT_FAILURE_LIMIT))
+            const capped: Record<string, ImportAttemptStatus> = {}
+            retained.forEach((name) => { capped[name] = previousAttempts[name] })
+            capped[data.doc.name] = attempt
+            return capped
+        })
+    }
+
     const onImport = () => {
+
+        // A retry supersedes whatever the previous attempt observed, so the stale marker is
+        // discarded BEFORE the request goes out rather than after it resolves - otherwise the
+        // importer list would keep flagging the file for the whole duration of a retry that may
+        // well succeed.
+        clearImportAttempt()
 
         call({
             docs: data.doc,
             method: 'insert_transactions'
         }).then((response) => {
-            const doc = response.docs ? response.docs[0] : undefined
-            if (doc && doc.start_date && doc.end_date) {
-                setDates({
-                    fromDate: doc.start_date,
-                    toDate: doc.end_date,
-                })
-            }
-            toast.success(_("Bank statement imported."))
-            navigate(`/`)
+            onImportCompleted(response.docs ? response.docs[0] : undefined)
         }).catch((importError: FrappeError) => {
-            // The rejection used to be swallowed, discarding the server's own message. The import
-            // rolls back server-side and the log persists neither an error nor a failed status, so
-            // the error is passed UNMODIFIED to the shared dialog (surfacing the backend's throw
-            // verbatim) and recorded against this log so the importer list can flag the file.
-            toast.error(_("There was an error while importing the bank statement."))
-            setErrorDialog(importError)
-            setImportFailures((previousFailures) => ({ ...previousFailures, [data.doc.name]: importError }))
+            // Handled asynchronously because the server must be consulted before any outcome is
+            // recorded; the terminal catch keeps that handler from ever escaping as an unhandled
+            // rejection.
+            recordImportRejection(importError).catch((handlerError) => console.error(handlerError))
         })
 
     }
@@ -114,8 +202,6 @@ const StatementDetails = ({ data }: Props) => {
 
     return (
         <div className='flex flex-col gap-4'>
-            {/* The importer sits in a different route tree from the reconciliation page, so it needs
-                its own mount of the shared dialog. It renders nothing until the atom holds an error. */}
             <BankRecErrorDialog />
             <div className='flex flex-col gap-4'>
                 <div className='flex justify-between items-center'>

@@ -1,23 +1,22 @@
 /**
- * Typed fixture builders and the ONE shared `frappe-react-sdk` module mock for the
- * ERPNext Banking SPA's Vitest suites.
+ * Typed fixture builders and the ONE shared `frappe-react-sdk` module mock for the ERPNext Banking
+ * SPA's Vitest suites. They live here once because a fixture hand-rolled per suite drifts from the
+ * contract it models, and a wrong field NAME or payload SHAPE silently invalidates every assertion
+ * built on it.
  *
- * ─── Why this file exists ────────────────────────────────────────────────────────────
- * Every suite under `src/**` needs the same three things: bank-reconciliation records
- * shaped exactly as the server returns them, Frappe error envelopes shaped exactly as
- * the server raises them, and a stand-in for the Frappe SDK. Hand-rolling any of those
- * per suite is how fixtures drift away from the contracts they are supposed to model,
- * and a fixture that misreports a field NAME or a payload SHAPE silently invalidates
- * every assertion built on it. So all three live here, once.
+ * The existing backend contract is authoritative, so every default below was read off this
+ * repository rather than invented. Return types are annotated with the real application types, which
+ * makes that mechanically enforced by `tsc -b`: a misspelt or extra field is a compile error.
  *
- * ─── The governing rule: derive, never invent ────────────────────────────────────────
- * The existing backend contract is authoritative for API shapes, field names and
- * method signatures. Accordingly, EVERY default below was read off a specific line of
- * this repository, and each is annotated with that `file:line`. Three consequences are
- * worth stating up front, because they look like omissions until you know why:
+ * Identity constants restate the values `src/test/setup.ts` seeds, because a company or currency name
+ * that is not a `locals` key resolves to `undefined` or falls back silently instead of failing.
  *
- *   • `UnreconciledTransaction` carries exactly the FIFTEEN fields the endpoint's
- *     `Pick` names (`BankReconciliation/utils.ts:84`) — not fourteen, not sixteen.
+ *   • `get_bank_transactions` projects SIXTEEN columns
+ *     (`bank_reconciliation_tool.py:66-85`), while the client's `UnreconciledTransaction`
+ *     `Pick` (`BankReconciliation/utils.ts:84`) deliberately narrows that to FIFTEEN by
+ *     omitting `allocated_amount`. The builder in §2 models the client projection, not the
+ *     raw response — it is a CONSUMER-SIDE view of the payload, and §2 says which column it
+ *     drops and why.
  *   • `BankStatementImportLog.status` has exactly TWO values
  *     (`types/Accounts/BankStatementImportLog.ts:19`). There is no `Error` value and no
  *     error field anywhere on that DocType, which is precisely why the per-file failure
@@ -50,143 +49,131 @@
  * Every builder takes a `Partial<T>` of overrides and spreads it LAST, so a caller can
  * always replace any default — including replacing it with `undefined`. Return types are
  * annotated with the real application types, which is what makes "never invent a field"
- * mechanically enforced by `tsc -b` rather than merely promised: adding a sixteenth
- * field or misspelling an existing one is a compile error, not a silent lie.
+ * mechanically enforced by `tsc -b` rather than merely promised: naming a field the
+ * application type does not declare, or misspelling one it does, is a compile error rather
+ * than a silent lie.
  */
 
-// `vitest.config.ts` sets `globals: true`, which exposes the Vitest API at RUNTIME but
-// does not TYPE it — `tsconfig.app.json` declares no `types` array, and adding one is out
-// of bounds. So `vi` must be imported explicitly.
+// `globals: true` exposes the Vitest API at runtime but does not TYPE it, so `vi` is imported
+// explicitly.
 import { vi } from 'vitest'
 
-// `createElement` + `Fragment` build the `FrappeProvider` pass-through (§8) without JSX;
-// `createContext` builds the real `FrappeContext` the SPA consumes with `useContext`.
-// `ReactNode` is imported explicitly rather than reached through the `React` UMD global,
-// which modules may not rely on.
 import { createContext, createElement, Fragment, type ReactNode } from 'react'
 
 import type { LinkedPayment, UnreconciledTransaction } from '@/components/features/BankReconciliation/utils'
-import type { SelectedBank } from '@/components/features/BankReconciliation/bankRecAtoms'
+import type { ImportAttemptStatus, SelectedBank } from '@/components/features/BankReconciliation/bankRecAtoms'
 import type { BankTransaction } from '@/types/Accounts/BankTransaction'
 import type { BankStatementImportLog } from '@/types/Accounts/BankStatementImportLog'
-import type { FrappeError } from 'frappe-react-sdk'
-
-/* ═══ 1. Shared fixture identity ══════════════════════════════════════════════════════
- * Exported so a suite never has to restate a literal that must agree with the harness or
- * with a sibling builder. Every value that must match `src/test/setup.ts` says so.
- * ══════════════════════════════════════════════════════════════════════════════════ */
+// Type-only imports, so nothing here loads the SDK module — which matters, because a suite
+// replaces it wholesale with `vi.mock`. Every name below is exported by the package root
+// (`frappe-react-sdk/dist/lib/index.d.ts:12-14,401,502`), which is what lets the spy
+// contracts in §8 be DERIVED from the installed declarations instead of restated by hand.
+import type {
+	DocumentUpdateEventData,
+	FileArgs,
+	Filter,
+	FrappeError,
+	FrappeFileUploadResponse,
+	GetDocListArgs,
+	Key,
+	SWRConfiguration
+} from 'frappe-react-sdk'
 
 /**
- * Must equal `setup.ts`'s `TEST_COMPANY`, which is used as BOTH
- * `boot.user.defaults.company` and the `locals[':Company']` key. `src/lib/company.ts:4`
- * looks the company up in `locals` by name, so any other value resolves to `undefined`.
+ * Must equal the harness's company, which is used as BOTH `boot.user.defaults.company` and the
+ * `locals[':Company']` key; any other value makes `getCompanyCurrency()` return `undefined`.
  */
 export const TEST_COMPANY = 'Test Company'
 
-/** The harness system default, and a registered `locals[':Currency']` key (symbol `₹`). */
 export const TEST_CURRENCY = 'INR'
 
 /**
- * The second registered `locals[':Currency']` key (symbol `$`). Pairing this with
- * {@link TEST_CURRENCY} is what makes a currency mismatch observable: the transaction row
- * resolves its effective currency as
- * `transaction.currency ?? selectedBank?.account_currency ?? getCompanyCurrency(...)`
- * (`MatchAndReconcile.tsx:336`), so a `USD` transaction against an `INR` account differs
- * at the first term.
+ * The harness's second registered currency. Pairing it with {@link TEST_CURRENCY} is what makes a
+ * mismatch observable, because a row resolves its effective currency from `transaction.currency`
+ * first and only then from the account.
  */
 export const TEST_ALTERNATE_CURRENCY = 'USD'
 
-/** `setup.ts`'s boot user — the owner recorded on every document fixture. */
 export const TEST_USER = 'Administrator'
 
-/** `Bank Account.name`; also every fixture's `bank_account` link target. */
 export const TEST_BANK_ACCOUNT = 'Test Bank - Test Company'
 
-/** `Bank Account.bank` — a `Bank` link. */
 export const TEST_BANK = 'Test Bank'
 
-/** `Bank Account.account` — the Chart-of-Accounts account the bank account posts to. */
 export const TEST_BANK_LEDGER_ACCOUNT = 'Test Bank - TC'
 
-/** `Bank Transaction Rule.name`; the value stamped into `matched_transaction_rule`. */
 export const TEST_TRANSACTION_RULE = 'BTR-0001'
 
-/**
- * The transaction date shared by the base transaction and the suggested voucher.
- * `isSuggested` compares dates for EQUALITY (`MatchAndReconcile.tsx:846-847`), so this
- * shared constant is what makes the suggestion deterministic rather than coincidental.
- */
+/** Shared by the base transaction and the suggested voucher: the predicate compares dates for equality. */
 export const TEST_TRANSACTION_DATE = '2024-01-15'
 
-/** A date deliberately unequal to {@link TEST_TRANSACTION_DATE}, for the override voucher. */
 export const TEST_ALTERNATE_DATE = '2024-01-09'
 
 /**
- * The base transaction's amount AND unallocated amount. `isSuggested` compares
- * `voucher.paid_amount === transaction.unallocated_amount`
- * (`MatchAndReconcile.tsx:845`), so the suggested voucher reuses this exact number.
+ * The base transaction's amount AND unallocated amount. The suggested voucher reuses this exact
+ * number, because the predicate compares `paid_amount` against `unallocated_amount`.
  */
 export const TEST_TRANSACTION_AMOUNT = 12500
 
-/** An amount deliberately unequal to {@link TEST_TRANSACTION_AMOUNT}. */
 export const TEST_ALTERNATE_AMOUNT = 8750
 
 /**
- * The base transaction's `reference_number` and the suggested voucher's `reference_no`,
- * so they form a FULL reference match (`MatchAndReconcile.tsx:848`).
+ * The base transaction's `reference_number` and the suggested voucher's `reference_no`, so they form
+ * a full reference match.
  *
- * NEVER make a `reference_no` empty. `referenceMatchesPartial`
- * (`MatchAndReconcile.tsx:850`) is `transaction.reference_number?.includes(reference_no)`,
- * and `String.prototype.includes('')` is ALWAYS `true` — an empty value would make every
- * voucher a partial match and make `isSuggested` non-deterministic.
+ * NEVER make a `reference_no` empty. The partial-match term is
+ * `transaction.reference_number?.includes(reference_no)`, and `includes('')` is ALWAYS `true`, so an
+ * empty value would make every voucher a partial match.
  */
 export const TEST_REFERENCE_NUMBER = 'NEFT/2024/000145'
 
 /**
- * The override voucher's `reference_no`. Chosen so it is NOT a substring of
- * {@link TEST_REFERENCE_NUMBER} or of the base transaction's description — otherwise
- * `referenceMatchesPartial` would be true and the override voucher would read as a
- * partial match instead of "No Match".
+ * The override voucher's `reference_no`, chosen so it is neither equal to nor a SUBSTRING of
+ * {@link TEST_REFERENCE_NUMBER} or of the base description — otherwise it would read as a partial
+ * match instead of "No Match".
  */
 export const TEST_ALTERNATE_REFERENCE_NUMBER = 'JV-ADJ-2024-0007'
 
-/** `Bank Transaction.description`. Non-empty: the row renders it and the search indexes it. */
 export const TEST_TRANSACTION_DESCRIPTION = 'NEFT credit from ACME Traders'
 
-/** A `Frappe` datetime, microsecond-precision — the format `creation`/`modified` carry. */
 export const TEST_CREATION_TIMESTAMP = '2024-01-15 10:30:00.000000'
 
-/** A `modified` stamp strictly later than {@link TEST_CREATION_TIMESTAMP}. */
 export const TEST_MODIFIED_TIMESTAMP = '2024-01-15 10:31:12.000000'
 
 /* ═══ 2. Bank transactions ════════════════════════════════════════════════════════════
- * `UnreconciledTransaction` (`BankReconciliation/utils.ts:84`) is a `Pick` over EXACTLY
- * fifteen `BankTransaction` fields:
+ * THE BACKEND CONTRACT. `get_bank_transactions` selects SIXTEEN columns
+ * (`bank_reconciliation_tool.py:66-85`):
  *
- *   name · matched_transaction_rule · date · withdrawal · deposit · currency ·
- *   description · status · transaction_type · reference_number · party_type · party ·
- *   bank_account · company · unallocated_amount
+ *   date · deposit · withdrawal · currency · description · transaction_type · name ·
+ *   bank_account · company · allocated_amount · unallocated_amount · reference_number ·
+ *   party_type · party · status · matched_transaction_rule
  *
- * `status` AND `unallocated_amount` are both in that set — which is exactly why the
+ * THE CLIENT PROJECTION. `UnreconciledTransaction` (`BankReconciliation/utils.ts:84`) is a
+ * `Pick` over FIFTEEN of those sixteen. The one column it does not name is
+ * `allocated_amount`. That narrowing is deliberate, not an oversight: no reconciliation
+ * surface reads the allocated figure off a row — the list shows the transaction value and
+ * the remaining `unallocated_amount` (`MatchAndReconcile.tsx:430-431`), and the allocated
+ * figure only becomes relevant on the FULL document the reconcile response returns, which
+ * `makeBankTransaction` below does model.
+ *
+ * So the builder in this section is a faithful model of the CONSUMER projection, and is
+ * not to be read as a transcription of the raw endpoint response. The distinction matters
+ * for a fixture: a suite that needed the allocated figure would be asserting against the
+ * wrong type, and should use `makeBankTransaction` instead.
+ *
+ * `status` AND `unallocated_amount` are both in the picked set — which is exactly why the
  * client-side already-reconciled guard needs no new data and no backend change.
  *
- * Only `name` is required (`types/Accounts/BankTransaction.ts:4`); the other fourteen are
- * optional. All fifteen are nonetheless written out explicitly below, so the "exactly
- * fifteen" property is auditable by reading the builder.
+ * Only `name` is required (`types/Accounts/BankTransaction.ts:4`); the other fourteen
+ * picked fields are optional. All fifteen are nonetheless written out explicitly below, so
+ * the projection is auditable by reading the builder rather than by trusting this comment.
  * ══════════════════════════════════════════════════════════════════════════════════ */
 
 /**
- * Builds an ordinary unreconciled DEPOSIT row: the default state of a freshly imported
- * bank transaction awaiting review.
- *
- * `useIsTransactionWithdrawal` (`utils.ts:350-361`) picks the displayed amount as
- * `withdrawal > 0 ? withdrawal : deposit`, so exactly one of the two is positive here.
- * For a withdrawal row, override both:
- * `makeUnreconciledTransaction({ withdrawal: 900, deposit: 0 })`.
- *
- * `matched_transaction_rule` is explicitly `undefined` rather than omitted, so that all
- * fifteen picked fields appear in one place. The row's violet rule badge is gated on its
- * truthiness (`MatchAndReconcile.tsx:366`), so an unstamped row renders no badge.
+ * An ordinary unreconciled DEPOSIT row: exactly one of `withdrawal`/`deposit` is positive, because
+ * the displayed amount is `withdrawal > 0 ? withdrawal : deposit`. Override both for a withdrawal
+ * row. `matched_transaction_rule` is explicitly `undefined` rather than omitted, so all fifteen
+ * picked fields appear in one place; an unstamped row renders no rule badge.
  */
 export const makeUnreconciledTransaction = (
 	overrides: Partial<UnreconciledTransaction> = {}
@@ -209,14 +196,6 @@ export const makeUnreconciledTransaction = (
 	...overrides
 })
 
-/**
- * A transaction the rule engine has already matched — the fixture behind the
- * rule-suggested-match scenario.
- *
- * `MatchAndReconcile.tsx:366-369` renders `matched_transaction_rule` as the TEXT of a
- * violet badge titled "Matched by rule", so a suite asserts on the rule NAME appearing
- * in the row.
- */
 export const makeRuleMatchedTransaction = (
 	overrides: Partial<UnreconciledTransaction> = {}
 ): UnreconciledTransaction =>
@@ -227,18 +206,13 @@ export const makeRuleMatchedTransaction = (
 	})
 
 /**
- * A transaction the server considers FULLY RECONCILED — the fixture behind the
- * already-reconciled guard.
+ * A transaction the server considers FULLY RECONCILED. Both signals are set and both are
+ * load-bearing: the server derives `status` from `docstatus` and `unallocated_amount`, so
+ * `status === 'Reconciled'` holds exactly when `unallocated_amount <= 0`, and setting only one would
+ * model a state the server can never produce.
  *
- * Both signals are set, and both are load-bearing. The server derives `status` purely
- * from `docstatus` and `unallocated_amount`, and its posting guard is
- * `if 0.0 >= self.unallocated_amount: throw` — so `status === 'Reconciled'` holds exactly
- * when `unallocated_amount <= 0`. A fixture setting only one of the two would model a
- * state the server can never produce.
- *
- * Such rows DO reach the UI today: the "Bank Transactions" tab requests the unfiltered
- * set with `all_transactions: true` (`utils.ts:120`), bypassing the server-side filter
- * that would otherwise exclude them.
+ * Such rows do reach the UI: the "Bank Transactions" tab requests the unfiltered set, bypassing the
+ * server-side filter that would otherwise exclude them.
  */
 export const makeReconciledTransaction = (
 	overrides: Partial<UnreconciledTransaction> = {}
@@ -255,9 +229,21 @@ export const makeReconciledTransaction = (
  * non-blocking currency-mismatch advisory. Pair it with a {@link makeSelectedBank} whose
  * `account_currency` is {@link TEST_CURRENCY}.
  *
- * The indicator is advisory ONLY and must not disable confirming: the server is the
- * authority, and its currency validation raises on save, so the rejection surfaces
- * through the same dismissible-dialog path as any other backend refusal.
+ * The ONE guaranteed requirement is that the indicator is ADVISORY: it must not disable
+ * confirming, and the server stays the authority. This fixture therefore promises nothing
+ * about how the backend answers a post — a suite must mock whichever response it intends to
+ * exercise, and assert against that:
+ *
+ *   • accepted — `frappePostCall.mockResolvedValue(makeReconcileSuccessResponse())`
+ *   • refused  — `frappePostCall.mockRejectedValue(makeServerMessagesError(…))`, which then
+ *     surfaces through the same dismissible dialog as any other backend refusal
+ *
+ * Do NOT assume a mismatch is rejected. `validate_currency`
+ * (`bank_transaction.py:65-82`) is reached only from `validate()`, while the reconcile path
+ * saves an ALREADY-SUBMITTED document — which Frappe routes through `update_after_submit`,
+ * a path that never calls `validate()`. `MatchAndReconcile.tsx:398-408` records the runtime
+ * confirmation of that seam. Assuming a rejection here would make an FM5 suite assert a
+ * response the real call path does not produce.
  */
 export const makeCurrencyMismatchTransaction = (
 	overrides: Partial<UnreconciledTransaction> = {}
@@ -269,26 +255,13 @@ export const makeCurrencyMismatchTransaction = (
 	})
 
 /**
- * Builds a COMPLETE `Bank Transaction` document, as distinct from the fifteen-field
- * projection above.
+ * Builds a COMPLETE `Bank Transaction` document, as distinct from the fifteen-field client
+ * projection above. This is the builder that carries `allocated_amount` — the one column
+ * `get_bank_transactions` returns that `UnreconciledTransaction` does not pick — so a suite
+ * needing the allocated figure belongs here rather than on the row builder.
  *
- * Needed because `useReconcileTransaction` is
- * `useFrappePostCall<{ message: BankTransaction }>(…)` (`utils.ts:223`) and its success
- * handler passes `res.message` on to the action log — whose `ActionLogItem.bankTransaction`
- * is typed as a full `BankTransaction` (`bankRecAtoms.ts:70`) — and to
- * `onReconcileTransaction`, which reads `updatedTransaction.unallocated_amount`
- * (`utils.ts:169`). Without this builder, every reconcile-success suite would invent its
- * own document.
- *
- * Defaults model the response to a SUCCESSFUL full reconciliation: `docstatus: 1`
- * (the endpoint only ever returns submitted rows), `status: 'Reconciled'`,
- * `allocated_amount` equal to the transaction value and `unallocated_amount: 0`. That
- * zero drives `onReconcileTransaction` down its "advance to the next transaction" branch
- * (`utils.ts:169`); for the partial-allocation branch, override
- * `{ unallocated_amount: 2500, status: 'Unreconciled' }`.
- *
- * `naming_series` is a REQUIRED literal-typed field (`BankTransaction.ts:15`), so it can
- * only ever hold the one value below.
+ * Defaults model the response to a SUCCESSFUL FULL reconciliation, so `unallocated_amount: 0` drives
+ * the "advance to the next transaction" branch; override it for the partial-allocation branch.
  */
 export const makeBankTransaction = (overrides: Partial<BankTransaction> = {}): BankTransaction => ({
 	name: 'ACC-BTN-2024-00001',
@@ -316,72 +289,17 @@ export const makeBankTransaction = (overrides: Partial<BankTransaction> = {}): B
 	...overrides
 })
 
-/* ═══ 3. The selected bank account ════════════════════════════════════════════════════
- * `SelectedBank` (`bankRecAtoms.ts:11-17`) is a `Pick` over eleven `Bank Account` fields
- * plus five of its own: `logo`, `logoDark`, `darkModeInvert`, `logoClassName` and
- * `account_currency`.
- *
- * Within that `Pick`, THREE members are non-optional — `name`, `bank` and `account_name`
- * (`types/Accounts/BankAccount.ts:3,18,14`) — so the builder must always supply them.
- * ══════════════════════════════════════════════════════════════════════════════════ */
-
 /**
- * Builds the bank account held in `selectedBankAccountAtom`.
+ * The bank account held in `selectedBankAccountAtom`.
  *
- * `account_currency` deserves the emphasis: it is NOT a native `Bank Account` field —
- * it appears nowhere in `types/Accounts/BankAccount.ts`. The `bank_account.get_list`
- * endpoint derives it at query time by following `Bank Account.account` to
- * `Account.account_currency`, which is exactly why `BankAccountWithCurrency` types it as
- * OPTIONAL (`utils.ts:283-285`) and why `SelectedBank` does too. It defaults to
- * {@link TEST_CURRENCY} here so the currency-mismatch predicate has something to compare
- * against; override it to model an account whose currency the endpoint could not resolve.
+ * `account_currency` is not a native `Bank Account` field: `bank_account.get_list` derives it at
+ * query time by following `Bank Account.account` to `Account.account_currency`, which is why both
+ * `BankAccountWithCurrency` and `SelectedBank` type it as optional. Defaulted here so the
+ * currency comparison has something to read; override it to model an unresolved currency.
  *
- * Because the server resolves the currency it validates against through that SAME lookup,
- * a client-side indicator built on this field cannot disagree with the server.
- *
- * `is_credit_card` and `is_default` are Frappe `Check` fields, typed `0 | 1`
- * (`BankAccount.ts:44,26`) — numeric flags, never `false`/`true`.
- *
- * The four logo members are deliberately left unset. `useGetBankAccounts` attaches them
- * by keyword-matching the bank name against `BANK_LOGOS` (`utils.ts:290-306,324-332`),
- * and none of that table's 121 keywords occurs in {@link TEST_BANK} — verified, not
- * assumed — so `undefined` is the honest result for this fixture rather than an omission.
- *
- * ─── Building one is not enough: the atom must be HYDRATED ────────────────────────────
- * `MatchAndReconcile` reads `selectedBankAccountAtom` and EARLY-RETURNS an empty state
- * when it is null (`MatchAndReconcile.tsx:41-43`, "Select a bank account to reconcile"),
- * so a suite that renders the workbench without seeding the atom sees no transaction rows
- * at all — however well its endpoint mocks are set up. `selectedBankAccountAtom` is an
- * `atomWithStorage` with `getOnInit: true` (`bankRecAtoms.ts:18-20`), so it latches its
- * value at module load and writing to `localStorage` afterwards has no effect. Seed it
- * through a jotai store instead, and render inside that store's `Provider`:
- *
- *     const store = createStore()
- *     store.set(selectedBankAccountAtom, makeSelectedBank())
- *     render(<Provider store={store}>…</Provider>)
- *
- * Verified by reproduction: without the seed the workbench renders only the empty state.
- *
- * ─── And hydration alone is STILL not enough: give elements real dimensions ───────────
- * Once the atom is seeded the workbench mounts and the filter counter correctly reports
- * "1 result", yet the transaction ROW still does not render. `VirtualizedListBody`
- * (`MatchAndReconcile.tsx:73-123`) drives the list through `@tanstack/react-virtual`, and
- * `virtual-core`'s `getRect` measures its scroll container with `offsetWidth`/`offsetHeight`
- * SPECIFICALLY (`@tanstack/virtual-core/dist/esm/index.js:14-17`) — not
- * `getBoundingClientRect`, not `clientHeight`. jsdom hard-codes both `offset*` properties to
- * `0`, so the virtualizer sees a zero-height viewport, computes an empty range and renders
- * nothing. `setup.ts` installs a no-op `ResizeObserver`, so no later measurement rescues it.
- *
- * Any suite asserting on rows inside a virtualized list must therefore stub those two
- * getters before rendering:
- *
- *     vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(900)
- *     vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(600)
- *
- * Verified by reproduction in both directions: with only `getBoundingClientRect` and
- * `clientHeight`/`clientWidth` stubbed the row never appears; adding the two `offset*`
- * getters makes it render. Restore the spies in `afterEach` — `setup.ts`'s own `afterEach`
- * only calls `cleanup()` and clears storage, it does NOT reset mocks.
+ * A suite that replaces the `offsetWidth`/`offsetHeight` getters to give a virtualized list a
+ * non-zero viewport must restore those property spies itself — the shared teardown resets this
+ * module's spies, not property getters.
  */
 export const makeSelectedBank = (overrides: Partial<SelectedBank> = {}): SelectedBank => ({
 	name: TEST_BANK_ACCOUNT,
@@ -393,45 +311,19 @@ export const makeSelectedBank = (overrides: Partial<SelectedBank> = {}): Selecte
 	company: TEST_COMPANY,
 	is_credit_card: 0,
 	is_default: 1,
-	// Set only for bank accounts linked to an external banking integration. This fixture
-	// models a manually maintained account, and no integration UI is in scope.
+	// Set only for accounts linked to an external banking integration; this fixture models a
+	// manually maintained account.
 	integration_id: undefined,
 	last_integration_date: undefined,
 	account_currency: TEST_CURRENCY,
 	...overrides
 })
 
-/* ═══ 4. Candidate vouchers ═══════════════════════════════════════════════════════════
- * `LinkedPayment` (`utils.ts:100-111`) is what `get_linked_payments` returns. EIGHT of
- * its ten members are REQUIRED — `rank`, `doctype`, `name`, `paid_amount`,
- * `reference_no`, `reference_date`, `posting_date` and `currency`; only `party_type` and
- * `party` are optional. `rank` is the one most easily forgotten, and omitting it is a
- * compile error under `strict`.
- *
- * The suggestion predicate, verbatim from `MatchAndReconcile.tsx:845-853`:
- *
- *   amountMatches            = voucher.paid_amount   === transaction.unallocated_amount
- *   postingDateMatches       = voucher.posting_date  === transaction.date
- *   referenceDateMatches     = voucher.reference_date === transaction.date
- *   referenceMatchesFull     = voucher.reference_no  === transaction.reference_number
- *                              || voucher.reference_no === transaction.description
- *   referenceMatchesPartial  = transaction.reference_number?.includes(voucher.reference_no)
- *                              || transaction.description?.includes(voucher.reference_no)
- *   isSuggested = amountMatches
- *                 && (postingDateMatches || referenceDateMatches || referenceMatchesPartial)
- *                 && index === 0
- *
- * Note the `index === 0` term: a voucher is only ever "suggested" when rendered FIRST.
- * ══════════════════════════════════════════════════════════════════════════════════ */
-
 /**
- * Builds a candidate voucher. Defaults describe a `Payment Entry` that lines up with
- * {@link makeUnreconciledTransaction} on amount, posting date, reference date and
- * reference number — so at list index 0 it satisfies `isSuggested`.
- *
- * `reference_no` is non-empty in every default and every variant, and must stay that way:
- * `referenceMatchesPartial` calls `String.prototype.includes(reference_no)`, and
- * `includes('')` is always `true`, which would make every voucher a partial match.
+ * A candidate voucher. Defaults agree with {@link makeUnreconciledTransaction} on amount, posting
+ * date, reference date and reference number, so at list index 0 it satisfies the suggestion
+ * predicate — which also requires `index === 0`, so a voucher is only ever suggested when rendered
+ * first.
  */
 export const makeLinkedPayment = (overrides: Partial<LinkedPayment> = {}): LinkedPayment => ({
 	rank: 1,
@@ -448,19 +340,12 @@ export const makeLinkedPayment = (overrides: Partial<LinkedPayment> = {}): Linke
 })
 
 /**
- * Builds the voucher that a given transaction SUGGESTS, by copying the four fields the
- * predicate compares straight off that transaction.
+ * The voucher a given transaction SUGGESTS, built by copying the compared fields off that
+ * transaction. Deriving rather than restating is the point: this stays suggested by construction even
+ * for a transaction whose amount or date a suite overrode.
  *
- * Deriving rather than restating is the point: a suite pairing
- * `makeUnreconciledTransaction()` with `makeLinkedPayment()` is only suggested because
- * their literals happen to agree, whereas this helper is suggested BY CONSTRUCTION for
- * any transaction — including one whose amount or date a suite has overridden.
- *
- * `reference_no` falls back with `||`, not `??`, on purpose: a transaction carrying an
- * EMPTY `reference_number` must not produce an empty `reference_no` (see the `includes('')`
- * trap above), and `??` would happily propagate `''`.
- *
- * Still subject to `index === 0` — this must be the first voucher rendered.
+ * `reference_no` falls back with `||`, not `??`: an empty `reference_number` must not propagate into
+ * an empty `reference_no`, which `??` would happily do.
  */
 export const makeSuggestedLinkedPayment = (
 	transaction: UnreconciledTransaction,
@@ -479,19 +364,10 @@ export const makeSuggestedLinkedPayment = (
 	})
 
 /**
- * Builds a DIFFERENT voucher — the one a reviewer picks when manually overriding the
- * suggestion. It is a `Journal Entry` rather than a `Payment Entry`, at `rank: 2`, and it
- * disagrees with {@link makeUnreconciledTransaction} on every compared field:
- *
- *   • `paid_amount` differs        ⇒ `amountMatches` false ⇒ `isSuggested` false
- *   • `posting_date`/`reference_date` differ ⇒ neither date term holds
- *   • `reference_no` is neither equal to nor a SUBSTRING of the base transaction's
- *     reference number or description ⇒ both reference terms false ⇒ the row reads
- *     "No Match" (`MatchAndReconcile.tsx:916-917`) rather than "Partial Match"
- *
- * Reconciling against this voucher still posts through the same single, atomic server
- * call as accepting the suggestion — the override changes WHICH voucher is linked, not
- * how the posting happens.
+ * A DIFFERENT voucher — the one a reviewer picks when overriding the suggestion. A `Journal Entry` at
+ * `rank: 2` that disagrees with {@link makeUnreconciledTransaction} on amount and on both dates, and
+ * whose reference is neither equal to nor a substring of the base reference or description, so the
+ * row reads "No Match" rather than "Partial Match".
  */
 export const makeAlternateLinkedPayment = (overrides: Partial<LinkedPayment> = {}): LinkedPayment =>
 	makeLinkedPayment({
@@ -507,35 +383,15 @@ export const makeAlternateLinkedPayment = (overrides: Partial<LinkedPayment> = {
 		...overrides
 	})
 
-/* ═══ 5. Statement import logs ════════════════════════════════════════════════════════
- * `BankStatementImportLog` (`types/Accounts/BankStatementImportLog.ts`) declares 29
- * properties, EIGHT of them required: `name`, `creation`, `modified`, `owner`,
- * `modified_by`, `docstatus`, `bank_account` and `file`.
- * ══════════════════════════════════════════════════════════════════════════════════ */
-
 /**
- * Builds a statement import log row.
+ * A statement import log row.
  *
- * `status` has exactly TWO values — `"Not Started" | "Completed"`
- * (`BankStatementImportLog.ts:19`) — and the DocType carries NO error field of any kind.
- * The import runs synchronously and rolls back on failure, so on failure the status
- * simply never advances and nothing is persisted. That is the whole reason the per-file
- * failure indicator is driven from {@link makeImportFailures} rather than from the
- * document, and it is why no third status value is invented here.
+ * `status` has exactly TWO values — `"Not Started" | "Completed"` — and the DocType carries no error
+ * field of any kind. The import runs synchronously and rolls back on failure, so the status simply
+ * never advances and nothing is persisted. That is why the per-file failure indicator is driven from
+ * {@link makeImportFailures} rather than from the document, and why no third value is invented here.
  *
- * Defaults populate every field the importer list requests
- * (`pages/BankStatementImporter.tsx:223`): `name`, `file`, `status`,
- * `number_of_transactions`, `start_date`, `end_date`, `closing_balance`, `creation` —
- * plus the remaining required members and `currency`.
- *
- * `file` MUST contain a slash: the row renders `item.file.split('/').pop()`
- * (`BankStatementImporter.tsx:275`) as the displayed file name.
- *
- * `name` is a random hash and `docstatus` is `0` because the DocType uses
- * `"autoname": "hash"` with `"naming_rule": "Random"` and is not submittable — verified
- * against `bank_statement_import_log.json`.
- *
- * For the not-yet-run state, override `{ status: 'Not Started', number_of_transactions: 0 }`.
+ * `file` MUST contain a slash: the row renders `file.split('/').pop()` as the displayed name.
  */
 export const makeBankStatementImportLog = (
 	overrides: Partial<BankStatementImportLog> = {}
@@ -557,57 +413,20 @@ export const makeBankStatementImportLog = (
 	...overrides
 })
 
-/* ═══ 6. Frappe error envelopes ═══════════════════════════════════════════════════════
- * `getErrorMessages` (`src/lib/frappe.ts:20-69`) is the single code path through which
- * every backend refusal reaches the user, and `ErrorBanner` renders whatever it returns
- * (`src/components/ui/error-banner.tsx:34-47`). It resolves in a fixed ORDER, and each
- * step is reachable only if the previous one produced nothing:
+/* Every backend refusal reaches the user through `getErrorMessages`, which resolves in a fixed
+ * ORDER: parsed `_server_messages` first, then an APPENDED `_error_message`, then the text after the
+ * first colon of `exception`, then the bare `message`. The fixtures below cover one path each.
  *
- *   1. `:22`     `_server_messages` is JSON-parsed into an array.
- *   2. `:23-34`  each ELEMENT is JSON-parsed too, falling back to the raw element.
- *   3. `:36-44`  if `_error_message` is truthy it is APPENDED (this step is additive, and
- *                runs even when step 1 already produced messages).
- *   4. `:46-58`  only if still empty: the text after the first colon of `exception`.
- *   5. `:59-65`  only if still empty: the bare `message`.
- *
- * Step 4 hides two quirks that these fixtures make testable, because `if (indexOfFirstColon)`
- * is a TRUTHINESS test rather than a `>= 0` test:
- *
- *   • a colon at index 0 yields `0`, which is FALSY — so the whole step is SKIPPED and
- *     resolution falls through to step 5;
- *   • no colon at all yields `-1`, which is TRUTHY — so `slice(-1 + 1)` returns the WHOLE
- *     exception string.
- *
- * Two typing notes. `_error_message` is NOT a member of the public `FrappeError` type,
- * which is why the production code reaches it behind `ts-expect-error` at `frappe.ts:36,39`;
- * here the envelope is built as a plain object and cast EXACTLY ONCE, which keeps this
- * file free of `ts-expect-error` and therefore free of any risk of an orphaned directive.
- * And `FrappeError` itself requires `httpStatus`, `httpStatusText`, `message` and
- * `exception` — verified in `frappe-js-sdk/lib/frappe_app/types.d.ts` — so every fixture
- * supplies all four.
- * ══════════════════════════════════════════════════════════════════════════════════ */
+ * `_error_message` is not a member of the public `FrappeError` type, so each envelope is built as a
+ * plain object and cast EXACTLY ONCE. That keeps this file free of `ts-expect-error`, and therefore
+ * free of any risk of an orphaned directive. */
 
-/**
- * The literal object Frappe encodes into each `_server_messages` element, restricted to
- * the three keys the client actually reads. Frappe also transmits `raise_exception` on a
- * thrown message; it is omitted because nothing in this SPA looks at it.
- *
- * Declared locally and deliberately NOT exported. `frappe.ts:3-7` keeps its own
- * `ParsedErrorMessage` private and `error-banner.tsx:14-18` declares a second private
- * copy, so there is no shared type to reuse and none is published here — suites assert
- * on parsed messages STRUCTURALLY.
- */
 type ServerMessagePayload = {
 	message: string
 	title?: string
 	indicator?: string
 }
 
-/**
- * The wire shape of a Frappe error response. Mirrors the SDK's exported error type and
- * adds the `_error_message` key the SDK's type omits but the server sometimes sends.
- * Local and unexported: it exists to type this file's builders, not to be imported.
- */
 type FrappeErrorPayload = {
 	httpStatus: number
 	httpStatusText: string
@@ -620,28 +439,19 @@ type FrappeErrorPayload = {
 }
 
 /**
- * Encodes one server message the way Frappe actually transmits it: DOUBLE-ENCODED — a
- * JSON array whose element is itself a JSON string. `getErrorMessages` parses the outer
- * array at `frappe.ts:22` and then parses the element at `:23-34`, so a fixture that
- * encoded only once would arrive as a raw string and take the `catch` branch instead.
- *
- * A single element is the faithful shape for a `frappe.throw`, which raises exactly one
- * message.
+ * Encodes one server message the way Frappe actually transmits it: DOUBLE-ENCODED — a JSON array
+ * whose element is itself a JSON string. A singly encoded fixture would arrive as a raw string and
+ * take the parser's `catch` branch instead.
  */
 const encodeServerMessage = (message: ServerMessagePayload): string =>
 	JSON.stringify([JSON.stringify(message)])
 
 /**
- * Assembles a Frappe error envelope over realistic defaults, and performs the single type
- * assertion this module needs.
+ * Assembles a Frappe error envelope and performs the single type assertion this module needs.
  *
- * Defaults describe a `frappe.throw`: HTTP 417, which is the status Frappe returns for a
- * `ValidationError`. `exception` defaults to EMPTY, which is the "no exception reported"
- * state and — as traced in the section header — resolves through to the bare `message`.
- *
- * Exposed so a suite can compose an envelope the named factories below do not cover, for
- * example the permission refusal the statement importer can raise:
- * `makeFrappeError({ httpStatus: 403, httpStatusText: 'Forbidden', exc_type: 'PermissionError', … })`.
+ * Defaults describe a `frappe.throw`: HTTP 417, the status Frappe returns for a `ValidationError`,
+ * with an EMPTY `exception` — the "no exception reported" state. Exposed so a suite can compose an
+ * envelope the named factories below do not cover.
  */
 export const makeFrappeError = (payload: Partial<FrappeErrorPayload> = {}): FrappeError =>
 	({
@@ -654,17 +464,12 @@ export const makeFrappeError = (payload: Partial<FrappeErrorPayload> = {}): Frap
 	}) as unknown as FrappeError
 
 /**
- * PATH 1 — an error carrying a `_server_messages` envelope, the form a `frappe.throw`
- * produces and by far the most common backend refusal.
+ * PATH 1 — an error carrying `_server_messages`, the form a `frappe.throw` produces and by far the
+ * most common refusal.
  *
- * `title: 'Message'` is what Frappe really sends for a plain throw, and it is meaningful:
- * `parseHeading` (`error-banner.tsx:20-23`) collapses both `'Message'` and `'Error'` into
- * the friendly heading, so this fixture exercises that collapse.
- *
- * `exception` is populated too, even though it can never be reached while
- * `_server_messages` is present. That is deliberate: it is what the server genuinely
- * sends alongside, and it lets a suite prove the PRECEDENCE — that the parsed server
- * message wins over the exception text.
+ * `title: 'Message'` is what Frappe really sends for a plain throw, and the banner collapses both
+ * `'Message'` and `'Error'` into its friendly heading. `exception` is populated too, even though it
+ * is unreachable while `_server_messages` is present, so a suite can prove that precedence.
  */
 export const makeServerMessagesError = (
 	message: string,
@@ -677,13 +482,9 @@ export const makeServerMessagesError = (
 	})
 
 /**
- * PATH 1, warning severity — identical to {@link makeServerMessagesError} except that the
- * server's own indicator is `'yellow'`.
- *
- * That single value is the whole amber-versus-red decision: `error-banner.tsx:39` reads
- * `<Alert theme={messages[0]?.indicator === 'yellow' ? 'amber' : 'red'}>`. The client makes
- * no severity judgement of its own, so this fixture is the only way to reach the amber
- * branch.
+ * PATH 1 at warning severity. The server's own `indicator` is the whole amber-versus-red decision —
+ * the banner themes on `indicator === 'yellow'` and makes no judgement of its own — so this is the
+ * only way to reach the amber branch.
  */
 export const makeWarningServerMessagesError = (
 	message: string,
@@ -695,37 +496,12 @@ export const makeWarningServerMessagesError = (
 		...overrides
 	})
 
-/**
- * The server's own wording for the already-reconciled refusal, VERBATIM, including its
- * untranslated `{0}` placeholder:
- *
- *     Bank Transaction {0} is already fully reconciled
- *
- * The backend raises it as the FIRST statement of the first method the posting endpoint
- * invokes, guarded by `if 0.0 >= self.unallocated_amount`. Because that check precedes
- * every mutation and the whole operation commits through a single save, a partial posting
- * on this path is structurally impossible rather than merely unlikely.
- *
- * Kept as a template because the client must render the server's text with NO paraphrasing
- * whatsoever, so a suite can assert against the exact server wording.
- */
+/** The pre-format template; {@link formatAlreadyReconciledMessage} substitutes the transaction name. */
 export const ALREADY_RECONCILED_MESSAGE_TEMPLATE = 'Bank Transaction {0} is already fully reconciled'
 
-/**
- * Substitutes the transaction name into {@link ALREADY_RECONCILED_MESSAGE_TEMPLATE} the
- * same way the server's `.format()` call does, producing the exact text that travels on
- * the wire.
- */
 export const formatAlreadyReconciledMessage = (transactionName: string): string =>
 	ALREADY_RECONCILED_MESSAGE_TEMPLATE.replace('{0}', transactionName)
 
-/**
- * The already-reconciled refusal as a complete error envelope — the fixture behind the
- * stale-client scenario and the "a failed confirm changes nothing" scenario.
- *
- * A suite pairs it with {@link makeReconciledTransaction} and asserts two things: that the
- * server's text reaches the dialog verbatim, and that no row transitions to reconciled.
- */
 export const makeAlreadyReconciledError = (
 	transactionName: string = 'ACC-BTN-2024-00003',
 	overrides: Partial<FrappeErrorPayload> = {}
@@ -733,13 +509,8 @@ export const makeAlreadyReconciledError = (
 	makeServerMessagesError(formatAlreadyReconciledMessage(transactionName), overrides)
 
 /**
- * PATH 2 — an error whose text arrives in `_error_message` rather than
- * `_server_messages`. `frappe.ts:36-44` pushes it as
- * `{ message, title: 'Error', indicator: 'red' }`.
- *
- * Note this step is ADDITIVE, not exclusive: supplying `_server_messages` as well through
- * `overrides` yields TWO parsed messages, and `ErrorBanner` renders both
- * (`error-banner.tsx:43-45`).
+ * PATH 2 — text arriving in `_error_message` rather than `_server_messages`. This step is ADDITIVE,
+ * not exclusive: supplying both yields TWO parsed messages, and the banner renders both.
  */
 export const makeErrorMessageError = (
 	message: string,
@@ -752,13 +523,9 @@ export const makeErrorMessageError = (
 	})
 
 /**
- * PATH 3 — no server messages at all, so the text is recovered from `exception` by
- * slicing off everything up to and including the first colon.
- *
- * Two details a suite must expect. The parsed message RETAINS the leading space that
- * follows the colon in a real Frappe exception line, and it carries NO `indicator`
- * (`frappe.ts:52-55` sets only `message` and `title`) — which means
- * `error-banner.tsx:39` falls to the red theme.
+ * PATH 3 — no server messages, so the text is recovered from `exception` by slicing off everything up
+ * to and including the first colon. The parsed message RETAINS the leading space that follows the
+ * colon and carries no `indicator`, so the banner falls to the red theme.
  */
 export const makeExceptionError = (
 	message: string,
@@ -770,16 +537,10 @@ export const makeExceptionError = (
 	})
 
 /**
- * PATH 3, first quirk — an `exception` whose colon sits at INDEX 0.
- *
- * `indexOfFirstColon` is then `0`, and `if (0)` is falsy, so `frappe.ts:49` skips the
- * entire colon-slice step even though a colon is plainly present. Resolution therefore
- * falls through to the bare `message` at `:59-65`, yielding
- * `{ message: <the bare message>, title: 'Error', indicator: 'red' }` — NOT the exception
- * text.
- *
- * `message` is given a distinct default precisely so a suite can tell the two apart and
- * prove which branch ran.
+ * PATH 3, first quirk — a colon at INDEX 0. The parser guards with a TRUTHINESS test, so `0` is falsy
+ * and the colon-slice step is skipped even though a colon is plainly present; resolution falls
+ * through to the bare `message`, which is given a distinct default so a suite can prove which branch
+ * ran.
  */
 export const makeLeadingColonExceptionError = (
 	exceptionMessage: string,
@@ -792,11 +553,8 @@ export const makeLeadingColonExceptionError = (
 	})
 
 /**
- * PATH 3, second quirk — an `exception` containing NO colon.
- *
- * `indexOf(':')` returns `-1`, which is TRUTHY, so `frappe.ts:50` slices from `-1 + 1`,
- * i.e. from index 0, and the parsed message is the WHOLE exception string with nothing
- * stripped. Like the ordinary colon case it carries no `indicator`.
+ * PATH 3, second quirk — an `exception` containing NO colon. `indexOf(':')` returns `-1`, which is
+ * TRUTHY, so the slice starts at index 0 and the whole exception string survives.
  */
 export const makeColonlessExceptionError = (
 	exceptionMessage: string,
@@ -808,16 +566,9 @@ export const makeColonlessExceptionError = (
 	})
 
 /**
- * PATH 4 — the final fallback: nothing but a bare `message`.
- *
- * `exception` is EMPTY, and that is what routes resolution here. Traced through
- * `frappe.ts:48-57`: `''.indexOf(':')` is `-1` (truthy), `''.slice(0)` is `''`, and
- * `if ('')` is falsy — so the colon-slice step produces nothing and `:59-65` supplies
- * `{ message, title: 'Error', indicator: 'red' }`.
- *
- * This is also the fixture for the transport half of an "API or network failure": a
- * request that never reached application code has no server messages and no exception.
- * Override `message` for a specific wording, e.g. `makeMessageOnlyError('Network Error')`.
+ * PATH 4 — the message-only envelope: no server messages and an EMPTY `exception`, which is what
+ * routes resolution here. The colon-slice step yields an empty string and is skipped, so the bare
+ * `message` supplies the text.
  */
 export const makeMessageOnlyError = (
 	message: string = 'Internal Server Error',
@@ -832,30 +583,34 @@ export const makeMessageOnlyError = (
 		...overrides
 	})
 
-/* ═══ 7. Per-file import failures ═════════════════════════════════════════════════════ */
-
 /**
  * Builds the value held by `bankRecImportFailuresAtom`, whose type is
- * `Record<string, FrappeError>` keyed by import-log NAME (`bankRecAtoms.ts:91`).
+ * `Record<string, ImportAttemptStatus>` keyed by import-log NAME.
  *
- * This map — not the document — is what drives the per-file failure indicator, because
- * `Bank Statement Import Log` has only two status values and no error field, so a failed
- * import persists nothing at all. The failure is therefore observed from the synchronous
- * rejection and held for the session.
+ * This map supplements — and never overrides — the document, because `Bank Statement Import
+ * Log` has only two status values and no error field, so an import that rolls back persists
+ * nothing at all. The marker is what the client established about ONE attempt, and it holds
+ * no error object: `'failed'` means the server was asked and reported a status other than
+ * `Completed`, while `'unknown'` means no status could be obtained. An authoritative
+ * `Completed` always wins over either, so a suite asserting the badge must supply the log's
+ * own `status` as well as the marker.
  *
  * Accepts the log itself rather than a bare name so the key cannot drift from the row it
  * marks.
  */
 export const makeImportFailures = (
 	log: BankStatementImportLog,
-	error: FrappeError = makeServerMessagesError('No tables found in the uploaded file')
-): Record<string, FrappeError> => ({ [log.name]: error })
+	attempt: ImportAttemptStatus = 'failed'
+): Record<string, ImportAttemptStatus> => ({ [log.name]: attempt })
 
-/* ═══ 8. The ONE shared `frappe-react-sdk` module mock ════════════════════════════════
- * Every suite mocks the SDK through this single helper, so no suite hand-rolls its own
- * module mock and no suite can accidentally omit a symbol.
+/* Every suite mocks the SDK through {@link createFrappeSDKMock}, so none hand-rolls a module mock or
+ * omits a symbol. The `vi.mock('frappe-react-sdk', () => createFrappeSDKMock())` line must stay
+ * literally in the test file, so Vitest's transform can hoist it above the imports; the factory
+ * itself runs lazily, which is why it may reference an imported helper.
  *
- * Applied in one line at module level:
+ * Only symbols used as VALUES are stubbed. `FrappeError`, `FrappeConfig`, `SWRConfiguration` and
+ * `Filter` appear solely in type positions and are erased before the module is resolved, so stubbing
+ * them would invent exports the library does not have.
  *
  *     vi.mock('frappe-react-sdk', () => createFrappeSDKMock())
  *
@@ -864,10 +619,10 @@ export const makeImportFailures = (
  * why it may reference this imported helper.
  *
  * ─── Which symbols are stubbed, and which must NOT be ────────────────────────────────
- * Every `from 'frappe-react-sdk'` import across `src/` was enumerated: SEVENTEEN distinct
- * symbols, of which THIRTEEN are used as VALUES and are stubbed below, while four —
- * `FrappeError`, `FrappeConfig`, `SWRConfiguration` and `Filter` — appear only in type
- * positions.
+ * Every `from 'frappe-react-sdk'` import in the APPLICATION code under `src/` was
+ * enumerated: SEVENTEEN distinct symbols, of which THIRTEEN are used as VALUES and are
+ * stubbed below, while four — `FrappeError`, `FrappeConfig`, `SWRConfiguration` and
+ * `Filter` — appear only in type positions.
  *
  * Those four are deliberately absent. They are erased before the module is ever resolved:
  * esbuild drops an import specifier that survives only in a type annotation, so the name
@@ -876,105 +631,551 @@ export const makeImportFailures = (
  * `pages/BankStatementImporter.tsx` all import cleanly against this thirteen-symbol mock.
  * Adding a runtime stub for a type would be inventing an export the library does not have.
  *
+ * This module itself imports five FURTHER type-only names — `Key`, `GetDocListArgs`,
+ * `FileArgs`, `FrappeFileUploadResponse` and `DocumentUpdateEventData` — to derive the
+ * contracts in §8a. They are `import type` and therefore erased outright, so the runtime
+ * surface a suite receives is still exactly thirteen symbols.
+ *
  * ─── Return shapes are the library's, not a guess ────────────────────────────────────
  * Each shape below was read off `frappe-react-sdk/dist/lib/index.d.ts`, then cross-checked
  * against what the SPA actually destructures. Two of them are easy to get wrong and both
  * break suites loudly rather than subtly:
  *
  *   • `useSWRConfig()` MUST return `{ mutate }`. `useRefreshUnreconciledTransactions`
- *     destructures it at `utils.ts:153`, and `useReconcileTransaction` calls that hook —
+ *     destructures it at `utils.ts:209`, and `useReconcileTransaction` calls that hook —
  *     so a mock without it fails every reconcile test at render time. Exposing the spy is
  *     also what makes the cache-revalidation assertions possible.
- *   • that `mutate` MUST return a PROMISE. `utils.ts:198` chains `.then(...)` onto it
+ *   • that `mutate` MUST return a PROMISE. `utils.ts:254-255` chains `.then(...)` onto it
  *     directly, so a plain `vi.fn()` returning `undefined` would throw. It resolves to
  *     `undefined`, which is safe because the continuation reads `res?.message` behind
- *     optional chaining (`utils.ts:202`).
+ *     optional chaining (`utils.ts:258`).
  *
- * ─── Defaults are inert, never failing ──────────────────────────────────────────────
- * Queries return no data and no error; async operations RESOLVE. A suite therefore opts
- * in to every interesting state, and — importantly for the failure-mode scenarios — must
- * opt in to failure explicitly with `.mockRejectedValue(...)`. Nothing here fails by
- * default, so a passing test never passes because a stub happened to break.
+ * ─── Every spy carries a TYPED contract, never a bare `vi.fn()` ──────────────────────
+ * §8a declares one callable contract per SDK seam, each derived from the installed
+ * declarations, and every spy is created as `vi.fn<Contract>(default)`. A bare `vi.fn()`
+ * would infer `(...args: any[]) => any`, which silently accepts a wrong endpoint argument,
+ * a wrong hook option or a wrong response shape — exactly the mistakes a typed test client
+ * exists to prevent. With the contracts in place `tsc -b` rejects them at the point the
+ * suite writes them, before anything runs.
+ *
+ * Where the library types a parameter as `any`, the contract narrows it to the shape every
+ * call site in `src/` actually passes (`Record<string, unknown>` for RPC parameter bags,
+ * for instance) and says so. Narrowing is deliberate: it is what makes a mistake a compile
+ * error rather than a runtime surprise. Generics are preserved only where a caller depends
+ * on one — `MockedQueryResponse<T>` keeps its payload parameter so the document-count hook
+ * can promise a `number` — while payload types default to `unknown`, because a suite must
+ * stay free to hand back any contract-valid fixture.
+ *
+ * ─── Defaults: passive reads are empty, side-effecting operations REJECT ─────────────
+ * The four SWR-backed READ hooks default to "no data, no error, not loading", which is what
+ * lets any component mount without configuration and is why a suite opts in to data.
+ *
+ * Every IMPERATIVE operation defaults to rejecting with
+ * {@link UNCONFIGURED_OPERATION_MESSAGE} instead: the post call, `createDoc`, `updateDoc`,
+ * the file upload and all twelve `FrappeContext` operations. A resolved-by-default
+ * operation is the more dangerous choice, because production `.then` handlers then run on a
+ * payload the test never supplied — the reconcile flow would log an action and toast success
+ * with `res.message` undefined (`utils.ts:313-341`), and the importer would navigate away on
+ * a response with no `docs` (`StatementDetails.tsx:77-86`) — so a suite could assert a
+ * "successful" flow it never actually configured. Rejecting makes that omission fail loudly
+ * and immediately, naming the operation and how to configure it. None of these fires during
+ * mount — every one is reached from a user-event handler — so the rejection only ever
+ * appears once a test drives the flow it forgot to set up.
+ *
+ * The two `mutate` spies are the deliberate exception: they keep resolving, because
+ * production chains `.then(...)` straight onto them and cache revalidation is a consequence
+ * of a scenario rather than the scenario itself. So are the document-event emitters, which
+ * nothing in the SPA calls.
+ *
+ * Opting in is a one-liner, and {@link makeReconcileSuccessResponse} /
+ * {@link makeImportSuccessResponse} make the payload contract-valid by construction rather
+ * than hand-shaped per suite.
  * ══════════════════════════════════════════════════════════════════════════════════ */
 
+/* ─── 8a. Callable contracts, derived from the installed declarations ──────────────────
+ * One alias per SDK seam. Each mirrors the corresponding declaration in
+ * `frappe-react-sdk/dist/lib/index.d.ts` — or, for the `FrappeContext` operations, the
+ * `frappe-js-sdk` class the SDK re-exports — narrowed to what `src/` actually passes and
+ * reads. They exist so every spy below can be held to a real shape by `vi.fn<Contract>(…)`
+ * instead of the `(...args: any[]) => any` a bare `vi.fn()` infers.
+ * ────────────────────────────────────────────────────────────────────────────────────── */
+
 /**
- * Stable spy for the keyed revalidation function returned by `useSWRConfig()`.
+ * SWR's optimistic-update options, narrowed to the members production supplies:
+ * `Preferences.tsx:24-32` passes `optimisticData` (line 27) and `revalidate` (line 31). The mock never reads
+ * them — typing them is what stops a suite misspelling an option and believing it applied.
+ */
+interface MockedMutateOptions {
+	optimisticData?: unknown
+	revalidate?: boolean
+	rollbackOnError?: boolean
+	populateCache?: boolean
+}
+
+/**
+ * The keyed `mutate` from `useSWRConfig()`, which revalidates ONE named cache key. Every
+ * call site passes a bare key string (`utils.ts:226-229,254,270,363-372`), and `Key` is
+ * SWR's own type for that argument, re-exported by the SDK.
+ */
+type MockedKeyedMutate = (
+	key: Key,
+	data?: unknown,
+	options?: MockedMutateOptions
+) => Promise<unknown>
+
+/**
+ * The `mutate` returned by an individual query hook. It revalidates that hook's OWN key, so
+ * it takes no key: called bare in most places, and with an optimistic payload at
+ * `Preferences.tsx:24-32`.
+ */
+type MockedHookMutate = (data?: unknown, options?: MockedMutateOptions) => Promise<unknown>
+
+/**
+ * The five members the SPA destructures from every SWR-backed hook — the subset of SWR's own
+ * `SWRResponse` this application reads. `error` is `undefined` rather than `null` when
+ * absent, matching SWR, so `error && <ErrorBanner …>` stays falsy.
+ *
+ * `T` defaults to `unknown` so a suite may hand back any contract-valid fixture, and is
+ * pinned only where the library itself fixes the payload (see {@link MockedGetDocCountHook}).
+ */
+interface MockedQueryResponse<T = unknown> {
+	data: T | undefined
+	error: FrappeError | undefined
+	isLoading: boolean
+	isValidating: boolean
+	mutate: MockedHookMutate
+}
+
+/** `index.d.ts:301`. `params` is `Record<string, any>` there, narrowed to a record here. */
+type MockedGetCallHook = (
+	method: string,
+	params?: Record<string, unknown>,
+	swrKey?: Key,
+	options?: SWRConfiguration,
+	type?: 'GET' | 'POST'
+) => MockedQueryResponse
+
+/** `index.d.ts:108`. */
+type MockedGetDocHook = (
+	doctype: string,
+	name?: string,
+	swrKey?: Key,
+	options?: SWRConfiguration
+) => MockedQueryResponse
+
+/** `index.d.ts:158`. */
+type MockedGetDocListHook = (
+	doctype: string,
+	args?: GetDocListArgs,
+	swrKey?: Key,
+	options?: SWRConfiguration
+) => MockedQueryResponse
+
+/**
+ * `index.d.ts:265`. The one query hook whose payload the LIBRARY fixes — it resolves to a
+ * count — so the generic is pinned to `number` rather than left open. `BankBalance.tsx:120`
+ * destructures it as `data: totalCount`.
+ */
+type MockedGetDocCountHook = (
+	doctype: string,
+	filters?: Filter[],
+	debug?: boolean,
+	swrKey?: Key,
+	options?: SWRConfiguration
+) => MockedQueryResponse<number>
+
+/** The `call` returned by `useFrappePostCall` (`index.d.ts:335`). */
+type MockedPostCall = (params: Record<string, unknown>) => Promise<unknown>
+
+/** `index.d.ts:333-346`. `error` is `Error | null` on this hook — not `| undefined`. */
+interface MockedPostCallResult {
+	call: MockedPostCall
+	result: unknown
+	loading: boolean
+	error: FrappeError | null
+	isCompleted: boolean
+	reset: () => void
+}
+
+type MockedPostCallHook = (method: string) => MockedPostCallResult
+
+/** The `createDoc` returned by `useFrappeCreateDoc` (`index.d.ts:190`). */
+type MockedCreateDoc = (doctype: string, doc: unknown) => Promise<unknown>
+
+/**
+ * `index.d.ts:188-199`. Two details are easy to get wrong and both are load-bearing: the
+ * create hook exposes NO `result` member, and its `error` is `Error | null | undefined`.
+ */
+interface MockedCreateDocResult {
+	createDoc: MockedCreateDoc
+	loading: boolean
+	error: FrappeError | null | undefined
+	isCompleted: boolean
+	reset: () => void
+}
+
+type MockedCreateDocHook = () => MockedCreateDocResult
+
+/** The `updateDoc` returned by `useFrappeUpdateDoc` (`index.d.ts:214`). */
+type MockedUpdateDoc = (doctype: string, docname: string | null, doc: unknown) => Promise<unknown>
+
+/** `index.d.ts:212-223`, which likewise carries no `result` member. */
+interface MockedUpdateDocResult {
+	updateDoc: MockedUpdateDoc
+	loading: boolean
+	error: FrappeError | null | undefined
+	isCompleted: boolean
+	reset: () => void
+}
+
+type MockedUpdateDocHook = () => MockedUpdateDocResult
+
+/**
+ * The `upload` returned by `useFrappeFileUpload` (`index.d.ts:433`). It resolves to the File
+ * document — `pages/BankStatementImporter.tsx:69` reads `file.file_url` off it — which is why
+ * the resolution type is the library's own interface and {@link makeFileUploadResponse}
+ * exists to satisfy it without a cast.
+ */
+type MockedFileUpload = (
+	file: File,
+	args: FileArgs<unknown>,
+	apiPath?: string
+) => Promise<FrappeFileUploadResponse>
+
+/** `index.d.ts:431-444`. `progress` is a rounded percentage. */
+interface MockedFileUploadResult {
+	upload: MockedFileUpload
+	progress: number
+	loading: boolean
+	error: FrappeError | null
+	isCompleted: boolean
+	reset: () => void
+}
+
+type MockedFileUploadHook = () => MockedFileUploadResult
+
+/**
+ * `index.d.ts:496`. The library types the payload as `T = any`; `unknown` here, because the
+ * concrete payload is supplied by {@link emitFrappeEvent} at the moment a test pushes one.
+ */
+type MockedEventListenerHook = (
+	eventName: string,
+	callback: (eventData: unknown) => void
+) => void
+
+/** The emitters returned by `useFrappeDocumentEventListener` (`index.d.ts:524-526`). */
+type MockedDocEventEmitter = () => void
+
+/** `index.d.ts:520-527`. */
+interface MockedDocumentEventListenerResult {
+	viewers: string[]
+	emitDocOpen: MockedDocEventEmitter
+	emitDocClose: MockedDocEventEmitter
+}
+
+type MockedDocumentEventListenerHook = (
+	doctype: string,
+	docname: string,
+	onUpdateCallback: (eventData: DocumentUpdateEventData) => void,
+	emitOpenCloseEventsOnMount?: boolean
+) => MockedDocumentEventListenerResult
+
+/**
+ * `useSWRConfig` is re-exported from SWR and really returns the whole cache configuration.
+ * All seven call sites in `src/` destructure `{ mutate }` and nothing else, so the contract
+ * is narrowed to that single member — anything more would be fixture surface no consumer reads.
+ */
+type MockedUseSWRConfigHook = () => { mutate: MockedKeyedMutate }
+
+/**
+ * `FrappeCall.get/post/put/delete` (`frappe-js-sdk/lib/call/index.d.ts`). The library types
+ * `params` as `Record<string, any>` on `get` and `any` on the other three; every call site in
+ * `src/` passes a parameter object, so all four share one narrowed record contract.
+ */
+type MockedContextRequest = (path: string, params?: Record<string, unknown>) => Promise<unknown>
+
+/** `FrappeDB.getDoc` (`frappe-js-sdk/lib/db/index.d.ts`). */
+type MockedContextGetDoc = (doctype: string, docname?: string) => Promise<unknown>
+
+/** `FrappeDB.getDocList`. */
+type MockedContextGetDocList = (doctype: string, args?: GetDocListArgs) => Promise<unknown[]>
+
+/** `FrappeDB.getCount`, whose resolution the library fixes to a number. */
+type MockedContextGetCount = (
+	doctype: string,
+	filters?: Filter[],
+	debug?: boolean
+) => Promise<number>
+
+/** `FrappeDB.createDoc`. */
+type MockedContextCreateDoc = (doctype: string, value: unknown) => Promise<unknown>
+
+/** `FrappeDB.updateDoc`, whose `docname` is genuinely nullable. */
+type MockedContextUpdateDoc = (
+	doctype: string,
+	docname: string | null,
+	value: unknown
+) => Promise<unknown>
+
+/** `FrappeDB.deleteDoc`, whose resolution the library fixes to `{ message }`. */
+type MockedContextDeleteDoc = (
+	doctype: string,
+	docname?: string | null
+) => Promise<{ message: string }>
+
+/**
+ * `FrappeDB.setValue`. `fieldname` really is `string | object` in the library — one field, or
+ * a map of several — so the union is kept rather than simplified away.
+ */
+type MockedContextSetValue = (
+	doctype: string,
+	name: string,
+	fieldname: string | object,
+	value?: unknown
+) => Promise<unknown>
+
+/**
+ * Axios's progress event, narrowed to the ONE member every upload call site reads —
+ * `progress?.progress ?? 0` (`TransferModalContent.tsx:229`,
+ * `RecordPaymentModalContent.tsx:364`, `BankEntryModalContent.tsx:317`). Modelled locally so
+ * a fixture module never has to import Axios's types.
+ */
+interface MockedUploadProgressEvent {
+	progress?: number
+}
+
+/**
+ * `FrappeFileUpload.uploadFile` (`frappe-js-sdk/lib/file/index.d.ts`) — the CONTEXT upload,
+ * which differs from the hook's `upload` in two ways: it accepts an `onProgress` callback,
+ * and it resolves to an Axios response rather than the File document. All three call sites
+ * discard the resolved value, so it is `unknown` here for the same reason as above.
+ */
+type MockedContextUploadFile = (
+	file: File,
+	args: FileArgs<unknown>,
+	onProgress?: (
+		bytesUploaded: number,
+		totalBytes?: number,
+		progress?: MockedUploadProgressEvent
+	) => void,
+	apiPath?: string
+) => Promise<unknown>
+
+/* ─── 8b. Opting in: the rejection, and the contract-valid success payloads ────────────
+ * Together these are what make a test non-vacuous: an operation nobody configured rejects
+ * with a message that names itself, and a scenario that WANTS a success says so with a
+ * payload shaped by the hook's own declared type.
+ * ────────────────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * The message every unconfigured imperative default rejects with.
+ *
+ * Exported so a suite can assert positively that a flow it deliberately left unconfigured did
+ * NOT quietly succeed, and so anyone meeting the message in a failure report can find its
+ * origin by searching for this one constant.
+ */
+export const UNCONFIGURED_OPERATION_MESSAGE = 'Unconfigured frappe SDK operation'
+
+/**
+ * Builds the rejection an unconfigured imperative operation produces.
+ *
+ * Deliberately a plain `Error` and NOT a {@link makeFrappeError} envelope: this is a test
+ * CONFIGURATION fault, not a server refusal. Dressing it as a Frappe error would let it
+ * masquerade as exactly the backend rejection a failure-mode suite is supposed to configure
+ * for itself — and `getErrorMessages` would render it as though the server had spoken.
+ *
+ * The `how` hint travels in the message so the fix appears in the failure output itself.
+ */
+const rejectUnconfigured = (operation: string, how: string): Promise<never> =>
+	Promise.reject(
+		new Error(
+			`${UNCONFIGURED_OPERATION_MESSAGE}: ${operation} ran without a configured implementation, ` +
+				`so this test would otherwise have asserted an outcome it never set up. Configure it — ${how}`
+		)
+	)
+
+/**
+ * The success payload of the reconcile post, shaped exactly as its hook declares it:
+ * `useFrappePostCall<{ message: BankTransaction }>` (`utils.ts:279`).
+ *
+ *     frappePostCall.mockResolvedValue(makeReconcileSuccessResponse())
+ *
+ * Overrides forward to {@link makeBankTransaction}, so the partial-allocation branch is
+ * `makeReconcileSuccessResponse({ unallocated_amount: 2500, status: 'Unreconciled' })`.
+ */
+export const makeReconcileSuccessResponse = (
+	overrides: Partial<BankTransaction> = {}
+): { message: BankTransaction } => ({ message: makeBankTransaction(overrides) })
+
+/**
+ * The success payload of the statement import, shaped exactly as its hook declares it:
+ * `useFrappePostCall<{ docs: BankStatementImportLog[] }>('run_doc_method')`
+ * (`StatementDetails.tsx:58`).
+ *
+ * The importer reads `response.docs[0].start_date` and `.end_date` to move the reconciliation
+ * date range (`StatementDetails.tsx:78-84`), so the default carries one fully populated log.
+ */
+export const makeImportSuccessResponse = (
+	logs: BankStatementImportLog[] = [makeBankStatementImportLog()]
+): { docs: BankStatementImportLog[] } => ({ docs: logs })
+
+/**
+ * The File document the hook upload resolves to (`index.d.ts:401-430`). Every member of that
+ * interface is required, which is why this builder exists: without it a suite would have to
+ * cast, and a cast would discard the very contract {@link MockedFileUpload} establishes.
+ *
+ * `file_url` is the only member production reads (`pages/BankStatementImporter.tsx:69`, which
+ * passes it straight into the import log it then creates), so it is the member most worth
+ * overriding.
+ */
+export const makeFileUploadResponse = (
+	overrides: Partial<FrappeFileUploadResponse> = {}
+): FrappeFileUploadResponse => ({
+	name: 'file-a1b2c3d4e5',
+	owner: TEST_USER,
+	creation: TEST_CREATION_TIMESTAMP,
+	modified: TEST_MODIFIED_TIMESTAMP,
+	modified_by: TEST_USER,
+	docstatus: 0,
+	idx: 0,
+	file_name: 'statement.csv',
+	is_private: 1,
+	is_home_folder: 0,
+	is_attachments_folder: 0,
+	file_size: 2048,
+	file_url: '/private/files/statement.csv',
+	folder: 'Home/Attachments',
+	is_folder: 0,
+	attached_to_doctype: 'Bank Statement Import Log',
+	attached_to_name: 'a1b2c3d4e5',
+	content_hash: 'd41d8cd98f00b204e9800998ecf8427e',
+	uploaded_to_dropbox: 0,
+	uploaded_to_google_drive: 0,
+	doctype: 'File',
+	...overrides
+})
+
+/* ─── 8c. The operation spies ──────────────────────────────────────────────────────────
+ * Each is created WITH its default implementation rather than having one installed
+ * afterwards. That is deliberate: `mockReset()` restores the implementation passed to
+ * `vi.fn()`, so {@link resetFrappeSDKMock} needs no second copy of these defaults — and two
+ * copies are exactly how a creation default and a reset default drift apart.
+ * ────────────────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Stable spy for the keyed revalidation function returned by `useSWRConfig()` — the SPA's global
+ * cache-invalidation channel, called on BOTH the success and the failure path, which is how a stale
+ * client is corrected after the server refuses a post.
  *
  * This is the SPA's global cache-invalidation channel: the reconcile flow calls it with
  * each affected cache key on BOTH the success and the failure path, which is how a stale
  * client is corrected after the server refuses a post. Assert on it with the exact key
- * strings built in `utils.ts:59,78,94,121,137` — those five families are fixed, and a
+ * strings built in `utils.ts:115,134,150,177,193` — those five families are fixed, and a
  * suite must reuse them rather than reshape them.
+ *
+ * It RESOLVES by default, unlike the imperative operations below, for two reasons: production
+ * chains `.then(...)` straight onto it (`utils.ts:254-255,372-373`), and revalidation is a
+ * consequence of a scenario rather than a scenario a suite would forget to configure.
+ * Resolving to `undefined` is safe because every continuation guards with `res?.message`.
  */
-export const frappeSWRMutate = vi.fn()
+export const frappeSWRMutate = vi.fn<MockedKeyedMutate>(() => Promise.resolve(undefined))
 
 /**
  * Stable spy for the `mutate` returned by the individual query hooks. Kept distinct from
  * {@link frappeSWRMutate} on purpose: a single shared spy would let a local re-fetch
  * satisfy an assertion that global keyed revalidation had occurred.
  */
-export const frappeHookMutate = vi.fn()
+export const frappeHookMutate = vi.fn<MockedHookMutate>(() => Promise.resolve(undefined))
 
 /**
  * Stable spy for the `call` returned by `useFrappePostCall`, shared by every post-call
  * site. This is the seam for both posting scenarios:
  *
- *   • success  — `frappePostCall.mockResolvedValue({ message: makeBankTransaction() })`
+ *   • success  — `frappePostCall.mockResolvedValue(makeReconcileSuccessResponse())`
  *   • refusal  — `frappePostCall.mockRejectedValue(makeAlreadyReconciledError())`
+ *
+ * Unconfigured, it REJECTS. Resolving would run the production success handler on a payload
+ * the test never supplied — logging an action and toasting "Reconciled" with `res.message`
+ * undefined (`utils.ts:313-341`), or navigating away from the importer on a response with no
+ * `docs` (`StatementDetails.tsx:77-86`) — and a suite could then assert a success it never
+ * configured.
  *
  * When a component holds several post calls and a suite must distinguish them, override
  * the hook instead and branch on its `method` argument:
  * `frappeSDKMock.useFrappePostCall.mockImplementation((method) => …)`.
  */
-export const frappePostCall = vi.fn()
-
-/** Stable spy for the `createDoc` returned by `useFrappeCreateDoc`. */
-export const frappeCreateDoc = vi.fn()
-
-/** Stable spy for the `updateDoc` returned by `useFrappeUpdateDoc`. */
-export const frappeUpdateDoc = vi.fn()
-
-/** Stable spy for the `upload` returned by `useFrappeFileUpload`. */
-export const frappeFileUpload = vi.fn()
-
-/** Stable spies for the emitters returned by `useFrappeDocumentEventListener`. */
-const frappeEmitDocOpen = vi.fn()
-const frappeEmitDocClose = vi.fn()
+export const frappePostCall = vi.fn<MockedPostCall>(() =>
+	rejectUnconfigured(
+		'useFrappePostCall(…).call',
+		'frappePostCall.mockResolvedValue(makeReconcileSuccessResponse()) or .mockRejectedValue(makeAlreadyReconciledError())'
+	)
+)
 
 /**
- * Realtime subscriptions recorded by the `useFrappeEventListener` stub, keyed by channel.
+ * Stable spy for the `createDoc` returned by `useFrappeCreateDoc`. Rejects unconfigured:
+ * `pages/BankStatementImporter.tsx:65-73` navigates to `doc.name` straight after it resolves,
+ * so an unconfigured success would route the test to `/statement-importer/undefined`.
+ */
+export const frappeCreateDoc = vi.fn<MockedCreateDoc>(() =>
+	rejectUnconfigured(
+		'useFrappeCreateDoc().createDoc',
+		'frappeCreateDoc.mockResolvedValue(makeBankStatementImportLog())'
+	)
+)
+
+/** Stable spy for the `updateDoc` returned by `useFrappeUpdateDoc`. Rejects unconfigured. */
+export const frappeUpdateDoc = vi.fn<MockedUpdateDoc>(() =>
+	rejectUnconfigured(
+		'useFrappeUpdateDoc().updateDoc',
+		'frappeUpdateDoc.mockResolvedValue(makeSelectedBank())'
+	)
+)
+
+/**
+ * Stable spy for the `upload` returned by `useFrappeFileUpload`. Rejects unconfigured, because
+ * `pages/BankStatementImporter.tsx:59-69` feeds `file.file_url` into the import log it creates
+ * next — an unconfigured success would silently attach `undefined`.
+ */
+export const frappeFileUpload = vi.fn<MockedFileUpload>(() =>
+	rejectUnconfigured(
+		'useFrappeFileUpload().upload',
+		'frappeFileUpload.mockResolvedValue(makeFileUploadResponse())'
+	)
+)
+
+/**
+ * Stable spies for the emitters returned by `useFrappeDocumentEventListener`.
  *
- * The most recent callback for a channel replaces any earlier one, which mirrors the real
- * hook: it re-subscribes whenever the callback identity changes. Keeping only the latest
- * is also what prevents {@link emitFrappeEvent} from invoking a stale closure captured by
- * an earlier render.
+ * No-ops rather than rejections: nothing in `src/` calls either one, so there is no scenario
+ * a suite could forget to configure, and a rejection would only be able to fire from code that
+ * does not exist. Both are still spies so a future caller is observable.
+ */
+const frappeEmitDocOpen = vi.fn<MockedDocEventEmitter>(() => undefined)
+const frappeEmitDocClose = vi.fn<MockedDocEventEmitter>(() => undefined)
+
+/**
+ * Realtime subscriptions recorded by the `useFrappeEventListener` stub, keyed by channel. The most
+ * recent callback for a channel replaces any earlier one, which mirrors the real hook and stops
+ * {@link emitFrappeEvent} invoking a closure captured by an earlier render.
+ *
+ * LIFETIME: the map is module-level, so it outlives any component and React's unmount cleanup leaves
+ * entries behind. {@link resetFrappeSDKMock} empties it from the harness's shared teardown, so no
+ * test inherits a callback closed over a previous test's tree.
  */
 const frappeEventListeners = new Map<string, (eventData: unknown) => void>()
 
-/**
- * Returns the handler currently subscribed to a realtime channel, or `undefined` if
- * nothing is subscribed — useful for asserting that a component did (or did not) subscribe.
- *
- * The channel the statement importer uses is `"bank-rec-statement-import-progress"`
- * (`CSV/StatementDetails.tsx:88`).
- */
 export const getFrappeEventListener = (
 	eventName: string
 ): ((eventData: unknown) => void) | undefined => frappeEventListeners.get(eventName)
 
 /**
- * Delivers a realtime payload to the handler subscribed to `eventName`, simulating a
- * server push — for example import progress:
+ * Delivers a realtime payload to the handler subscribed to `eventName`, simulating a server push.
  *
- *     act(() => { emitFrappeEvent('bank-rec-statement-import-progress', { progress: 40 }) })
+ * The `act()` wrapper is the CALLER's responsibility: the handler sets React state, and wrapping
+ * here would impose act semantics on every caller and hide the update from the test's own batching.
  *
- * The `act()` wrapper is the CALLER's responsibility: the handler sets React state
- * (`StatementDetails.tsx:88-90`), and wrapping here would impose act semantics on every
- * caller and hide the update from the test's own batching.
- *
- * Throws when nothing is subscribed, rather than silently doing nothing. A no-op would let
- * a suite believe it had simulated progress while the component never received it, turning
- * a real wiring bug into a confusing assertion failure somewhere else.
+ * Throws when nothing is subscribed, rather than silently doing nothing — a no-op would let a suite
+ * believe it had simulated progress the component never received.
  */
 export const emitFrappeEvent = (eventName: string, eventData: unknown): void => {
 	const listener = frappeEventListeners.get(eventName)
@@ -990,60 +1191,142 @@ export const emitFrappeEvent = (eventName: string, eventData: unknown): void => 
 }
 
 /**
- * The value carried by the replacement {@link FrappeContextMock}.
+ * The value carried by {@link FrappeContextMock}.
  *
  * A real context with a real default is required because the SPA reads it as
- * `useContext(FrappeContext) as FrappeConfig` and immediately destructures a member — nine
- * files do so across eighteen sites. With the library's own `null` default, or with a
+ * `useContext(FrappeContext) as FrappeConfig` and immediately destructures a member — six
+ * files do so across eleven sites. With the library's own `null` default, or with a
  * non-context stand-in, the first lazily loaded modal body to mount would throw.
  *
  * The members the SPA actually invokes are `call.get` (five sites), `db.setValue` and
  * `db.deleteDoc` (two each) and `file.uploadFile` (three). The remaining members mirror
  * the real `FrappeCall` and `FrappeDB` surfaces so that a component reaching for one finds
  * a spy instead of `undefined`.
+ *
+ * ALL TWELVE reject when unconfigured. Every one is an imperative operation reached from a
+ * user-event handler — `call.get` from a party change (`RecordPaymentModalContent.tsx:141`),
+ * `db.setValue`/`db.deleteDoc` from rule-list actions inside `toast.promise`
+ * (`RuleList.tsx:105,145,167`), `file.uploadFile` from a submit handler — so not one of them
+ * runs during mount, and a rejection can only ever surface once a test drives the flow it
+ * left unconfigured. The three read-shaped members (`db.getDoc`, `db.getDocList`,
+ * `db.getCount`) reject for the same reason as the rest: an unconfigured `[]` or `0` is
+ * indistinguishable from a real answer, so it could satisfy an assertion by accident. Only the
+ * four SWR-backed READ HOOKS keep empty-data defaults, because a component must be able to
+ * mount before a suite has configured anything.
  */
 export const frappeContextValue = {
 	call: {
-		get: vi.fn(() => Promise.resolve({})),
-		post: vi.fn(() => Promise.resolve({})),
-		put: vi.fn(() => Promise.resolve({})),
-		delete: vi.fn(() => Promise.resolve({}))
+		get: vi.fn<MockedContextRequest>((path) =>
+			rejectUnconfigured(
+				`FrappeContext call.get("${path}")`,
+				'frappeContextValue.call.get.mockResolvedValue({ message: … })'
+			)
+		),
+		post: vi.fn<MockedContextRequest>((path) =>
+			rejectUnconfigured(
+				`FrappeContext call.post("${path}")`,
+				'frappeContextValue.call.post.mockResolvedValue({ message: … })'
+			)
+		),
+		put: vi.fn<MockedContextRequest>((path) =>
+			rejectUnconfigured(
+				`FrappeContext call.put("${path}")`,
+				'frappeContextValue.call.put.mockResolvedValue({ message: … })'
+			)
+		),
+		delete: vi.fn<MockedContextRequest>((path) =>
+			rejectUnconfigured(
+				`FrappeContext call.delete("${path}")`,
+				'frappeContextValue.call.delete.mockResolvedValue({ message: … })'
+			)
+		)
 	},
 	db: {
-		getDoc: vi.fn(() => Promise.resolve({})),
-		getDocList: vi.fn(() => Promise.resolve([])),
-		getCount: vi.fn(() => Promise.resolve(0)),
-		createDoc: vi.fn(() => Promise.resolve({})),
-		updateDoc: vi.fn(() => Promise.resolve({})),
-		deleteDoc: vi.fn(() => Promise.resolve({ message: 'ok' })),
-		setValue: vi.fn(() => Promise.resolve({}))
+		getDoc: vi.fn<MockedContextGetDoc>((doctype) =>
+			rejectUnconfigured(
+				`FrappeContext db.getDoc("${doctype}")`,
+				'frappeContextValue.db.getDoc.mockResolvedValue(makeBankTransaction())'
+			)
+		),
+		getDocList: vi.fn<MockedContextGetDocList>((doctype) =>
+			rejectUnconfigured(
+				`FrappeContext db.getDocList("${doctype}")`,
+				'frappeContextValue.db.getDocList.mockResolvedValue([makeBankTransaction()])'
+			)
+		),
+		getCount: vi.fn<MockedContextGetCount>((doctype) =>
+			rejectUnconfigured(
+				`FrappeContext db.getCount("${doctype}")`,
+				'frappeContextValue.db.getCount.mockResolvedValue(0)'
+			)
+		),
+		createDoc: vi.fn<MockedContextCreateDoc>((doctype) =>
+			rejectUnconfigured(
+				`FrappeContext db.createDoc("${doctype}")`,
+				'frappeContextValue.db.createDoc.mockResolvedValue(makeBankStatementImportLog())'
+			)
+		),
+		updateDoc: vi.fn<MockedContextUpdateDoc>((doctype) =>
+			rejectUnconfigured(
+				`FrappeContext db.updateDoc("${doctype}")`,
+				'frappeContextValue.db.updateDoc.mockResolvedValue(makeSelectedBank())'
+			)
+		),
+		deleteDoc: vi.fn<MockedContextDeleteDoc>((doctype) =>
+			rejectUnconfigured(
+				`FrappeContext db.deleteDoc("${doctype}")`,
+				"frappeContextValue.db.deleteDoc.mockResolvedValue({ message: 'ok' })"
+			)
+		),
+		setValue: vi.fn<MockedContextSetValue>((doctype) =>
+			rejectUnconfigured(
+				`FrappeContext db.setValue("${doctype}")`,
+				'frappeContextValue.db.setValue.mockResolvedValue(makeBankTransaction())'
+			)
+		)
 	},
 	file: {
-		uploadFile: vi.fn(() => Promise.resolve({}))
+		uploadFile: vi.fn<MockedContextUploadFile>(() =>
+			rejectUnconfigured(
+				'FrappeContext file.uploadFile',
+				'frappeContextValue.file.uploadFile.mockResolvedValue(makeFileUploadResponse())'
+			)
+		)
 	}
 }
 
 /**
- * The replacement for the SDK's `FrappeContext`. Created once at module scope so every
- * consumer in a suite's module graph shares one context identity — a fresh one per
- * `createFrappeSDKMock()` call would silently hand `useContext` the default value instead
- * of a provided one.
+ * The replacement for the SDK's `FrappeContext`, created once at module scope so every consumer in a
+ * suite's module graph shares one identity; a fresh context per call would hand `useContext` the
+ * default value instead of a provided one.
  */
 export const FrappeContextMock = createContext(frappeContextValue)
 
 /**
- * The replacement for `FrappeProvider`: a pass-through that renders its children and
- * nothing else, so a suite can mount `App`-shaped trees without a server, a socket or a
- * site name.
- *
- * Built with `createElement` around a `Fragment` because this is a `.ts` module and JSX is
- * not available here — and the filename stays `factories.ts` by design.
+ * A pass-through replacement for `FrappeProvider`, so a suite can mount `App`-shaped trees without a
+ * server, a socket or a site name.
  */
 export const FrappeProviderMock = ({ children }: { children?: ReactNode }) =>
 	createElement(Fragment, null, children)
 
 /**
- * The thirteen SDK hooks, as stable `vi.fn()` spies.
+ * The "no data yet" answer every SWR-backed READ hook gives until a suite configures one.
+ *
+ * A fresh object per call, matching the real hooks, which also return a new response object
+ * each render. `data: undefined` with `error: undefined` and `isLoading: false` is the state
+ * that lets any component mount and render its empty state without configuration.
+ */
+const emptyQueryResponse = (): MockedQueryResponse => ({
+	data: undefined,
+	error: undefined,
+	isLoading: false,
+	isValidating: false,
+	mutate: frappeHookMutate
+})
+
+/**
+ * The eleven SDK hooks, as stable spies — each typed by its contract from §8a and created
+ * with its default implementation already in place.
  *
  * Exported so a suite can override any single hook's return without re-mocking the module:
  *
@@ -1051,179 +1334,161 @@ export const FrappeProviderMock = ({ children }: { children?: ReactNode }) =>
  *         method.endsWith('get_bank_transactions')
  *             ? { data: { message: [makeUnreconciledTransaction()] }, error: undefined,
  *                 isLoading: false, isValidating: false, mutate: frappeHookMutate }
- *             : { data: undefined, error: undefined, isLoading: false,
- *                 isValidating: false, mutate: frappeHookMutate })
+ *             : emptyQueryResponse())
  *
  * Branching on the method (rather than a blanket `mockReturnValue`) matters because a
- * single render reaches `useFrappeGetCall` many times with different endpoints.
+ * single render reaches `useFrappeGetCall` many times with different endpoints — and because
+ * the contracts type that `method` argument as a `string`, a branch on a misspelt or
+ * wrongly-typed argument now fails to compile instead of silently never matching.
+ *
+ * The four query hooks answer empty; the imperative hooks answer with their result object,
+ * whose operation spy rejects until configured (§8b). The hooks THEMSELVES never reject:
+ * a hook that threw could not be rendered at all.
  */
 export const frappeSDKMock = {
-	useFrappeGetCall: vi.fn(),
-	useFrappeGetDoc: vi.fn(),
-	useFrappeGetDocList: vi.fn(),
-	useFrappeGetDocCount: vi.fn(),
-	useFrappePostCall: vi.fn(),
-	useFrappeCreateDoc: vi.fn(),
-	useFrappeUpdateDoc: vi.fn(),
-	useFrappeFileUpload: vi.fn(),
-	useFrappeEventListener: vi.fn(),
-	useFrappeDocumentEventListener: vi.fn(),
-	useSWRConfig: vi.fn()
-}
+	useFrappeGetCall: vi.fn<MockedGetCallHook>(() => emptyQueryResponse()),
+	useFrappeGetDoc: vi.fn<MockedGetDocHook>(() => emptyQueryResponse()),
+	useFrappeGetDocList: vi.fn<MockedGetDocListHook>(() => emptyQueryResponse()),
 
-/**
- * Installs the inert default behaviour on every spy above. Run once at module load, and
- * again by {@link resetFrappeSDKMock}, because `mockReset()` discards implementations as
- * well as call history.
- */
-const installFrappeSDKDefaults = (): void => {
-	// Must be a promise: `utils.ts:198` chains `.then()` straight onto it. Resolving to
-	// `undefined` is safe — the continuation guards with `res?.message`.
-	frappeSWRMutate.mockImplementation(() => Promise.resolve(undefined))
-	frappeHookMutate.mockImplementation(() => Promise.resolve(undefined))
-
-	// Resolve to an empty object rather than `undefined`: success handlers dereference the
-	// result (`res.message` at `utils.ts:247`, `response.docs` at `StatementDetails.tsx:71`),
-	// and `{}` yields `undefined` for those keys instead of throwing.
-	frappePostCall.mockImplementation(() => Promise.resolve({}))
-	frappeCreateDoc.mockImplementation(() => Promise.resolve({}))
-	frappeUpdateDoc.mockImplementation(() => Promise.resolve({}))
-	frappeFileUpload.mockImplementation(() => Promise.resolve({}))
-
-	frappeEmitDocOpen.mockImplementation(() => undefined)
-	frappeEmitDocClose.mockImplementation(() => undefined)
-
-	// SWR-backed hooks. `error` is `undefined` rather than `null`, matching SWR's own
-	// "no error yet" value, so `error && <ErrorBanner …>` stays falsy.
-	frappeSDKMock.useFrappeGetCall.mockImplementation(() => ({
+	// The count hook's payload is a `number`, so its empty answer is spelt out rather than
+	// reusing `emptyQueryResponse()`, whose payload type is `unknown`.
+	useFrappeGetDocCount: vi.fn<MockedGetDocCountHook>(() => ({
 		data: undefined,
 		error: undefined,
 		isLoading: false,
 		isValidating: false,
 		mutate: frappeHookMutate
-	}))
-	frappeSDKMock.useFrappeGetDoc.mockImplementation(() => ({
-		data: undefined,
-		error: undefined,
-		isLoading: false,
-		isValidating: false,
-		mutate: frappeHookMutate
-	}))
-	frappeSDKMock.useFrappeGetDocList.mockImplementation(() => ({
-		data: undefined,
-		error: undefined,
-		isLoading: false,
-		isValidating: false,
-		mutate: frappeHookMutate
-	}))
-	frappeSDKMock.useFrappeGetDocCount.mockImplementation(() => ({
-		data: undefined,
-		error: undefined,
-		isLoading: false,
-		isValidating: false,
-		mutate: frappeHookMutate
-	}))
+	})),
 
-	// Imperative hooks. `error: null` here, because the SDK initialises these with `null`
-	// rather than leaving them undefined.
-	frappeSDKMock.useFrappePostCall.mockImplementation(() => ({
+	// `error: null` on the imperative hooks, matching the SDK, which initialises them with
+	// `null` rather than leaving them undefined. Neither create nor update carries a
+	// `result` member — the library does not declare one, so none is invented here.
+	useFrappePostCall: vi.fn<MockedPostCallHook>(() => ({
 		call: frappePostCall,
 		result: null,
 		loading: false,
 		error: null,
 		isCompleted: false,
-		reset: vi.fn()
-	}))
-	frappeSDKMock.useFrappeCreateDoc.mockImplementation(() => ({
+		reset: vi.fn<() => void>(() => undefined)
+	})),
+	useFrappeCreateDoc: vi.fn<MockedCreateDocHook>(() => ({
 		createDoc: frappeCreateDoc,
-		result: null,
 		loading: false,
 		error: null,
 		isCompleted: false,
-		reset: vi.fn()
-	}))
-	frappeSDKMock.useFrappeUpdateDoc.mockImplementation(() => ({
+		reset: vi.fn<() => void>(() => undefined)
+	})),
+	useFrappeUpdateDoc: vi.fn<MockedUpdateDocHook>(() => ({
 		updateDoc: frappeUpdateDoc,
-		result: null,
 		loading: false,
 		error: null,
 		isCompleted: false,
-		reset: vi.fn()
-	}))
+		reset: vi.fn<() => void>(() => undefined)
+	})),
+
 	// `progress` completes the library's shape and is read by the importer's upload UI.
-	frappeSDKMock.useFrappeFileUpload.mockImplementation(() => ({
+	useFrappeFileUpload: vi.fn<MockedFileUploadHook>(() => ({
 		upload: frappeFileUpload,
 		progress: 0,
 		loading: false,
 		error: null,
 		isCompleted: false,
-		reset: vi.fn()
-	}))
+		reset: vi.fn<() => void>(() => undefined)
+	})),
 
-	// Records the subscription so `emitFrappeEvent` can drive it, and returns `void` just
-	// as the real hook does.
-	frappeSDKMock.useFrappeEventListener.mockImplementation(
-		(eventName: string, callback: (eventData: unknown) => void) => {
-			frappeEventListeners.set(eventName, callback)
-		}
-	)
+	// Records the subscription so `emitFrappeEvent` can drive it, and returns `void` just as
+	// the real hook does.
+	useFrappeEventListener: vi.fn<MockedEventListenerHook>((eventName, callback) => {
+		frappeEventListeners.set(eventName, callback)
+	}),
 
-	frappeSDKMock.useFrappeDocumentEventListener.mockImplementation(() => ({
+	useFrappeDocumentEventListener: vi.fn<MockedDocumentEventListenerHook>(() => ({
 		viewers: [],
 		emitDocOpen: frappeEmitDocOpen,
 		emitDocClose: frappeEmitDocClose
-	}))
+	})),
 
-	frappeSDKMock.useSWRConfig.mockImplementation(() => ({ mutate: frappeSWRMutate }))
+	useSWRConfig: vi.fn<MockedUseSWRConfigHook>(() => ({ mutate: frappeSWRMutate }))
 }
 
-installFrappeSDKDefaults()
+/**
+ * The one member {@link resetFrappeSDKMock} needs from a spy, whatever that spy's signature
+ * happens to be. Declared structurally so a heterogeneous collection of `Mock<…>` values can
+ * be swept in a single pass without casting any of them to a common mock type.
+ */
+interface ResettableSpy {
+	mockReset: () => unknown
+}
+
+/** Applies `mockReset()` across a list of spies whose signatures all differ. */
+const resetSpies = (spies: ResettableSpy[]): void => {
+	spies.forEach((spy) => {
+		spy.mockReset()
+	})
+}
 
 /**
- * Clears every recorded call and per-test override, then reinstalls the inert defaults and
- * drops all realtime subscriptions.
+ * Clears every recorded call and per-test override, restoring each spy to the default it was
+ * CREATED with, and drops all realtime subscriptions.
  *
- * `src/test/setup.ts` unmounts trees and clears web storage after each test but does not
- * touch mocks, so call this from a suite's own `afterEach`/`beforeEach` when its tests
- * assert on call counts or install differing per-test implementations.
+ * Note what is deliberately absent: a second copy of the defaults. `mockReset()` restores the
+ * implementation passed to `vi.fn()`, so the inline defaults in §8b/§8c ARE the reset
+ * defaults. Re-installing them here from a separate list is precisely how a creation default
+ * and a reset default drift apart — and how a spy ends up behaving differently in the first
+ * test of a file than in every test after it.
+ *
+ * `src/test/setup.ts` calls this from its shared `afterEach`, immediately after `cleanup()`, so
+ * no suite has to opt in - the realtime-listener stub records callbacks in a module-level map
+ * that React's unmount cleanup does not remove. Because it also discards per-test
+ * implementations, install those from a suite's own `beforeEach` (or inside the test) rather
+ * than at `describe` or module scope, which runs once at collection time.
  */
 export const resetFrappeSDKMock = (): void => {
 	frappeEventListeners.clear()
 
-	frappeSWRMutate.mockReset()
-	frappeHookMutate.mockReset()
-	frappePostCall.mockReset()
-	frappeCreateDoc.mockReset()
-	frappeUpdateDoc.mockReset()
-	frappeFileUpload.mockReset()
-	frappeEmitDocOpen.mockReset()
-	frappeEmitDocClose.mockReset()
+	resetSpies([
+		frappeSWRMutate,
+		frappeHookMutate,
+		frappePostCall,
+		frappeCreateDoc,
+		frappeUpdateDoc,
+		frappeFileUpload,
+		frappeEmitDocOpen,
+		frappeEmitDocClose
+	])
 
-	Object.values(frappeSDKMock).forEach((hook) => hook.mockReset())
-
-	Object.values(frappeContextValue).forEach((group) => {
-		Object.values(group).forEach((member) => member.mockReset())
-	})
-
-	frappeContextValue.call.get.mockImplementation(() => Promise.resolve({}))
-	frappeContextValue.call.post.mockImplementation(() => Promise.resolve({}))
-	frappeContextValue.call.put.mockImplementation(() => Promise.resolve({}))
-	frappeContextValue.call.delete.mockImplementation(() => Promise.resolve({}))
-	frappeContextValue.db.getDoc.mockImplementation(() => Promise.resolve({}))
-	frappeContextValue.db.getDocList.mockImplementation(() => Promise.resolve([]))
-	frappeContextValue.db.getCount.mockImplementation(() => Promise.resolve(0))
-	frappeContextValue.db.createDoc.mockImplementation(() => Promise.resolve({}))
-	frappeContextValue.db.updateDoc.mockImplementation(() => Promise.resolve({}))
-	frappeContextValue.db.deleteDoc.mockImplementation(() => Promise.resolve({ message: 'ok' }))
-	frappeContextValue.db.setValue.mockImplementation(() => Promise.resolve({}))
-	frappeContextValue.file.uploadFile.mockImplementation(() => Promise.resolve({}))
-
-	installFrappeSDKDefaults()
+	// `Object.values` rather than a hand-written list, so a symbol added to either object is
+	// swept automatically instead of being silently left holding a previous test's override.
+	resetSpies(Object.values(frappeSDKMock))
+	resetSpies(Object.values(frappeContextValue.call))
+	resetSpies(Object.values(frappeContextValue.db))
+	resetSpies(Object.values(frappeContextValue.file))
 }
 
 /**
- * THE shared module mock. Returns the object a `vi.mock` factory should hand back in place
- * of `frappe-react-sdk`:
+ * The exact surface {@link createFrappeSDKMock} hands back in place of `frappe-react-sdk`:
+ * the eleven hook spies of {@link frappeSDKMock} plus {@link FrappeContextMock} and
+ * {@link FrappeProviderMock} — the thirteen runtime symbols enumerated in this module's
+ * header, and nothing else.
+ *
+ * Naming that surface is what lets the helper's `overrides` parameter be a typed partial of
+ * it instead of an open generic: the compiler then restricts an override to a symbol some
+ * module under `src/` genuinely imports, and to that symbol's real shape, so no type
+ * assertion is needed anywhere in the signature — `{}` satisfies a fully-optional type on
+ * its own. When the SPA starts importing a further SDK symbol it is added to
+ * {@link frappeSDKMock} above, where every suite picks it up at once; that is the whole
+ * point of there being ONE shared mock, and it is why an override must not be able to
+ * introduce a symbol privately.
+ */
+export type FrappeSDKMockExports = typeof frappeSDKMock & {
+	FrappeContext: typeof FrappeContextMock
+	FrappeProvider: typeof FrappeProviderMock
+}
+
+/**
+ * THE shared module mock — what a `vi.mock` factory hands back in place of `frappe-react-sdk`. It
+ * exposes the eleven hook spies plus `FrappeContext` and `FrappeProvider`, and none of the four
+ * type-only symbols. The spies are the same identities exported above.
  *
  *     vi.mock('frappe-react-sdk', () => createFrappeSDKMock())
  *
@@ -1232,17 +1497,13 @@ export const resetFrappeSDKMock = (): void => {
  * {@link frappeSDKMock}, {@link frappePostCall} and {@link frappeSWRMutate} without
  * re-deriving anything.
  *
- * `overrides` is an escape hatch for the rare suite that needs to replace a symbol
- * outright — or to supply one the SPA has only just started importing — without forking
- * this helper. It is spread LAST, so it always wins.
- *
- * It is generic over the overrides so the returned type REFLECTS them: a suite supplying a
- * symbol this helper does not know about can still reference it without a cast, which a
- * plain `Record<string, unknown>` parameter would have made a `TS2339` under `strict`.
+ * `overrides` is an escape hatch for the rare suite that needs to replace one of those
+ * symbols outright without forking this helper. It is optional, and it is spread LAST, so
+ * it always wins.
  */
-export const createFrappeSDKMock = <T extends Record<string, unknown> = Record<string, never>>(
-	overrides: T = {} as T
-) => ({
+export const createFrappeSDKMock = (
+	overrides: Partial<FrappeSDKMockExports> = {}
+): FrappeSDKMockExports => ({
 	...frappeSDKMock,
 	FrappeContext: FrappeContextMock,
 	FrappeProvider: FrappeProviderMock,
