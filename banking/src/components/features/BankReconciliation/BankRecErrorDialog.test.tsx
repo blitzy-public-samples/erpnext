@@ -68,7 +68,90 @@ const REDRESS_MESSAGE =
 	'<input id="redress-input" type="password" name="password" placeholder="Password" />' +
 	'<a id="redress-external" href="https://evil.example.com/login">Sign in</a>' +
 	'<a id="redress-scheme-relative" href="//evil.example.com/login">Continue</a>' +
+	/*
+	 * The same off-site destination written with BACKSLASHES. WHATWG URL parsing - what every
+	 * browser and jsdom implement - folds `\` into `/` inside an http(s) URL, so all three of
+	 * these resolve to `evil.example.com` exactly as the two forms above do, while carrying
+	 * neither a scheme nor a leading `//` for a purely syntactic test to catch. They are the
+	 * forms a sanitiser that compares characters instead of canonicalising will let through.
+	 */
+	'<a id="redress-backslash" href="\\\\evil.example.com/login">Proceed</a>' +
+	'<a id="redress-slash-backslash" href="/\\evil.example.com/login">Verify</a>' +
+	'<a id="redress-backslash-slash" href="\\/evil.example.com/login">Confirm</a>' +
 	'</div>'
+
+/**
+ * Every off-site destination the sanitiser must refuse, paired with the text that must survive
+ * it. Each is asserted on its own below, so a regression in one form cannot hide behind the
+ * others being caught.
+ *
+ * `HOSTILE_HOST` is the host jsdom's own URL parser resolves each of them to - asserted first,
+ * so the payloads are demonstrably hostile in this environment rather than only in theory. It is
+ * compared as a HOST rather than a full origin because the absolute form names its own scheme
+ * while the four relative forms inherit this document's, and the point being made is the same
+ * for all five: the browser, not the character sequence, decides where a link goes.
+ */
+const HOSTILE_HOST = 'evil.example.com'
+
+type LinkProbe = {
+	readonly label: string
+	readonly href: string
+	readonly text: string
+}
+
+const OFF_SITE_DESTINATIONS: readonly LinkProbe[] = [
+	{ label: 'an absolute URL', href: 'https://evil.example.com/login', text: 'Sign in' },
+	{ label: 'the scheme-relative form', href: '//evil.example.com/login', text: 'Continue' },
+	{ label: 'two leading backslashes', href: '\\\\evil.example.com/login', text: 'Proceed' },
+	{ label: 'a slash followed by a backslash', href: '/\\evil.example.com/login', text: 'Verify' },
+	{ label: 'a backslash followed by a slash', href: '\\/evil.example.com/login', text: 'Confirm' }
+]
+
+/**
+ * Destinations that resolve to THIS origin - so a bare origin comparison would admit every one of
+ * them - and that the renderer refuses anyway. They pin the three refusals it deliberately keeps
+ * stricter than origin equality, each of which stays load-bearing somewhere the origin check alone
+ * is blind: a backslash makes the destination the reader sees and the one the browser computes
+ * disagree, a scheme-relative URL reads as off-site whoever it happens to name, and refusing every
+ * explicit scheme is what keeps `javascript:` out of a document whose own origin is opaque.
+ *
+ * Built from `window.location` rather than hard-coded, so they stay this document's own host and
+ * origin whatever the harness serves the tests from.
+ */
+const STRICTLY_REFUSED_DESTINATIONS: readonly LinkProbe[] = [
+	{
+		label: 'a backslash inside an otherwise local path',
+		href: '/app/bank-transaction\\ACC-BTN-2024-00001',
+		text: 'Backslash path'
+	},
+	{
+		label: 'the scheme-relative form naming this very host',
+		href: `//${window.location.host}/app/bank-transaction/ACC-BTN-2024-00001`,
+		text: 'Scheme-relative to us'
+	},
+	{
+		label: 'an absolute URL naming this very origin',
+		href: `${window.location.origin}/app/bank-transaction/ACC-BTN-2024-00001`,
+		text: 'Absolute to us'
+	}
+]
+
+/**
+ * Destinations that point back at this application and must therefore still render, so the
+ * hardening above cannot quietly turn into "no link ever survives" - which would pass every
+ * hostile case while silently dropping the `/app/bank-transaction/…` links Frappe's own
+ * messages carry.
+ */
+const SAME_ORIGIN_DESTINATIONS: readonly string[] = [
+	'#reconciliation',
+	'/app/bank-transaction/ACC-BTN-2024-00001',
+	'app/bank-transaction/ACC-BTN-2024-00001',
+	'?bank_transaction=ACC-BTN-2024-00001'
+]
+
+/** A single anchor the server wrote, as raw HTML inside a `_server_messages` entry. */
+const anchorMessage = (href: string, text: string): string =>
+	`Next step: <a href="${href}">${text}</a>`
 
 const DIALOG_TITLE = 'Something went wrong'
 const DIALOG_DESCRIPTION =
@@ -569,15 +652,100 @@ describe('BankRecErrorDialog', () => {
 			).toHaveLength(0)
 		})
 
-		it('refuses an off-site destination, including the scheme-relative form', () => {
+		it('refuses an off-site destination in every form, including the backslash ones', () => {
 			renderDialog(makeServerMessagesError(REDRESS_MESSAGE))
 			const dialog = getDialogContent()
 
 			expect(dialog.querySelectorAll('a')).toHaveLength(0)
 			expect(dialog.querySelector('[href*="evil.example.com"]')).toBeNull()
-			// The link TEXT is still shown, so nothing the server wrote is hidden from the user.
-			expect(dialog.textContent).toContain('Sign in')
-			expect(dialog.textContent).toContain('Continue')
+			// Swept by attribute VALUE as well, so the assertion does not depend on which element
+			// a stray destination ends up on: NOTHING rendered from this message may name that host.
+			dialog.querySelectorAll('[href]').forEach((element) => {
+				expect(element.getAttribute('href')).not.toContain(HOSTILE_HOST)
+			})
+
+			// The link TEXT of every refused destination is still shown, so nothing the server
+			// wrote is hidden from the user.
+			OFF_SITE_DESTINATIONS.forEach(({ text }) => {
+				expect(dialog.textContent).toContain(text)
+			})
+		})
+
+		/*
+		 * The characters the server wrote are NOT the destination: the browser canonicalises them
+		 * first. This asserts that canonicalisation directly, through jsdom's own URL parser - the
+		 * same one the production predicate resolves with - so every payload here is demonstrably
+		 * hostile in this environment rather than presumed to be.
+		 */
+		it.each(OFF_SITE_DESTINATIONS)(
+			'resolves $label to another origin, which is what makes it hostile',
+			({ href }) => {
+				const resolved = new URL(href, window.location.href)
+
+				expect(resolved.host).toBe(HOSTILE_HOST)
+				expect(resolved.origin).not.toBe(window.location.origin)
+			}
+		)
+
+		it.each(OFF_SITE_DESTINATIONS)('renders no anchor for $label', ({ href, text }) => {
+			renderDialog(makeServerMessagesError(anchorMessage(href, text)))
+			const dialog = getDialogContent()
+
+			// No anchor at all - not an href-less one, and not one pointing anywhere.
+			expect(dialog.querySelectorAll('a')).toHaveLength(0)
+			// Swept DOCUMENT-wide rather than only within the dialog, so a node escaping into the
+			// portal root or back into the React container is caught just the same.
+			document.querySelectorAll('[href]').forEach((element) => {
+				expect(element.getAttribute('href')).not.toContain(HOSTILE_HOST)
+			})
+			// The sentence is intact, including the destination as literal text.
+			expect(dialog.textContent).toContain(text)
+		})
+
+		/*
+		 * Everything below resolves to THIS origin, so it is refused by a rule that is deliberately
+		 * stricter than "same origin". Pinning those rules is what stops the predicate being
+		 * simplified back down to a single origin comparison, which would reopen the backslash
+		 * bypass wherever the document's own origin is opaque and would start honouring absolute
+		 * URLs this renderer has never honoured.
+		 */
+		it.each(STRICTLY_REFUSED_DESTINATIONS)(
+			'resolves $label to this very origin, which is what makes refusing it a choice',
+			({ href }) => {
+				expect(new URL(href, window.location.href).origin).toBe(window.location.origin)
+			}
+		)
+
+		it.each(STRICTLY_REFUSED_DESTINATIONS)('refuses $label all the same', ({ href, text }) => {
+			renderDialog(makeServerMessagesError(anchorMessage(href, text)))
+			const dialog = getDialogContent()
+
+			expect(dialog.querySelectorAll('a')).toHaveLength(0)
+			expect(dialog.textContent).toContain(text)
+		})
+
+		it.each(['', '   '])('refuses a link whose destination is empty (%j)', (href) => {
+			// Nothing to navigate to, so nothing that should look navigable. The whitespace-only
+			// form is the same case once the control-character strip has run.
+			renderDialog(makeServerMessagesError(anchorMessage(href, 'Empty destination')))
+			const dialog = getDialogContent()
+
+			expect(dialog.querySelectorAll('a')).toHaveLength(0)
+			expect(dialog.textContent).toContain('Empty destination')
+		})
+
+		it('refuses a destination the URL parser cannot resolve at all, without throwing', () => {
+			// `////` is a network path with an empty host: `new URL('////', location.href)` THROWS.
+			// The sanitiser must answer "not ours" rather than let that escape and take down the
+			// very dialog that is reporting the failure.
+			expect(() => new URL('////', window.location.href)).toThrow()
+
+			renderDialog(makeServerMessagesError(anchorMessage('////', 'Retry')))
+			const dialog = getDialogContent()
+
+			expect(dialog).toBeInTheDocument()
+			expect(dialog.querySelectorAll('a')).toHaveLength(0)
+			expect(dialog.textContent).toContain('Retry')
 		})
 
 		it('still renders a same-origin document link the server offered', () => {
@@ -592,6 +760,41 @@ describe('BankRecErrorDialog', () => {
 			expect(anchor).toHaveAttribute('href', '/app/bank-transaction/ACC-BTN-2024-00001')
 			expect(anchor).toHaveAttribute('rel', 'noreferrer noopener')
 			expect(anchor).not.toHaveAttribute('target')
+		})
+
+		it.each(SAME_ORIGIN_DESTINATIONS)('still renders the destination %s, which is ours', (href) => {
+			// The guard against over-correcting: refusing every link would satisfy each hostile
+			// case above while dropping the document links Frappe's own messages carry.
+			expect(new URL(href, window.location.href).origin).toBe(window.location.origin)
+
+			renderDialog(makeServerMessagesError(anchorMessage(href, 'Open the record')))
+			const anchor = getDialogContent().querySelector('a')
+
+			expect(anchor).not.toBeNull()
+			expect(anchor).toHaveAttribute('href', href)
+			expect(anchor).toHaveAttribute('rel', 'noreferrer noopener')
+		})
+
+		/*
+		 * The invariant the whole boundary reduces to, asserted on a payload that mixes both kinds
+		 * so it cannot pass vacuously: whatever survives, EVERY surviving destination resolves to
+		 * this origin - which is exactly the question the browser answers when the link is clicked.
+		 */
+		it('leaves no surviving anchor whose destination resolves off this origin', () => {
+			const message =
+				anchorMessage('/app/bank-transaction/ACC-BTN-2024-00001', 'Open the record') +
+				OFF_SITE_DESTINATIONS.map(({ href, text }) => ` <a href="${href}">${text}</a>`).join('')
+
+			renderDialog(makeServerMessagesError(message))
+			const anchors = Array.from(getDialogContent().querySelectorAll('a'))
+
+			// Non-vacuous: the legitimate link is there to be found.
+			expect(anchors).toHaveLength(1)
+
+			anchors.forEach((anchor) => {
+				const href = anchor.getAttribute('href') ?? ''
+				expect(new URL(href, window.location.href).origin).toBe(window.location.origin)
+			})
 		})
 	})
 

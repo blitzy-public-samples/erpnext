@@ -86,20 +86,54 @@ const URL_SCHEME = /^[a-z][a-z0-9+.-]*:/i
  * A URL is renderable only when it points back at this application: an in-page fragment, a
  * root-relative path such as Frappe's own `/app/bank-transaction/…` document links, or a
  * plain relative path. Anything else - an absolute `https://` URL, a scheme-relative
- * `//host/path`, and every dangerous scheme (`javascript:`, `data:`, `vbscript:`) - is
- * refused, so a server-controlled message cannot present an off-site destination as though
- * the application were offering it.
+ * `//host/path`, the backslash spellings of that same network path (`\\host/path`,
+ * `/\host/path`, `\/host/path`), and every dangerous scheme (`javascript:`, `data:`,
+ * `vbscript:`) - is refused, so a server-controlled message cannot present an off-site
+ * destination as though the application were offering it.
  *
  * Whitespace and control characters are stripped first, because browsers ignore them inside a
- * scheme and `java\nscript:` would otherwise slip through. The scheme-relative form is
- * rejected explicitly: it carries no scheme, so a scheme test alone would pass it while the
- * browser resolves it to an entirely different origin.
+ * scheme and `java\nscript:` would otherwise slip through.
+ *
+ * The surviving value is then CANONICALISED with the platform URL parser and its resolved origin
+ * required to equal this document's own, so the predicate asks the same question the browser will
+ * answer when the link is clicked rather than a lookalike of it. Comparing characters alone is not
+ * enough: WHATWG URL parsing - what every browser and jsdom implement - folds `\` into `/` inside
+ * an http(s) URL, so `\\host/path`, `/\host/path` and `\/host/path` are all network-path
+ * references that resolve to an entirely different origin while carrying neither a scheme nor a
+ * leading `//` for a syntactic test to catch. A reference the parser cannot resolve at all
+ * (`////`, a network path with an empty host, throws) is refused for the same reason, and refused
+ * HERE rather than allowed to throw out of the sanitiser and take down the very error dialog that
+ * is reporting a failure.
+ *
+ * Three syntactic refusals are kept ON TOP of that origin check, because each is STRICTER than it
+ * and each still earns its place:
+ *
+ * - a backslash, because the parser folds it into `/`: the destination the reader sees written out
+ *   and the one the browser navigates to would disagree, which is the whole trick above;
+ * - the scheme-relative `//host/path` form, which origin equality would admit whenever the host
+ *   happens to be ours, yet reads as an off-site link either way;
+ * - any explicit scheme, which is what keeps `javascript:`, `data:` and `vbscript:` out even in a
+ *   document whose own origin is opaque - there `window.location.origin` is the string `"null"`
+ *   and so is the origin of a `javascript:` URL, so the comparison alone would pass them.
+ *
+ * `%5C` is a literal path character to the parser, not a separator, so a percent-encoded
+ * backslash inside a legitimate document name is untouched by any of this.
  */
 const isSameOriginUrl = (value: Properties[string]): boolean => {
     if (typeof value !== 'string') return false
     // eslint-disable-next-line no-control-regex
     const normalized = value.replace(/[\u0000-\u0020]/g, '')
     if (normalized.length === 0) return false
+
+    try {
+        const { origin } = new URL(normalized, window.location.href)
+        if (origin !== window.location.origin) return false
+    } catch {
+        // Unparseable, so it cannot be shown to point back at this application.
+        return false
+    }
+
+    if (normalized.includes('\\')) return false
     if (normalized.startsWith('//')) return false
     return !URL_SCHEME.test(normalized)
 }
