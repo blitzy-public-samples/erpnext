@@ -6,7 +6,11 @@ import tseslint from "typescript-eslint";
 import { defineConfig, globalIgnores } from "eslint/config";
 
 export default defineConfig([
-	globalIgnores(["dist"]),
+	// "coverage" joins "dist" because both are generated, never authored: it is the default
+	// output directory of `yarn test:coverage`, and the HTML report it writes there ships its
+	// own pre-disabled helper scripts. Linting them made the result of `eslint .` depend on
+	// whether a coverage run had happened first.
+	globalIgnores(["dist", "coverage"]),
 	{
 		files: ["**/*.{ts,tsx}"],
 		extends: [js.configs.recommended, tseslint.configs.recommended, reactRefresh.configs.vite],
