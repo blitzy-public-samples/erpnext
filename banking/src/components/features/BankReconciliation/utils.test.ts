@@ -25,6 +25,7 @@ import {
 	frappeSWRMutate,
 	makeAlreadyReconciledError,
 	makeAlternateLinkedPayment,
+	makeBankAccountListRow,
 	makeBankTransaction,
 	makeBlankReferenceLinkedPayment,
 	makeLinkedPayment,
@@ -145,14 +146,12 @@ describe('matchVoucherReference', () => {
 
 	describe('a blank voucher reference is never a match (the invoice branches)', () => {
 		it('does not match an empty reference against a populated transaction', () => {
-			// This is the regression that mattered: `'…'.includes('')` is ALWAYS true, so before
-			// the guard every empty-reference invoice scored a partial match against every
-			// transaction that had any reference at all.
+			// `'…'.includes('')` is ALWAYS true, so without the guard an empty reference agrees with
+			// every transaction that has any reference at all: a blank value is not evidence.
 			expect(matchVoucherReference('', [TEST_REFERENCE_NUMBER, TEST_TRANSACTION_DESCRIPTION])).toBe('none')
 		})
 
 		it('does not match an empty reference against an empty transaction reference', () => {
-			// `'' === ''` reads as an exact match to a naive comparison.
 			expect(matchVoucherReference('', ['', ''])).toBe('none')
 		})
 
@@ -234,14 +233,10 @@ describe('matchVoucherDate', () => {
 	})
 })
 
-/**
- * The grading rules applied to the fixtures that model the real endpoint rows, exercised through
- * the same disjunction `VoucherItem` uses to decide whether to present a voucher as suggested:
- * amount agreement AND (posting date OR reference date OR any reference agreement), at index 0.
- *
- * Amount agreement alone must not be enough. Both blank-reference fixtures deliberately agree on
- * amount and disagree on both dates, which is exactly the combination that used to be promoted to
- * a green, solid-button suggestion by the blank reference alone.
+/*
+ * Graded through the same disjunction `VoucherItem` uses: amount agreement AND (posting date OR
+ * reference date OR reference agreement). Amount agreement alone must not be enough, so both
+ * blank-reference fixtures agree on amount and disagree on both dates.
  */
 describe('suggestion inputs for the shapes the endpoint really returns', () => {
 	const transaction = makeUnreconciledTransaction()
@@ -292,25 +287,18 @@ describe('suggestion inputs for the shapes the endpoint really returns', () => {
 	})
 
 	it('still suggests a blank-reference voucher when a DATE genuinely agrees', () => {
-		// The guard removes a false signal; it must not suppress a true one. Give the same
-		// invoice row a posting date that matches and it is suggested again - on the date's
-		// evidence, not the reference's.
 		const graded = gradeVoucher(makeBlankReferenceLinkedPayment({ posting_date: transaction.date }))
 		expect(graded.reference).toBe('none')
 		expect(graded.wouldBeSuggested).toBe(true)
 	})
 })
 
-/* ────────────────────────────────────────────────────────────────────────────────────
- * The reconcile seam: what the client is allowed to CLAIM, and what it must go and READ.
- *
- * `reconcile_vouchers` is a single server-side operation and its response is the only
- * authority on what was recorded. Everything below tests the two ways a client can betray
- * that: by asserting an outcome it cannot observe, and by continuing to act on a snapshot it
- * has just been told is unreliable.
- * ──────────────────────────────────────────────────────────────────────────────────── */
+/*
+ * `reconcile_vouchers` is a single server-side operation and its response is the only authority on
+ * what was recorded, so the client may neither assert an outcome it cannot observe nor keep acting on
+ * a snapshot it has been told is unreliable.
+ */
 
-/** A promise whose settlement the test controls, so an `await` can be observed mid-flight. */
 const createDeferred = <T,>() => {
 	let resolve!: (value: T) => void
 	const promise = new Promise<T>((resolveFn) => {
@@ -322,7 +310,6 @@ const createDeferred = <T,>() => {
 const FROM_DATE = '2024-01-01'
 const TO_DATE = '2024-01-31'
 
-/** The two EXISTING cache-key families the rejection path revalidates, spelled out in full. */
 const UNRECONCILED_KEY = `bank-reconciliation-unreconciled-transactions-${TEST_BANK_ACCOUNT}-${FROM_DATE}-${TO_DATE}`
 const ALL_TRANSACTIONS_KEY = `bank-reconciliation-bank-transactions-${TEST_BANK_ACCOUNT}-${FROM_DATE}-${TO_DATE}`
 
@@ -346,9 +333,6 @@ const withStore = (store: ReturnType<typeof createStore>) =>
 	({ children }: PropsWithChildren) => createElement(Provider, { store }, children)
 
 describe('useReconcileTransaction — rejection is resolved against the server, not guessed', () => {
-	// The hook logs the raw rejection reason before doing anything else, which is deliberate and
-	// worth keeping. It is silenced here so a passing suite stays readable, and asserted on in
-	// the first test so silencing it cannot hide its removal.
 	let consoleError: ReturnType<typeof vi.spyOn>
 
 	beforeEach(() => {
@@ -416,7 +400,6 @@ describe('useReconcileTransaction — rejection is resolved against the server, 
 
 			expect(error?.httpStatus).toBe(0)
 			expect(error?.httpStatusText).toBe('Network Error')
-			// No server text exists on this path, so none is fabricated into `exception`.
 			expect(error?.exception).toBe('')
 		})
 
@@ -460,8 +443,6 @@ describe('useReconcileTransaction — rejection is resolved against the server, 
 
 		expect(frappeSWRMutate).toHaveBeenCalledWith(UNRECONCILED_KEY)
 		expect(frappeSWRMutate).toHaveBeenCalledWith(ALL_TRANSACTIONS_KEY)
-		// Exactly two revalidations, so the rejection path cannot have reached for a sixth cache-key
-		// family or re-shaped an existing one.
 		const revalidatedKeys = frappeSWRMutate.mock.calls.map(([key]) => key)
 		expect(revalidatedKeys).toEqual([UNRECONCILED_KEY, ALL_TRANSACTIONS_KEY])
 	})
@@ -502,7 +483,6 @@ describe('useReconcileTransaction — rejection is resolved against the server, 
 
 	it('replaces the selection with the server\u2019s refreshed row, status and all', async () => {
 		const store = createSeededStore()
-		// What the client believed when it clicked: still unreconciled, fully unallocated.
 		const staleSnapshot = makeUnreconciledTransaction({ name: 'ACC-BTN-2024-00003' })
 		store.set(SELECTED_TRANSACTION_ATOM, [staleSnapshot])
 		frappePostCall.mockImplementation(() => Promise.reject(makeAlreadyReconciledError(staleSnapshot.name)))
@@ -534,7 +514,6 @@ describe('useReconcileTransaction — rejection is resolved against the server, 
 		store.set(SELECTED_TRANSACTION_ATOM, [transaction])
 		frappePostCall.mockImplementation(() => Promise.reject(makeAlreadyReconciledError(transaction.name)))
 
-		// Both lists come back EMPTY. An empty list is an authoritative answer, not an absent one.
 		frappeSWRMutate.mockImplementation(() => Promise.resolve({ message: [] }))
 
 		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
@@ -584,29 +563,19 @@ describe('useReconcileTransaction — rejection is resolved against the server, 
 	})
 })
 
-/* ────────────────────────────────────────────────────────────────────────────────────
- * The account currency behind the mismatch advisory.
- *
- * `selectedBankAccountAtom` persists through `localStorage`, so the stored bank is a snapshot
- * of a row as it looked whenever it was last chosen. `account_currency` is the field most
- * likely to have moved on without it: it is not stored on `Bank Account` at all, but derived
- * per row by `bank_account.get_list` from the linked `Account.account_currency`.
- * ──────────────────────────────────────────────────────────────────────────────────── */
+/*
+ * `selectedBankAccountAtom` persists through `localStorage`, so the stored bank is a snapshot and its
+ * currency can be stale: `account_currency` is not stored on `Bank Account` at all, but derived per
+ * row by `bank_account.get_list` from the linked `Account.account_currency`.
+ */
 describe('useSelectedBankAccountCurrency', () => {
-	/** One row of `bank_account.get_list`, as the endpoint projects it. */
-	const bankListRow = (accountCurrency?: string) => ({
-		name: TEST_BANK_ACCOUNT,
-		bank: 'Test Bank',
-		account_name: 'Test Bank Current Account',
-		is_credit_card: 0,
-		is_default: 1,
-		company: TEST_COMPANY,
-		account: 'Test Bank - TC',
-		account_type: 'Bank',
-		bank_account_no: '000123456789',
-		last_integration_date: undefined,
-		account_currency: accountCurrency
-	})
+	/**
+	 * One row of `bank_account.get_list`, from the shared builder so the projection is stated in
+	 * exactly one place. `account_currency` is the only member these tests vary, and it is passed
+	 * through verbatim - including `undefined`, which models a GL account with no currency.
+	 */
+	const bankListRow = (accountCurrency?: string) =>
+		makeBankAccountListRow({ account_currency: accountCurrency })
 
 	const renderWithBankList = (rows: unknown[] | undefined, storedCurrency?: string) => {
 		const store = createStore()
@@ -668,22 +637,14 @@ describe('useSelectedBankAccountCurrency', () => {
 		// setting it here is the entire mechanism by which this value is fresh, so it is asserted
 		// rather than left to be re-disabled by a later well-meaning edit.
 		expect(options).not.toHaveProperty('revalidateIfStale')
-		// Focus behaviour still matches the sibling hook, so nothing new fires on tab switches.
 		expect(options?.revalidateOnFocus).toBe(false)
 	})
 })
 
-/**
- * The cache-key builders, asserted against LITERAL strings.
- *
- * These assertions are the whole point of the builders existing. Several of these queries run with
- * `revalidateIfStale` and `revalidateOnFocus` disabled, so an entry refreshes only when a writer
- * mutates its exact key - and a key that is wrong by one character invalidates nothing while
- * reporting no error at all. The same strings are additionally spelled inline by four surfaces
- * outside the module (the action log, the balance panel, the unreconcile modal, the clearance
- * summary), so the format is a compatibility contract, not an implementation detail. Comparing
- * against hand-written literals rather than against the builders themselves is what makes these
- * tests capable of catching a "harmless tidy-up" of the format.
+/*
+ * Asserted against LITERAL strings, because these keys are a cross-module contract: four surfaces
+ * outside this module spell them inline, and several of these queries disable `revalidateIfStale` and
+ * `revalidateOnFocus`, so a key wrong by one character invalidates nothing and reports no error.
  */
 describe('cache-key builders produce the exact existing key strings', () => {
 
@@ -716,23 +677,17 @@ describe('cache-key builders produce the exact existing key strings', () => {
 		expect(statement.startsWith('bank-reconciliation-account-closing-balance-as-per-statement-')).toBe(true)
 	})
 
-	// The two keys the reconcile rejection path revalidates are built by these functions, so the
-	// Phase-4 assertions and these builders must agree on the same two strings.
 	it('agrees with the literal keys the reconcile path revalidates', () => {
 		expect(bankRecUnreconciledTransactionsKey(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)).toBe(UNRECONCILED_KEY)
 		expect(bankRecBankTransactionsKey(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)).toBe(ALL_TRANSACTIONS_KEY)
 	})
 })
 
-/**
- * Import-attempt classification.
- *
- * The rule that matters: `Not Started` is the INITIAL status and `insert_transactions` advances it
- * to `Completed` only as its final act, so it is nonterminal for the entire duration of a
- * synchronous import. Observing it after a lost response therefore distinguishes nothing - the
- * import may have rolled back, may still be running, or may have committed with the response lost.
- * Calling that "failed" is the client inventing a server-side fact, and it is the dangerous
- * direction to be wrong in, because a reviewer told the import failed will re-import.
+/*
+ * `Not Started` is the INITIAL status and `insert_transactions` advances it to `Completed` only as its
+ * final act, so it is nonterminal for the whole duration of a synchronous import. Observing it after
+ * a lost response distinguishes nothing, and calling it "failed" would invent a server-side fact that
+ * sends the reviewer to re-import.
  */
 describe('classifyImportAttempt', () => {
 
@@ -748,7 +703,7 @@ describe('classifyImportAttempt', () => {
 		expect(classifyImportAttempt({ serverRejected: true, confirmedStatus: 'Not Started' })).toBe('failed')
 	})
 
-	// The regression this whole helper exists to prevent.
+	// A nonterminal status observed after a lost response is not evidence of failure.
 	it('does NOT mark failed when a lost response leaves the log at Not Started', () => {
 		expect(classifyImportAttempt({ serverRejected: false, confirmedStatus: 'Not Started' })).toBe('unknown')
 	})
@@ -775,10 +730,10 @@ describe('classifyImportAttempt', () => {
 	})
 })
 
-/**
- * Marker storage, which is bank-scoped because visibility and retention are both per-account: the
- * importer list queries one bank with its own row limit. A flat map counted other accounts' markers
- * against that budget, so switching accounts could silently evict a marker whose row was on screen.
+/*
+ * Markers are bank-scoped because visibility and retention are both per-account: the importer list
+ * queries one bank with its own row limit, so a flat map would count other accounts' markers against
+ * that budget and could evict a marker whose row is on screen.
  */
 describe('import-attempt marker storage is scoped per bank account', () => {
 
@@ -807,7 +762,7 @@ describe('import-attempt marker storage is scoped per bank account', () => {
 		expect(getImportAttempt(markers, OTHER_BANK, 'LOG-2')).toBe('unknown')
 	})
 
-	// The M3 regression: filling one bank to the cap must not disturb another bank's marker.
+	// Filling one bank to the cap must not disturb another bank's marker.
 	it('caps per bank, so a busy account cannot evict another account\'s visible marker', () => {
 		let markers: ImportAttemptMarkers = withImportAttempt({}, OTHER_BANK, 'KEEP-ME', 'failed')
 
@@ -865,14 +820,11 @@ describe('import-attempt marker storage is scoped per bank account', () => {
 	})
 })
 
-/**
- * Post-import cache invalidation.
- *
+/*
  * `useGetUnreconciledTransactions` runs with `revalidateIfStale` and `revalidateOnFocus` both
- * disabled, so remounting it - which is exactly what navigating to the reconciliation page does -
- * does not refetch. If an entry for the imported range is already populated, the page renders that
- * cached copy and the freshly imported transactions are simply absent, with nothing anywhere to
- * explain it. Mutating the exact keys, and awaiting it before navigation, is the whole fix.
+ * disabled, so remounting it - which navigating to the reconciliation page does - never refetches. A
+ * populated entry for the imported range would be rendered in place of the new rows, so the exact
+ * keys are mutated and awaited before navigation.
  */
 describe('useRefreshImportedTransactions', () => {
 
@@ -897,18 +849,11 @@ describe('useRefreshImportedTransactions', () => {
 	})
 
 	/*
-	 * THE DEFECT THIS PINS. SWR's keyed mutate performs a bare `mutate(key)` by invoking the key's
-	 * registered revalidator, and revalidators are registered by MOUNTED subscribers. When an import
-	 * finishes, the reconciliation page is not mounted, so the imported range's keys have none: the
-	 * call resolves, nothing is fetched, and the populated entry survives. The unreconciled query
-	 * then mounts with `revalidateIfStale: false` and skips its mount fetch precisely BECAUSE the
-	 * entry still holds data - so a second import into an already-cached range rendered the
-	 * pre-import list with no error anywhere to explain it.
-	 *
-	 * Passing `undefined` as the DATA argument is a cache WRITE, which applies with or without a
-	 * subscriber and leaves the entry holding nothing; SWR's mount check ("fetch if there is no
-	 * data OR stale revalidation is enabled") then fetches. Every call must therefore carry three
-	 * arguments, and the second must be `undefined` - a two-argument call is the silent no-op.
+	 * A bare `mutate(key)` is served by invoking the key's registered revalidator, and revalidators
+	 * come from MOUNTED subscribers - so with the reconciliation page unmounted it silently fetches
+	 * nothing and the populated entry survives, after which `revalidateIfStale: false` skips the mount
+	 * fetch precisely because the entry still holds data. Passing `undefined` as the DATA argument is a
+	 * cache WRITE, which applies with or without a subscriber, so every call carries three arguments.
 	 */
 	it('EMPTIES each entry rather than merely asking it to revalidate', async () => {
 		const { result } = renderHook(() => useRefreshImportedTransactions())
@@ -976,14 +921,11 @@ describe('useRefreshImportedTransactions', () => {
 	})
 })
 
-/**
- * Waiting for rule evaluation.
- *
+/*
  * `insert_transactions` calls `run_rule_evaluation`, which enqueues the evaluator with
- * `enqueue_after_commit` defaulting to False - so the job can be picked up BEFORE the import's
- * commit, find none of the new rows, and return having stamped nothing. Re-invoking the endpoint
- * from the client is what makes this deterministic: it happens after the import's response has been
- * received, so the import has already committed and the job it enqueues cannot miss the rows.
+ * `enqueue_after_commit` defaulting to False - so the job can be picked up BEFORE the import commits,
+ * find none of the new rows, and stamp nothing. Re-invoking the endpoint from the client happens
+ * after the import's response, so the job it enqueues cannot miss the rows.
  */
 describe('useWaitForRuleEvaluation', () => {
 
@@ -1003,7 +945,6 @@ describe('useWaitForRuleEvaluation', () => {
 		})
 	}
 
-	/** Every call the hook made against the pending-transaction count, in order. */
 	const pendingCountCalls = () =>
 		frappeContextValue.db.getCount.mock.calls.filter(([doctype]) => doctype === 'Bank Transaction')
 
@@ -1014,12 +955,10 @@ describe('useWaitForRuleEvaluation', () => {
 	})
 
 	/*
-	 * THE DEFECT THIS PINS. `_run_rule_evaluation` reads every `Bank Transaction Rule` and returns
-	 * immediately when there are none - WITHOUT stamping anything. So on a site with no rules
-	 * `is_rule_evaluated` stays 0 for every imported transaction however often the evaluator runs,
-	 * the hook's exit condition is unreachable, and the poll exhausts its whole bound EVERY time.
-	 * That delayed every import on a default site by the full bound while the server had already
-	 * finished. Nothing is triggered either: there is no work for the evaluator to do.
+	 * `_run_rule_evaluation` returns immediately when no `Bank Transaction Rule` exists, WITHOUT
+	 * stamping anything, so on a site with no rules `is_rule_evaluated` stays 0 however often the
+	 * evaluator runs and the hook's exit condition is unreachable. Polling is bounded, so an
+	 * unconditional wait would spend that whole bound on work that can never complete.
 	 */
 	it('does not trigger evaluation or poll at all when the site has no rules', async () => {
 		stubCounts({ rules: 0, pending: 2 })
@@ -1031,7 +970,6 @@ describe('useWaitForRuleEvaluation', () => {
 			converged = await result.current(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)
 		})
 
-		// Converged, because no suggested match is still on its way - none will ever arrive.
 		expect(converged).toBe(true)
 		expect(frappePostCall).not.toHaveBeenCalled()
 		expect(pendingCountCalls()).toHaveLength(0)
@@ -1133,7 +1071,6 @@ describe('useWaitForRuleEvaluation', () => {
 		expect(converged).toBe(true)
 	})
 
-	// Not converged is reported honestly rather than retried blindly.
 	it('reports not-converged, without looping, when the pending count cannot be read', async () => {
 		stubCounts({ rules: 1, pending: new Error('no permission') })
 
@@ -1153,8 +1090,6 @@ describe('useWaitForRuleEvaluation', () => {
 	it('gives up after a bounded number of attempts rather than waiting forever', async () => {
 		vi.useFakeTimers()
 		try {
-			// Rules DO exist here, so the wait is legitimate: what is being pinned is that a range
-			// which never drains still ends, rather than that it is skipped.
 			stubCounts({ rules: 2, pending: 3 })
 
 			const { result } = renderHook(() => useWaitForRuleEvaluation())
@@ -1176,17 +1111,11 @@ describe('useWaitForRuleEvaluation', () => {
 })
 
 /*
- * The error-normalisation boundary.
- *
- * Six call sites now depend on this pair: the reconcile rejection handler, the import rejection
- * handler, and four ErrorBanner render sites. Two properties have to hold for all of them, and
- * they pull in opposite directions, which is why they are pinned here rather than assumed:
- *
- *  - a genuine server envelope must survive UNTOUCHED, so the backend's own message, title and
- *    severity are what the user reads; and
- *  - anything that is not an envelope must never reach the user, because for a lost response the
- *    SDK hands back its own `TypeError` about `error.response.data` - an implementation detail
- *    that says nothing about whether the work was recorded.
+ * The error-normalisation boundary has to satisfy two properties that pull in opposite directions: a
+ * genuine server envelope must survive UNTOUCHED, so the backend's own message, title and severity
+ * are what the user reads; and anything that is not an envelope must never reach the user, because
+ * for a lost response the SDK hands back its own `TypeError` about `error.response.data`, which says
+ * nothing about whether the work was recorded.
  */
 describe('error normalisation at the transport boundary', () => {
 
@@ -1254,22 +1183,14 @@ describe('error normalisation at the transport boundary', () => {
 	})
 })
 
-/* ════════════════════════════════════════════════════════════════════════════════════
- * THE TRANSPORT CONTRACT: endpoints, parameters, cache keys and SWR options.
- *
- * Everything below pins the exact strings this module hands the SDK. They are asserted as
- * LITERALS rather than rebuilt from the module's own helpers, because a test that recomputes a
- * value with the same expression it is testing proves only that the expression is
- * deterministic. The five cache-key families in particular are also spelled inline by surfaces
- * OUTSIDE this module - the action log, the balance panel, the unreconcile modal and the
- * clearance summary - and several of these queries switch `revalidateIfStale` and
- * `revalidateOnFocus` off, so an entry refreshes ONLY when a writer mutates that exact key. A
- * key that drifts by one character therefore invalidates nothing: the call succeeds, no error
- * is raised, and a stale list simply stays on screen. That failure is invisible at compile time
- * and at run time alike, which is the whole reason these literals are asserted here.
- * ════════════════════════════════════════════════════════════════════════════════════ */
+/*
+ * The transport contract: endpoints, parameters, cache keys and SWR options, asserted as LITERALS
+ * rather than rebuilt from the module's own helpers - recomputing a value with the expression under
+ * test proves only that the expression is deterministic. The cache keys are a cross-module contract,
+ * and several of these queries switch `revalidateIfStale` and `revalidateOnFocus` off, so a key that
+ * drifts by one character invalidates nothing while raising no error.
+ */
 
-/** The two `bank_reconciliation_tool` reads and the one write, by their dotted RPC paths. */
 const GET_BANK_TRANSACTIONS =
 	'erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.get_bank_transactions'
 const GET_LINKED_PAYMENTS =
@@ -1279,12 +1200,10 @@ const RECONCILE_VOUCHERS =
 const GET_ACCOUNT_BALANCE =
 	'erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.get_account_balance'
 
-/** The two `bank_account` reads. */
 const GET_CLOSING_BALANCE_AS_PER_STATEMENT =
 	'erpnext.accounts.doctype.bank_account.bank_account.get_closing_balance_as_per_statement'
 const BANK_ACCOUNT_GET_LIST = 'erpnext.accounts.doctype.bank_account.bank_account.get_list'
 
-/** The remaining three key families, spelled out exactly as the module builds them. */
 const CLOSING_BALANCE_KEY = `bank-reconciliation-account-closing-balance-${TEST_BANK_ACCOUNT}-${TO_DATE}`
 const CLOSING_BALANCE_AS_PER_STATEMENT_KEY =
 	`bank-reconciliation-account-closing-balance-as-per-statement-${TEST_BANK_ACCOUNT}-${TO_DATE}`
@@ -1297,15 +1216,13 @@ const CLOSING_BALANCE_AS_PER_STATEMENT_KEY =
 const vouchersKeyFor = (transactionName: string, joinedMatchFilters: string): string =>
 	`bank-reconciliation-vouchers-${transactionName}-${FROM_DATE}-${TO_DATE}-${joinedMatchFilters}`
 
-/** The default `bankRecMatchFilters` value, already joined - the suffix nearly every key carries. */
 const DEFAULT_JOINED_MATCH_FILTERS = 'payment_entry,journal_entry'
 
-/**
- * Every cache-key family this module is permitted to build. C4 fixes the set at FIVE: the
- * reconciliation surfaces share these keys with modules that spell them inline, so introducing a
- * sixth would silently orphan those writers. Ordered longest-first, because the
- * as-per-statement family is itself prefixed by the closing-balance family and a shortest-match
- * lookup would attribute it to the wrong one.
+/*
+ * Every cache-key family this module is permitted to build; the set is fixed at five because other
+ * modules spell the same keys inline and a sixth would silently orphan those writers. Ordered
+ * longest-first, because the as-per-statement family is itself prefixed by the closing-balance
+ * family and a shortest-match lookup would attribute it to the wrong one.
  */
 const KEY_FAMILY_PREFIXES = [
 	'bank-reconciliation-account-closing-balance-as-per-statement-',
@@ -1315,19 +1232,9 @@ const KEY_FAMILY_PREFIXES = [
 	'bank-reconciliation-vouchers-'
 ]
 
-/** The family a key belongs to, or `undefined` for a key from outside the permitted set. */
 const familyOf = (key: unknown): string | undefined =>
 	typeof key === 'string' ? KEY_FAMILY_PREFIXES.find((prefix) => key.startsWith(prefix)) : undefined
 
-/**
- * The SWR options members this suite asserts on.
- *
- * Declared locally, and reached from an `unknown` parameter, so the captured argument can be read
- * without widening anything to `any` and without importing the library's own deeply generic
- * configuration type. `onSuccess` is narrowed to the ONE parameter production reads - the fetched
- * payload - because that is the whole of the contract being asserted: the hook forwards
- * `data?.message` to its caller's callback.
- */
 interface AssertedSwrOptions {
 	revalidateOnFocus?: boolean
 	revalidateIfStale?: boolean
@@ -1336,14 +1243,11 @@ interface AssertedSwrOptions {
 
 const swrOptionsOf = (options: unknown): AssertedSwrOptions => (options ?? {}) as AssertedSwrOptions
 
-/**
- * The most recent `useFrappeGetCall` invocation for a dotted endpoint path, as a
- * `[method, params, swrKey, options, type]` tuple.
- *
- * The LAST matching call rather than the first, because a hook may legitimately render more than
- * once and the final render is the state the component settles in. Two hooks share
- * `get_bank_transactions` and two share `get_account_balance`, so each is rendered in isolation
- * below and the endpoint alone identifies the call.
+/*
+ * The LAST matching `useFrappeGetCall` invocation rather than the first, because a hook may
+ * legitimately render more than once and the final render is the state it settles in. Two hooks share
+ * `get_bank_transactions` and two share `get_account_balance`, so each is rendered in isolation below
+ * and the endpoint alone identifies the call.
  */
 const lastGetCallFor = (method: string) => {
 	const calls = frappeSDKMock.useFrappeGetCall.mock.calls.filter(([calledMethod]) => calledMethod === method)
@@ -1351,7 +1255,6 @@ const lastGetCallFor = (method: string) => {
 	return calls[calls.length - 1]
 }
 
-/** The same, for the one document read this module performs. */
 const lastGetDocCall = () => {
 	const calls = frappeSDKMock.useFrappeGetDoc.mock.calls
 	expect(calls.length).toBeGreaterThan(0)
@@ -1372,7 +1275,6 @@ const answerGetCall = (method: string, data: unknown): void => {
 			: { data: undefined, error: undefined, isLoading: false, isValidating: false, mutate: frappeHookMutate })
 }
 
-/** A store with a selected account and date range, but NO company - the empty-selection case. */
 const createStoreWithoutBank = () => {
 	const store = createStore()
 	store.set(selectedBankAccountAtom, null)
@@ -1424,7 +1326,6 @@ describe('the balance queries', () => {
 			company: TEST_COMPANY,
 			till_date: TO_DATE
 		})
-		// Named, because the reconcile success path revalidates this exact string.
 		expect(swrKey).toBe(CLOSING_BALANCE_KEY)
 	})
 
@@ -1460,11 +1361,6 @@ describe('the balance queries', () => {
 
 describe('the transaction-list queries', () => {
 
-	/*
-	 * TC1's client-side half: the reconciliation workbench lists the unreconciled transactions
-	 * for the selected account and range. The endpoint filters `unallocated_amount > 0`
-	 * server-side, so this list is "still reconcilable" by construction.
-	 */
 	it('lists unreconciled transactions for the selected account and range', () => {
 		const store = createSeededStore()
 
@@ -1478,7 +1374,6 @@ describe('the transaction-list queries', () => {
 			from_date: FROM_DATE,
 			to_date: TO_DATE
 		})
-		// No `all_transactions`, so the server's own filter applies.
 		expect(params).not.toHaveProperty('all_transactions')
 		expect(swrKey).toBe(UNRECONCILED_KEY)
 	})
@@ -1553,11 +1448,6 @@ describe('the transaction-list queries', () => {
 
 describe('the candidate-voucher query', () => {
 
-	/*
-	 * TC3's data source: the vouchers a reviewer may link a transaction to instead of the
-	 * suggestion. The key carries the transaction name AND the joined match filters, because
-	 * changing either produces a genuinely different candidate list.
-	 */
 	it('asks for the linked payments of one transaction, keyed by transaction and filters', () => {
 		const store = createSeededStore()
 		const transaction = makeUnreconciledTransaction()
@@ -1616,13 +1506,10 @@ describe('the candidate-voucher query', () => {
 })
 
 
-/**
- * Renders every keyed query this module owns in a single pass, so the FULL set of cache keys the
- * module can produce is observable from one render.
- *
- * A named `use…` function rather than an inline arrow because it genuinely is a custom hook - it
- * calls seven hooks unconditionally - and naming it that way is what keeps the hook rules
- * satisfied and the intent readable.
+/*
+ * Renders every keyed query in one pass, so the full set of cache keys is observable from a single
+ * render. A named `use…` function because it genuinely is a custom hook - it calls seven hooks
+ * unconditionally - which is what keeps the hook rules satisfied.
  */
 const useEveryKeyedQuery = (transaction: UnreconciledTransaction): void => {
 	useGetAccountClosingBalance()
@@ -1636,13 +1523,10 @@ const useEveryKeyedQuery = (transaction: UnreconciledTransaction): void => {
 	useGetBankAccounts()
 }
 
-/**
- * C4: the cache-key surface is CLOSED at five families.
- *
- * This is the assertion that makes the other key assertions binding rather than merely present.
- * Each family above is checked individually, but only a census can catch a SIXTH family being
- * introduced - and a sixth family is the specific failure C4 forbids, because these keys are
- * shared with modules that spell them inline and cannot follow a rename.
+/*
+ * The cache-key surface is CLOSED at five families. Each family is checked individually above, but
+ * only a census can catch a SIXTH being introduced - and these keys are shared with modules that
+ * spell them inline and cannot follow a rename.
  */
 describe('the cache-key surface is closed at five families', () => {
 
@@ -1652,21 +1536,16 @@ describe('the cache-key surface is closed at five families', () => {
 
 		renderHook(() => useEveryKeyedQuery(transaction), { wrapper: withStore(store) })
 
-		// Every non-null, non-undefined key handed to SWR by any query in the module.
 		const declaredKeys = frappeSDKMock.useFrappeGetCall.mock.calls
 			.map(([, , swrKey]) => swrKey)
 			.filter((swrKey): swrKey is string => typeof swrKey === 'string')
 
 		expect(declaredKeys.length).toBeGreaterThan(0)
-		// Nothing outside the permitted set.
 		expect(declaredKeys.filter((key) => familyOf(key) === undefined)).toEqual([])
-		// And all five genuinely in use, so a family cannot be quietly retired either.
 		expect(new Set(declaredKeys.map(familyOf)).size).toBe(KEY_FAMILY_PREFIXES.length)
 		expect(KEY_FAMILY_PREFIXES).toHaveLength(5)
 	})
 
-	// The builders and the inline voucher key must agree with the census above, so a future
-	// caller reaching for a builder lands on the same string a hand-written literal produces.
 	it('agrees with the exported builders on all four builder-backed families', () => {
 		expect(familyOf(bankRecUnreconciledTransactionsKey(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)))
 			.toBe('bank-reconciliation-unreconciled-transactions-')
@@ -1687,13 +1566,11 @@ describe('the cache-key surface is closed at five families', () => {
 	})
 })
 
-/**
- * The bank-account list, and the logo resolution layered on top of it.
- *
- * `account_currency` is the member worth caring about: it is NOT a `Bank Account` field. The
- * endpoint derives it per row by following `Bank Account.account` to `Account.account_currency`
- * after the query, which is exactly why it is optional here and why the currency advisory has to
- * treat its absence as "nothing to compare" rather than as a mismatch.
+/*
+ * `account_currency` is NOT a `Bank Account` field: the endpoint derives it per row by following
+ * `Bank Account.account` to `Account.account_currency` after the query. That is why it is optional
+ * here, and why the currency advisory treats its absence as "nothing to compare" rather than as a
+ * mismatch.
  */
 describe('useGetBankAccounts', () => {
 
@@ -1716,16 +1593,18 @@ describe('useGetBankAccounts', () => {
 
 	it('surfaces the derived account currency the endpoint attaches to each row', () => {
 		const store = createSeededStore()
-		answerGetCall(BANK_ACCOUNT_GET_LIST, { message: [makeSelectedBank()] })
+		answerGetCall(BANK_ACCOUNT_GET_LIST, { message: [makeBankAccountListRow()] })
 
 		const { result } = renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
 
 		expect(result.current.banks).toHaveLength(1)
 		expect(result.current.banks[0].account_currency).toBe(TEST_CURRENCY)
-		// The server's row is spread through rather than reconstructed field by field, so a column
-		// the hook does not know about still reaches the picker.
+		// The server's row is spread through rather than reconstructed field by field, so every
+		// projected column reaches the picker - `account_subtype` included, which is projected by
+		// this endpoint and is exactly the sort of column a hand-narrowed response would drop.
 		expect(result.current.banks[0].name).toBe(TEST_BANK_ACCOUNT)
 		expect(result.current.banks[0].bank).toBe(TEST_BANK)
+		expect(result.current.banks[0].account_subtype).toBe('Current')
 		expect(result.current.isLoading).toBe(false)
 		expect(result.current.error).toBeUndefined()
 	})
@@ -1734,7 +1613,7 @@ describe('useGetBankAccounts', () => {
 	// inventing one here is what would let the advisory claim a mismatch that does not exist.
 	it('leaves the currency undefined when the endpoint could not derive one', () => {
 		const store = createSeededStore()
-		answerGetCall(BANK_ACCOUNT_GET_LIST, { message: [makeSelectedBank({ account_currency: undefined })] })
+		answerGetCall(BANK_ACCOUNT_GET_LIST, { message: [makeBankAccountListRow({ account_currency: undefined })] })
 
 		const { result } = renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
 
@@ -1750,14 +1629,13 @@ describe('useGetBankAccounts', () => {
 	})
 
 	/*
-	 * The `onSuccess` callback is wired into the SWR configuration, so with the transport mocked
-	 * it is invoked here the way SWR would invoke it. The contract being asserted is narrow and
-	 * real: the hook forwards `data?.message` - the ROWS - not the response envelope. A caller
-	 * handed the envelope would have to unwrap it, and the bank picker does not.
+	 * `onSuccess` is wired into the SWR configuration, so with the transport mocked it is invoked the
+	 * way SWR would invoke it. The hook forwards `data?.message` - the ROWS - not the response
+	 * envelope, which the bank picker would otherwise have to unwrap.
 	 */
 	it('forwards the fetched rows to its caller\'s onSuccess callback', () => {
 		const store = createSeededStore()
-		const rows = [makeSelectedBank()]
+		const rows = [makeBankAccountListRow()]
 		const onSuccess = vi.fn<(data?: unknown[]) => void>()
 
 		renderHook(() => useGetBankAccounts(onSuccess), { wrapper: withStore(store) })
@@ -1774,8 +1652,6 @@ describe('useGetBankAccounts', () => {
 		renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
 		const options = swrOptionsOf(lastGetCallFor(BANK_ACCOUNT_GET_LIST)[3])
 
-		// Neither of these may throw: the picker mounts without a callback, and SWR can report a
-		// success whose payload is absent.
 		expect(() => options.onSuccess?.(undefined)).not.toThrow()
 		expect(() => options.onSuccess?.({})).not.toThrow()
 	})
@@ -1784,8 +1660,8 @@ describe('useGetBankAccounts', () => {
 		const store = createSeededStore()
 		answerGetCall(BANK_ACCOUNT_GET_LIST, {
 			message: [
-				makeSelectedBank({ name: 'Current - TC', is_credit_card: 0 }),
-				makeSelectedBank({ name: 'Card - TC', is_credit_card: 1 })
+				makeBankAccountListRow({ name: 'Current - TC', is_credit_card: 0 }),
+				makeBankAccountListRow({ name: 'Card - TC', is_credit_card: 1 })
 			]
 		})
 
@@ -1797,18 +1673,11 @@ describe('useGetBankAccounts', () => {
 	})
 })
 
-/*
- * Logo resolution.
- *
- * `findBankLogoForName` is module-private, so it is exercised through the only surface that uses
- * it. That is the right way round: the guarantee that matters is what the bank picker renders,
- * not the shape of an internal helper.
- */
 describe('bank logo resolution', () => {
 
 	const logoFor = (bankName: string | undefined) => {
 		const store = createSeededStore()
-		answerGetCall(BANK_ACCOUNT_GET_LIST, { message: [makeSelectedBank({ bank: bankName })] })
+		answerGetCall(BANK_ACCOUNT_GET_LIST, { message: [makeBankAccountListRow({ bank: bankName })] })
 		const { result } = renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
 		return result.current.banks[0]
 	}
@@ -1836,7 +1705,6 @@ describe('bank logo resolution', () => {
 
 		expect(bank.logo).toBe('Banco_de_Finanzas.svg')
 		expect(bank.logo).not.toBe('ANZ.png')
-		// The whole entry is adopted, not just its logo, so per-bank presentation travels with it.
 		expect(bank.logoClassName).toBe('h-4.5')
 	})
 
@@ -1865,22 +1733,13 @@ describe('bank logo resolution', () => {
 })
 
 
-/* ════════════════════════════════════════════════════════════════════════════════════
- * TC4 - CONFIRMING A MATCH POSTS THE RECONCILIATION AND THE STATUS FOLLOWS.
- *
- * `reconcile_vouchers` is ONE server-side operation and its response is the sole authority on
- * what was recorded. The client's entire job on the accepted path is therefore: send exactly the
- * payload the endpoint declares, record what came BACK, and invalidate the caches whose contents
- * the server has just changed. Nothing is computed locally and nothing is presumed.
- * ════════════════════════════════════════════════════════════════════════════════════ */
-
-/**
- * The Undo affordance attached to the success toast, read out of the captured options.
- *
- * Narrowed from `unknown` rather than from the toast library's own union, because that union
- * admits an arbitrary node in the same slot and narrowing it in place would need a type
- * assertion at every property access instead of one here.
+/*
+ * `reconcile_vouchers` is ONE server-side operation and its response is the sole authority on what
+ * was recorded, so on the accepted path the client sends exactly the payload the endpoint declares,
+ * records what came BACK, and invalidates the caches the server has just changed. Nothing is
+ * computed locally.
  */
+
 const undoActionOf = (options: unknown): { label?: unknown, onClick: () => void } | undefined =>
 	(options as { action?: { label?: unknown, onClick: () => void } } | undefined)?.action
 
@@ -1889,8 +1748,6 @@ describe('useReconcileTransaction — the accepted post (TC4)', () => {
 	let successToast: ReturnType<typeof vi.spyOn>
 
 	beforeEach(() => {
-		// Spied rather than left live so the assertions can read what the reviewer is shown, and
-		// so the toast library is not asked to render outside a mounted Toaster.
 		successToast = vi.spyOn(toast, 'success').mockReturnValue('toast-id')
 		frappeSWRMutate.mockResolvedValue(undefined)
 	})
@@ -1899,12 +1756,10 @@ describe('useReconcileTransaction — the accepted post (TC4)', () => {
 		successToast.mockRestore()
 	})
 
-	/**
-	 * Drives one accepted confirm and hands back everything the assertions need.
-	 *
+	/*
 	 * The server's answer is a FULL `Bank Transaction` document - the reconcile hook's declared
-	 * response type - so `unallocated_amount: 0` and `status: 'Reconciled'` here are the SERVER
-	 * reporting a completed reconciliation, not the client deciding one happened.
+	 * response type - so `unallocated_amount: 0` and `status: 'Reconciled'` are the SERVER reporting a
+	 * completed reconciliation, not the client deciding one happened.
 	 */
 	const confirmMatch = async (serverAnswer = makeReconcileSuccessResponse()) => {
 		const store = createSeededStore()
@@ -1925,7 +1780,6 @@ describe('useReconcileTransaction — the accepted post (TC4)', () => {
 		await confirmMatch()
 
 		expect(frappeSDKMock.useFrappePostCall).toHaveBeenCalledWith(RECONCILE_VOUCHERS)
-		// Exactly one post for one confirm: no retry, no second attempt, no duplicate posting.
 		expect(frappePostCall).toHaveBeenCalledTimes(1)
 	})
 
@@ -1949,13 +1803,9 @@ describe('useReconcileTransaction — the accepted post (TC4)', () => {
 				amount: voucher.paid_amount
 			}])
 		})
-		// A string, not an array - asserted separately because `toEqual` above would pass just as
-		// happily against a structurally identical array if the production code stopped stringifying.
 		expect(typeof payload.vouchers).toBe('string')
 	})
 
-	// Parsed rather than string-compared, so the assertion holds on the KEY NAMES and VALUES
-	// independently of the order they happen to be serialised in.
 	it('allocates one voucher, by doctype, name and paid amount', async () => {
 		const { voucher } = await confirmMatch()
 
@@ -1970,11 +1820,6 @@ describe('useReconcileTransaction — the accepted post (TC4)', () => {
 		})
 	})
 
-	/*
-	 * TC3's payload half. Overriding the suggestion must change the posted allocation and nothing
-	 * else - a different doctype, a different name, a different amount - because the reviewer is
-	 * linking the transaction to a genuinely different ledger entry.
-	 */
 	it('posts the voucher the reviewer actually chose, not the suggested one', async () => {
 		const store = createSeededStore()
 		const transaction = makeUnreconciledTransaction()
@@ -2014,7 +1859,6 @@ describe('useReconcileTransaction — the accepted post (TC4)', () => {
 		expect(log[0].isBulk).toBe(false)
 		expect(log[0].timestamp).toBeGreaterThan(0)
 		expect(log[0].items).toHaveLength(1)
-		// By identity: the logged transaction IS the server's answer, not a copy of the client's row.
 		expect(log[0].items[0].bankTransaction).toBe(serverAnswer.message)
 		expect(log[0].items[0].bankTransaction.status).toBe('Reconciled')
 		expect(log[0].items[0].bankTransaction.unallocated_amount).toBe(0)
@@ -2036,7 +1880,6 @@ describe('useReconcileTransaction — the accepted post (TC4)', () => {
 
 		expect(revalidatedKeys).toContain(UNRECONCILED_KEY)
 		expect(revalidatedKeys).toContain(CLOSING_BALANCE_KEY)
-		// Still only the permitted families - the success path introduces no key of its own.
 		expect(revalidatedKeys.filter((key) => familyOf(key) === undefined)).toEqual([])
 	})
 
@@ -2061,8 +1904,6 @@ describe('useReconcileTransaction — the accepted post (TC4)', () => {
 		const { store, transaction } = await confirmMatch()
 
 		expect(successToast).toHaveBeenCalledTimes(1)
-		// `_()` falls through to the literal here because the harness leaves the message catalogue
-		// empty, so this is the untranslated source string by construction.
 		expect(successToast.mock.calls[0][0]).toBe('Reconciled')
 
 		const undo = undoActionOf(successToast.mock.calls[0][1])
@@ -2085,8 +1926,6 @@ describe('useReconcileTransaction — the accepted post (TC4)', () => {
 		expect(store.get(bankRecReconcileSettlingAtom)).toBe(false)
 	})
 
-	// The dialog is for refusals. A success must not raise one, or the reviewer is shown an error
-	// about work that was in fact recorded.
 	it('raises no error dialog on the accepted path', async () => {
 		const { store } = await confirmMatch()
 
@@ -2094,14 +1933,11 @@ describe('useReconcileTransaction — the accepted post (TC4)', () => {
 	})
 })
 
-/* ════════════════════════════════════════════════════════════════════════════════════
- * FM1 / C9 - THE SERVER IS THE SOLE SOURCE OF TRUTH, SO NOTHING IS WRITTEN OPTIMISTICALLY.
- *
- * FM1 requires that a refused or lost post leave the transaction unreconciled with its state
- * unchanged, and produce no partial or duplicate posting. The strongest available proof is
- * structural: the client never writes a reconciliation it has not read back, so there is no
+/*
+ * A refused or lost post must leave the transaction unreconciled with its state unchanged. The proof
+ * is structural: the client never writes a reconciliation it has not read back, so there is no
  * optimistic write to roll back and no window in which a rolled-back write is observable.
- * ════════════════════════════════════════════════════════════════════════════════════ */
+ */
 describe('a refused post leaves the client\'s state exactly as it was', () => {
 
 	let consoleError: ReturnType<typeof vi.spyOn>
@@ -2110,8 +1946,6 @@ describe('a refused post leaves the client\'s state exactly as it was', () => {
 	beforeEach(() => {
 		consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
 		errorToast = vi.spyOn(toast, 'error').mockReturnValue('toast-id')
-		// No mounted fetcher answers either key, which is the honest shape of a refusal in
-		// isolation: the refresh is attempted and brings back no authoritative snapshot.
 		frappeSWRMutate.mockResolvedValue(undefined)
 	})
 
@@ -2190,11 +2024,10 @@ describe('a refused post leaves the client\'s state exactly as it was', () => {
 	})
 
 	/*
-	 * The ordinary case, not an edge case: the reviewer works the unreconciled list with the Bank
-	 * Transactions tab unmounted, so only ONE of the two keys has a fetcher behind it and only one
-	 * refresh can return rows. The selection must still be rebuilt from whichever list answered -
-	 * treating a single silent key as "no authoritative snapshot" would strand the reviewer on the
-	 * pre-attempt row even though the server had in fact just answered.
+	 * With the Bank Transactions tab unmounted only ONE of the two keys has a fetcher behind it, so
+	 * only one refresh can return rows. The selection must still be rebuilt from whichever list
+	 * answered; treating a single silent key as "no authoritative snapshot" would strand the reviewer
+	 * on the pre-attempt row.
 	 */
 	it('rebuilds the selection from whichever list answered, when only one of them did', async () => {
 		const store = createSeededStore()
@@ -2202,7 +2035,6 @@ describe('a refused post leaves the client\'s state exactly as it was', () => {
 		const refreshed = makeUnreconciledTransaction({ unallocated_amount: 4000 })
 		store.set(SELECTED_TRANSACTION_ATOM, [transaction])
 		frappePostCall.mockRejectedValue(makeAlreadyReconciledError(transaction.name))
-		// Only the unreconciled key is served; the all-transactions key has no mounted fetcher.
 		frappeSWRMutate.mockImplementation((key) => key === UNRECONCILED_KEY
 			? Promise.resolve({ message: [refreshed] })
 			: Promise.resolve(undefined))
@@ -2250,15 +2082,11 @@ describe('a refused post leaves the client\'s state exactly as it was', () => {
 })
 
 
-/* ════════════════════════════════════════════════════════════════════════════════════
- * POST-RECONCILE HOUSEKEEPING: which caches are invalidated, and which row is reviewed next.
- *
- * This is the hook the accepted post delegates to, tested directly so both of its branches are
- * pinned independently of the post that reaches them. The branch is chosen by the SERVER'S
- * reported `unallocated_amount`, never by the client's own arithmetic - a partial allocation
- * leaves the transaction on the list, a full one takes it off - which is why the branch condition
- * reads a field off the response document.
- * ════════════════════════════════════════════════════════════════════════════════════ */
+/*
+ * Post-reconcile housekeeping: which caches are invalidated, and which row is reviewed next. The
+ * branch is chosen by the SERVER'S reported `unallocated_amount`, never by the client's own
+ * arithmetic - a partial allocation leaves the transaction on the list, a full one takes it off.
+ */
 describe('useRefreshUnreconciledTransactions', () => {
 
 	beforeEach(() => {
@@ -2309,7 +2137,6 @@ describe('useRefreshUnreconciledTransactions', () => {
 		const second = makeRuleMatchedTransaction()
 		store.set(SELECTED_TRANSACTION_ATOM, [first])
 		answerGetCall(GET_BANK_TRANSACTIONS, { message: [first, second] })
-		// The refreshed list the server hands back: `first` is gone, `second` remains.
 		frappeSWRMutate.mockResolvedValue({ message: [second] })
 
 		const { result } = renderHook(() => useRefreshUnreconciledTransactions(), { wrapper: withStore(store) })
@@ -2446,7 +2273,6 @@ describe('useRefreshUnreconciledTransactions', () => {
 			result.current(transaction, makeBankTransaction({ unallocated_amount: 0 }))
 		})
 
-		// The keys still come from the same builders, so they remain within the permitted families.
 		expect(frappeSWRMutate.mock.calls.map(([key]) => key).filter((key) => familyOf(key) === undefined))
 			.toEqual([])
 	})
@@ -2470,12 +2296,6 @@ describe('useRefreshUnreconciledTransactions', () => {
 	})
 })
 
-/* ════════════════════════════════════════════════════════════════════════════════════
- * THE DISPLAY AND FILTERING HELPERS.
- *
- * Small, pure and heavily reused: every transaction row in the workbench reads the amount
- * through one of these, and the list the reviewer sees is whatever `getSearchResults` returns.
- * ════════════════════════════════════════════════════════════════════════════════════ */
 describe('useIsTransactionWithdrawal', () => {
 
 	/*
@@ -2557,18 +2377,13 @@ describe('useGetRuleForTransaction', () => {
 })
 
 /*
- * The search box.
+ * Debounced, and published into a SHARED atom rather than held locally, because the search string is
+ * read by the transaction list, by the next-transaction selection above and by the bulk-action
+ * surfaces; publishing per keystroke would re-filter a virtualised list per character.
  *
- * Debounced, and published into a SHARED atom rather than held locally, because the search string
- * is read by the transaction list, by the next-transaction selection above and by the bulk-action
- * surfaces. Publishing on every keystroke would re-filter a virtualised list per character.
- *
- * NOTE ON THE TWO UNCOVERED LINES IN THIS HOOK. Its "initial value changed" re-sync block is
- * PROVABLY unreachable: the ref is seeded with the same empty-string constant it is compared
- * against and is only ever reassigned that same constant, so the guard is always false. No input
- * to this hook can reach those lines, and reaching them would require editing the module - which
- * the minimal-change clause forbids for a coverage figure. Recorded here rather than worked
- * around, so the next reader knows it was analysed rather than missed.
+ * The hook's "initial value changed" re-sync block is provably unreachable: the ref is seeded with the
+ * same empty-string constant it is compared against and is only ever reassigned that constant, so no
+ * input can reach those two lines.
  */
 describe('useTransactionSearch', () => {
 
@@ -2618,12 +2433,10 @@ describe('useTransactionSearch', () => {
 	})
 })
 
-/**
- * The list the reviewer actually sees.
- *
- * `getSearchResults` composes three independent narrowings - fuzzy search, direction and exact
- * amount - and it is also what decides which row is reviewed next after a reconciliation, so its
- * behaviour is load-bearing twice over.
+/*
+ * `getSearchResults` composes three independent narrowings - fuzzy search, direction and exact amount
+ * - and also decides which row is reviewed next after a reconciliation, so it is load-bearing twice
+ * over.
  */
 describe('getSearchResults', () => {
 
@@ -2643,7 +2456,6 @@ describe('getSearchResults', () => {
 		description: 'Salary credit from Globex',
 		reference_number: 'SAL-9002'
 	})
-	/** A transaction with no value in either column - the row an amount filter cannot match. */
 	const valueless = makeUnreconciledTransaction({
 		name: 'ACC-BTN-2024-09003',
 		withdrawal: 0,
@@ -2655,7 +2467,6 @@ describe('getSearchResults', () => {
 
 	const rows = [debit, credit, valueless]
 
-	/** The very index the workbench builds: the same keys, threshold and scoring. */
 	const searchIndex = () => new Fuse(rows, {
 		keys: ['description', 'reference_number'],
 		threshold: 0.5,
@@ -2672,7 +2483,6 @@ describe('getSearchResults', () => {
 		expect(names(getSearchResults(searchIndex(), '', 'All', 0, rows))).toEqual(names(rows))
 	})
 
-	// Nothing to filter is an empty list, not `undefined`: the caller iterates the result directly.
 	it('returns an empty list when there are no transactions at all', () => {
 		expect(getSearchResults(null, '', 'All', 0, undefined)).toEqual([])
 	})
@@ -2734,10 +2544,8 @@ describe('getSearchResults', () => {
 	})
 })
 
-/**
- * The session action log.
- *
- * It is the reviewer's own audit trail of what they did in this sitting, which is why it is
+/*
+ * The session action log is the reviewer's own audit trail for one sitting, which is why it is
  * prepended (newest first, matching how it is displayed) and capped (an unbounded log in session
  * storage grows for as long as the tab lives).
  */
@@ -2801,8 +2609,6 @@ describe('useUpdateActionLog', () => {
 		expect(log).toHaveLength(100)
 		expect(log[0].timestamp).toBe(101)
 		expect(log[99].timestamp).toBe(2)
-		// The very first action is the one that fell off the end.
 		expect(log.map((action) => action.timestamp)).not.toContain(1)
 	})
 })
-

@@ -128,42 +128,19 @@ const ReconcileProgress = () => {
 
     const { data: unreconciledTransactions, } = useGetUnreconciledTransactions()
 
-    // Whether BOTH reads this figure is derived from have actually answered.
-    //
-    // A MISSING unreconciled list is not an EMPTY one, and the difference matters because the
-    // figure is a subtraction: with no list, `?? 0` reads as "nothing is unreconciled" and every
-    // transaction in range is reported as reconciled. That is not a rounding error, it is a
-    // financial claim the server never made - the list is absent while it is being fetched, which
-    // is exactly when the two reads are least likely to agree. It also produced the literal
-    // "0 / undefined reconciled" on first paint, before the count had answered.
-    //
-    // So nothing is claimed until both reads have resolved; the value slot shows the same skeleton
-    // the four sibling statistics in this row use for a value that is not yet known. Only the
-    // negative direction is left to the clamp below, where the two reads are momentarily out of
-    // step and their difference would otherwise render as "-2 / 2 reconciled".
-    const hasResolvedBothInputs = totalCount !== undefined && unreconciledTransactions?.message !== undefined
+    const reconciledCount = (totalCount ?? 0) - (unreconciledTransactions?.message?.length ?? 0)
 
-    // The two inputs are independently cached - the total is a document count keyed by SWR itself,
-    // the remainder comes from the unreconciled-transactions key - so one can refresh while the
-    // other is still serving its previous value. The unreconciled set is always a subset of the
-    // total, which means their difference is only ever negative while the two are momentarily out
-    // of step; clamping keeps the rendered figure impossible to read as a real number of
-    // reconciliations. No extra revalidation is issued here: the derived value is hardened instead.
-    const reconciledCount = Math.max(0, (totalCount ?? 0) - (unreconciledTransactions?.message?.length ?? 0))
-
-    const progress = Math.min(100, (totalCount ? reconciledCount / totalCount : 0) * 100)
+    const progress = (totalCount ? reconciledCount / totalCount : 0) * 100
 
     return <div className="w-[18%] flex flex-col gap-1 items-end">
         <div className="w-full">
             <Progress
-                value={hasResolvedBothInputs ? progress : 0}
+                value={progress}
                 max={100}
                 size="md"
                 label="Progress"
                 hint
-                hintText={hasResolvedBothInputs
-                    ? `${reconciledCount} / ${totalCount} ${_("reconciled")}`
-                    : <Skeleton className="w-[110px] h-4 rounded-sm" />} />
+                hintText={`${reconciledCount} / ${totalCount} ${_("reconciled")}`} />
         </div>
     </div>
 }
@@ -257,14 +234,6 @@ const ClosingBalanceForm = ({ defaultBalance, date, bankAccount, onClose }: { de
 
 
                 })
-                // A refused save is already shown to the reviewer by the `error` banner below, which
-                // reads this hook's own error state - but without a rejection handler the promise
-                // itself still rejected into nothing, which surfaces as an unhandled rejection rather
-                // than as anything actionable. The terminal handler keeps it from escaping while
-                // leaving the user-facing reporting exactly where it was; nothing is retried and no
-                // state is changed, so a failed save leaves the stored figure untouched and the
-                // editor open for the reviewer to act on what the banner says.
-                .catch((saveError: unknown) => console.error(saveError))
         } else {
             toast.error(_("Closing balance is required."))
         }

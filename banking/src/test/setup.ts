@@ -490,7 +490,7 @@ const boot = {
 	 */
 	desk_theme: 'Light',
 
-	/** Mirrors `index.html:2,32`; surfaced via `getBootFieldData` (`src/lib/frappe.ts:93`). */
+	/** Mirrors `index.html:2,32`; surfaced via `getBootFieldData` (`src/lib/frappe.ts:194`). */
 	layout_direction: 'ltr',
 	lang: 'en',
 
@@ -504,7 +504,7 @@ const boot = {
 	docs: BOOT_DOCUMENTS,
 
 	/**
-	 * Read safely through `getSystemDefault()` (`src/lib/frappe.ts:85-87`) but also read
+	 * Read safely through `getSystemDefault()` (`src/lib/frappe.ts:186-188`) but also read
 	 * WITHOUT optional chaining at `src/lib/currency.ts:8`
 	 * (`frappe.boot.sysdefaults.currency`) and `src/lib/date.ts:21`
 	 * (`…sysdefaults.date_format.toUpperCase()`) — either throws if this object or those

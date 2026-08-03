@@ -1,72 +1,31 @@
-/**
- * The reconciliation workbench, exercised end to end through the surface a reviewer actually
- * touches.
+/*
+ * The reconciliation workbench. Three properties of this environment shape the harness:
  *
- * WHAT IS PROVEN HERE, AND WHY EACH ASSERTION IS SHAPED THE WAY IT IS
- *   TC1  the unreconciled list renders one row per transaction the SERVER returned, with its
- *        amounts resolved through the currency helpers
- *   TC2  a rule-stamped transaction shows the violet rule badge, and an unstamped one does not
- *   TC3  confirming a DIFFERENT, non-suggested voucher sends THAT voucher's identity - the
- *        manual-override path the backend records as `reconciliation_type: "Matched"`
- *   TC4  confirming the suggested voucher posts ONCE, on the reconcile endpoint, and the row's
- *        status is then refreshed FROM THE SERVER rather than invented locally
- *   TC5  an already-reconciled transaction cannot be reconciled again (FM3)
- *   FM5  a currency mismatch shows a NON-BLOCKING advisory: the chip appears AND confirm stays
- *        enabled, because the server - not this badge - decides whether a post is allowed
+ *  1. Both lists render through `@tanstack/react-virtual`, whose range calculation returns nothing
+ *     when the scroll container measures zero - and jsdom performs no layout. The virtualiser reads
+ *     the viewport from `offsetHeight`, so {@link stubLayoutMeasurement} gives that one property a
+ *     non-zero value; without it NO row renders. The spy is restored per test, because the shared
+ *     teardown resets mock functions and not property getters.
  *
- * EVERYTHING IS ASSERTED ON RENDERED OUTPUT OR ON WHAT THE SERVER WAS ASKED TO DO. No test
- * reaches into component state or treats an atom as a proxy for behaviour: the two things that
- * matter about a financial posting surface are what the reviewer is shown and what request is
- * dispatched, and both are observable from outside.
+ *  2. A `TooltipProvider` and a router are required, not decorative: Radix's tooltip root throws
+ *     without a provider ancestor, and the "no transactions" empty state renders a `<Link>`. Jotai
+ *     is per-provider and the harness performs no global store reset, so each test builds its own
+ *     store and seeds `selectedBankAccountAtom` (the component early-returns without it) and
+ *     `bankRecDateAtom` (interpolated into the cache keys, so seeding it keeps key assertions
+ *     independent of the calendar month).
  *
- * NOTHING IN THE APPLICATION WAS CHANGED TO MAKE THIS TESTABLE. No test-only identifier attribute
- * was added, no test-only prop, no export, no extracted sub-component. Queries go through
- * accessible roles and text, or through the `data-slot` / `data-variant` / `data-size` /
- * `data-theme` attributes the design-system primitives already emit - which is also why no
- * assertion here reads a class string, a detail those primitives are free to change.
- *
- * ─── Four mechanical properties of this environment that shape the harness ────────────
- *
- *  1. VIRTUALISATION. Both lists render through `@tanstack/react-virtual`, whose range
- *     calculation returns NOTHING when the scroll container measures zero - and jsdom performs
- *     no layout, so every box is zero-sized. `ResizeObserver` is stubbed by the shared harness
- *     but deliberately never fires, for the same reason. The virtualiser reads the viewport
- *     from `offsetHeight`, so {@link stubLayoutMeasurement} gives that one property a non-zero
- *     value; without it NO ROW RENDERS AT ALL, which is verified by the empty-state test below
- *     continuing to pass while every row assertion would fail. The spy is restored per test,
- *     because the shared teardown resets mock functions and not property getters.
- *
- *  2. PROVIDERS. `App.tsx` wraps the whole router in one `TooltipProvider`, and Radix's tooltip
- *     root THROWS without a provider ancestor - so a suite that mounts this component directly
- *     has to supply one. A router is needed too: the "no transactions" empty state renders a
- *     `<Link>`.
- *
- *  3. JOTAI IS PER-PROVIDER, and the shared harness performs no global store reset, so every
- *     test builds its own store. Three atoms are load-bearing: without `selectedBankAccountAtom`
- *     the component early-returns its empty state; `bankRecDateAtom` is interpolated into the
- *     cache keys, so seeding it explicitly is what makes the key assertions exact rather than
- *     dependent on the calendar month the suite happens to run in; and the
- *     `bankRecSelectedTransactionAtom` family entry is the transaction under review that the
- *     confirm affordance and its guard both read.
- *
- *  4. `_()` FALLS THROUGH to the literal source string, because the harness leaves the
- *     translation map empty - so `getByRole('button', { name: 'Reconcile' })` reads plainly.
- *
- * ─── One attribute subtlety worth stating, because it is invisible in the source ──────
- * The currency advisory chip is a `Badge` inside a `TooltipTrigger asChild`. Radix's `Slot`
- * spreads the trigger's own props AFTER the Badge's, so the Badge's `data-slot="badge"` is
- * OVERWRITTEN with `data-slot="tooltip-trigger"` while `data-variant`, `data-size` and
- * `data-theme` survive. A query for `[data-slot="badge"][data-theme="orange"]` therefore matches
- * nothing at all. {@link currencyAdvisoryChip} selects on the surviving variant triple instead,
- * scoped to one row - which is also what keeps it from colliding with the voucher panel's own
- * orange "Partial Match" badge.
+ *  3. The currency advisory chip is a `Badge` inside a `TooltipTrigger asChild`, and Radix's `Slot`
+ *     spreads the trigger's props AFTER the Badge's - so `data-slot="badge"` is OVERWRITTEN with
+ *     `data-slot="tooltip-trigger"` while `data-variant`, `data-size` and `data-theme` survive.
+ *     {@link currencyAdvisoryChip} therefore selects on the surviving variant triple, scoped to one
+ *     row so it cannot collide with the voucher panel's own orange "Partial Match" badge.
  */
 
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Provider, createStore } from 'jotai'
 import { MemoryRouter } from 'react-router'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
 	TEST_ALTERNATE_CURRENCY,
 	TEST_BANK_ACCOUNT,
@@ -82,6 +41,8 @@ import {
 	frappeSWRMutate,
 	makeAlreadyReconciledError,
 	makeAlternateLinkedPayment,
+	makeBankAccountListRow,
+	makeBankTransactionRule,
 	makeBlankReferenceLinkedPayment,
 	makeCurrencyMismatchTransaction,
 	makeLinkedPayment,
@@ -94,12 +55,33 @@ import {
 	makeUnreconciledTransaction
 } from '@/test/factories'
 
-// The component's module graph loads the SDK at module scope, so the package is replaced
-// wholesale before it can resolve. It MUST be the shared helper: that mock is the only one
-// carrying `useSWRConfig`, which `useRefreshUnreconciledTransactions` destructures and
-// `useReconcileTransaction` calls - a hand-rolled mock missing it fails every confirm test at
-// render time. The line stays literally here so Vitest's transform hoists it above the imports.
+// Use the shared SDK mock because `useReconcileTransaction` requires `useSWRConfig`; `vi.mock` is
+// hoisted above the imports.
 vi.mock('frappe-react-sdk', () => createFrappeSDKMock())
+
+/**
+ * Toast spies, created with `vi.hoisted` so the `vi.mock` factory below - which the transform lifts
+ * above every import - can close over them.
+ *
+ * ⚠️ MOCKED FOR ISOLATION, NOT FOR CONVENIENCE. `sonner` keeps every emitted notification in a
+ * MODULE-LEVEL store, and nothing in this environment ever dismisses one: the toaster itself is
+ * mounted in `App.tsx`, which this suite never renders, so a real `toast.success` leaves an entry
+ * behind that outlives the test that raised it and is carried into every test that follows in this
+ * file. Replacing the module keeps each test's notifications its own, and it also makes them
+ * ASSERTABLE - which is the second half of the point: a mock that merely silenced the calls would be
+ * weaker than the code it replaced, so the confirm-success and confirm-rejection paths below assert
+ * exactly which notification was raised and that the other was not.
+ *
+ * Only `success` and `error` are stubbed, because they are the only members this component's module
+ * graph reaches: `utils.ts:688,710` on the reconcile paths, and the three lazily-imported modal
+ * bodies use the same two. `toast.promise` lives in `BankBalance.tsx`, which is not in this graph.
+ */
+const { toastSuccess, toastError } = vi.hoisted(() => ({
+	toastSuccess: vi.fn<(message: string, options?: unknown) => void>(),
+	toastError: vi.fn<(message: string, options?: unknown) => void>()
+}))
+
+vi.mock('sonner', () => ({ toast: { success: toastSuccess, error: toastError } }))
 
 import { TooltipProvider } from '@/components/ui/tooltip'
 import MatchAndReconcile from './MatchAndReconcile'
@@ -113,16 +95,8 @@ import {
 } from './bankRecAtoms'
 import type { LinkedPayment, UnreconciledTransaction, useGetRuleForTransaction } from './utils'
 
-/* ═══ 1. Contracts derived from the code under test ═══════════════════════════════════
- * Every shape below is READ OFF the application rather than restated, so a signature that
- * moves breaks this file at compile time instead of letting an assertion quietly describe a
- * contract that no longer exists.
- * ══════════════════════════════════════════════════════════════════════════════════ */
-
-/** The five members the SPA destructures from an SWR-backed hook, as the shared mock declares them. */
 type QueryResponse = ReturnType<typeof frappeSDKMock.useFrappeGetCall>
 
-/** The error envelope those hooks surface. */
 type QueryError = NonNullable<QueryResponse['error']>
 
 /**
@@ -132,8 +106,6 @@ type QueryError = NonNullable<QueryResponse['error']>
  */
 type RuleDocument = NonNullable<ReturnType<typeof useGetRuleForTransaction>['data']>
 
-/* ═══ 2. Identity constants ═══════════════════════════════════════════════════════════ */
-
 /**
  * The date range every test seeds. Fixed rather than derived from "this month", because both
  * revalidated cache keys interpolate it and the assertions below spell those keys out in full.
@@ -141,7 +113,6 @@ type RuleDocument = NonNullable<ReturnType<typeof useGetRuleForTransaction>['dat
 const FROM_DATE = '2024-01-01'
 const TO_DATE = '2024-01-31'
 
-/** The two cache keys the successful confirm path revalidates, composed exactly as `utils.ts` builds them. */
 const UNRECONCILED_KEY = `bank-reconciliation-unreconciled-transactions-${TEST_BANK_ACCOUNT}-${FROM_DATE}-${TO_DATE}`
 const CLOSING_BALANCE_KEY = `bank-reconciliation-account-closing-balance-${TEST_BANK_ACCOUNT}-${TO_DATE}`
 
@@ -152,13 +123,11 @@ const CLOSING_BALANCE_KEY = `bank-reconciliation-account-closing-balance-${TEST_
  */
 const BANK_TRANSACTIONS_KEY = `bank-reconciliation-bank-transactions-${TEST_BANK_ACCOUNT}-${FROM_DATE}-${TO_DATE}`
 
-/** The default match filters, which the voucher cache key joins with a comma. */
 const DEFAULT_MATCH_FILTERS = 'payment_entry,journal_entry'
 
 const vouchersKeyFor = (transactionName: string): string =>
 	`bank-reconciliation-vouchers-${transactionName}-${FROM_DATE}-${TO_DATE}-${DEFAULT_MATCH_FILTERS}`
 
-/** The ONE endpoint a confirm is allowed to post to. */
 const RECONCILE_ENDPOINT =
 	'erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.reconcile_vouchers'
 
@@ -169,10 +138,8 @@ const RECONCILE_ENDPOINT =
  */
 const CONTENT_HEIGHT = 800
 
-/** The account the whole suite reconciles against; its `account_currency` is {@link TEST_CURRENCY}. */
 const BANK = makeSelectedBank()
 
-/** The atom-family entry keyed by that account, holding the transaction(s) under review. */
 const SELECTED_TRANSACTION_ATOM = bankRecSelectedTransactionAtom(BANK.name)
 
 /**
@@ -201,36 +168,37 @@ const WITHDRAWAL_ROW = makeUnreconciledTransaction({
 /**
  * A rule as the server stores it, used to drive the recommended-action card that a rule-matched
  * transaction opens. `classify_as: 'Payment Entry'` selects the green branch of that card.
+ *
+ * Built from the SHARED builder rather than assembled here, because the DocType marks
+ * `description_rules` REQUIRED: a rule with no condition rows is a document the server cannot
+ * produce, so a locally-written fixture with an empty table would be asserting against an
+ * impossible response. The builder supplies one valid `Contains` row; only the members these tests
+ * actually read are overridden.
  */
 const MATCHED_RULE: RuleDocument = {
-	name: TEST_TRANSACTION_RULE,
-	creation: '2024-01-02 09:00:00.000000',
-	modified: '2024-01-02 09:00:00.000000',
-	owner: 'Administrator',
-	modified_by: 'Administrator',
-	docstatus: 0,
+	...makeBankTransactionRule({
+		name: TEST_TRANSACTION_RULE,
+		rule_name: 'ACME inbound NEFT credits',
+		rule_description: 'Credits whose description names ACME Traders',
+		transaction_type: 'Deposit',
+		priority: 4,
+		// The constant rather than `BANK.company`: `company` is optional on a bank account and
+		// required on a rule, so reading it off the account would not type-check - and the harness
+		// seeds exactly this company, so the two cannot disagree.
+		company: TEST_COMPANY,
+		classify_as: 'Payment Entry',
+		// Deliberately NOT the bank account's own GL account: the card renders this string, and a
+		// value shared with the account cell would make `getByText` ambiguous.
+		account: 'Debtors - TC',
+		party_type: 'Customer',
+		party: 'ACME Traders'
+	}),
 	// Required by the SDK's document wrapper, which is what deriving this type from the hook
 	// rather than from the generated declaration surfaces: `FrappeDoc` makes `idx` mandatory even
 	// though the DocType declares it optional.
-	idx: 0,
-	rule_name: 'ACME inbound NEFT credits',
-	rule_description: 'Credits whose description names ACME Traders',
-	transaction_type: 'Deposit',
-	priority: 4,
-	// The constant rather than `BANK.company`: `company` is optional on a bank account and
-	// required on a rule, so reading it off the account would not type-check - and the harness
-	// seeds exactly this company, so the two cannot disagree.
-	company: TEST_COMPANY,
-	description_rules: [],
-	classify_as: 'Payment Entry',
-	account: 'Debtors - TC',
-	party_type: 'Customer',
-	party: 'ACME Traders'
+	idx: 0
 }
 
-/* ═══ 3. The harness ══════════════════════════════════════════════════════════════════ */
-
-/** The "answered" state of an SWR-backed hook. */
 const answered = (data: unknown): QueryResponse => ({
 	data,
 	error: undefined,
@@ -239,7 +207,6 @@ const answered = (data: unknown): QueryResponse => ({
 	mutate: frappeHookMutate
 })
 
-/** The "still fetching" state, which drives the skeleton branches. */
 const fetching = (): QueryResponse => ({
 	data: undefined,
 	error: undefined,
@@ -248,7 +215,6 @@ const fetching = (): QueryResponse => ({
 	mutate: frappeHookMutate
 })
 
-/** The "refused" state, which drives the inline error banners. */
 const refused = (error: QueryError): QueryResponse => ({
 	data: undefined,
 	error,
@@ -273,11 +239,8 @@ const stubLayoutMeasurement = () =>
 	vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(CONTENT_HEIGHT)
 
 interface WorkbenchOptions {
-	/** Rows `get_bank_transactions` answers with. */
 	transactions?: UnreconciledTransaction[]
-	/** Rows `get_linked_payments` answers with, in the order the endpoint returns them. */
 	vouchers?: LinkedPayment[]
-	/** The transaction(s) under review, seeded into the atom family for {@link BANK}. */
 	selected?: UnreconciledTransaction[]
 	/**
 	 * The account currency the SERVER'S CURRENT bank-account list reports.
@@ -289,36 +252,21 @@ interface WorkbenchOptions {
 	 * omitted option has to remain distinguishable from one deliberately left unresolved.
 	 */
 	accountCurrency?: string | null
-	/** Omits the bank account entirely, which is what drives the component's own empty state. */
 	withoutBank?: boolean
-	/** Puts the transaction list into its loading or refused state instead of answering. */
 	transactionsState?: 'loading' | 'error'
-	/** Puts the voucher list into its loading or refused state instead of answering. */
 	vouchersState?: 'loading' | 'error'
-	/** The envelope the refused states surface. */
 	listError?: QueryError
-	/** The rule document `RuleAction` fetches for a rule-stamped transaction. */
 	rule?: RuleDocument
-	/** How many unreconciled transactions exist BEFORE the seeded range. */
 	olderCount?: number
-	/** Raises the settle window, the state a rejected confirm leaves the affordance in. */
 	settling?: boolean
-	/** Seeds the shared error dialog, so its mount point can be observed. */
 	dialogError?: QueryError
-	/** Seeds the amount filter directly, which is deterministic where typing into it is not. */
 	amountFilter?: number
 }
 
-/**
- * Mounts the workbench with its own jotai store, a tooltip provider and a router, and routes
- * every endpoint the component reaches.
- *
- * Endpoints are matched on the METHOD argument rather than blanket-stubbed, because a single
- * render calls `useFrappeGetCall` several times with different methods - the transaction list,
- * the candidate vouchers, the bank-account list behind the currency comparison, the
- * older-transaction count and the match-filter document types. Routing keeps the REAL hook layer
- * in the call path, so the cache keys, the search grading and the reconcile payload are all
- * produced by production code rather than by the test.
+/*
+ * Routes responses by endpoint so the real hooks generate the cache keys, the search grading and the
+ * reconcile payload. A single render calls `useFrappeGetCall` with several different methods, so a
+ * blanket stub cannot serve them.
  */
 const renderWorkbench = (options: WorkbenchOptions = {}) => {
 	const {
@@ -370,16 +318,22 @@ const renderWorkbench = (options: WorkbenchOptions = {}) => {
 
 		// Shared with the bank picker, and the source of the FRESH account currency the mismatch
 		// advisory compares against.
+		//
+		// Answered with the ENDPOINT-row builder rather than by spreading `BANK`: that constant is
+		// the persisted selection, whose shape differs from this endpoint's projection in both
+		// directions (it carries `integration_id`, which is not projected, and lacks
+		// `account_subtype`, which is). The row's `name` still matches the selection, because that
+		// is what the currency lookup keys on.
 		if (method.endsWith('bank_account.bank_account.get_list')) {
-			return answered({ message: [{ ...BANK, account_currency: accountCurrency ?? undefined }] })
+			return answered({
+				message: [makeBankAccountListRow({ name: BANK.name, account_currency: accountCurrency ?? undefined })]
+			})
 		}
 
 		if (method.endsWith('bank_reconciliation_tool.get_older_unreconciled_transactions')) {
 			return answered({ message: { count: olderCount, oldest_date: '2023-12-01' } })
 		}
 
-		// Anything else the tree reaches for - the match-filter document types among them - gets
-		// an honest "nothing yet" rather than a fabricated answer.
 		return answered(undefined)
 	})
 
@@ -398,16 +352,6 @@ const renderWorkbench = (options: WorkbenchOptions = {}) => {
 	return { ...utils, store }
 }
 
-/* ═══ 4. Queries ══════════════════════════════════════════════════════════════════════ */
-
-/**
- * The row element for one transaction.
- *
- * Located from the description text upwards to the enclosing `role="button"`, which is the row
- * itself - the only interactive element in it. Resolving upwards rather than filtering every
- * button by text content keeps the lookup unambiguous when the same description also appears in
- * the multi-selection table.
- */
 const transactionRow = (transaction: UnreconciledTransaction): HTMLElement => {
 	const label = transaction.description ?? transaction.name
 	const row = screen
@@ -433,13 +377,24 @@ const transactionRow = (transaction: UnreconciledTransaction): HTMLElement => {
 const currencyAdvisoryChip = (row: HTMLElement): HTMLElement | null =>
 	row.querySelector<HTMLElement>('[data-theme="orange"][data-variant="subtle"][data-size="sm"]')
 
-/** The violet rule badge inside one row, or `null` when the transaction carries no rule stamp. */
 const ruleBadge = (row: HTMLElement): HTMLElement | null =>
 	row.querySelector<HTMLElement>('[data-slot="badge"][data-theme="violet"]')
 
-/** The voucher card enclosing a named voucher, so a confirm control can be scoped to ONE candidate. */
+/**
+ * The voucher card enclosing a named voucher, so a confirm control can be scoped to ONE candidate.
+ *
+ * Resolved upwards from the voucher's own link to the enclosing VIRTUAL ROW - the element the
+ * virtualiser stamps with `data-index` and hands to its `measureElement` ref
+ * (`MatchAndReconcile.tsx:113-117`). That attribute is functional rather than presentational, so it
+ * is exactly as stable as the list itself; scoping on a utility class instead would couple these
+ * posting tests to Tailwind, and a harmless restyle of the card's wrapper would fail TC3/TC4 while
+ * the behaviour they assert was still correct.
+ *
+ * The link is unique to the voucher panel, so there is no risk of resolving to a transaction row's
+ * virtual wrapper even though both lists are built from the same component.
+ */
 const voucherCard = (voucher: LinkedPayment): HTMLElement => {
-	const card = screen.getByRole('link', { name: voucher.name }).closest<HTMLElement>('div.relative')
+	const card = screen.getByRole('link', { name: voucher.name }).closest<HTMLElement>('[data-index]')
 
 	if (!card) {
 		throw new Error(`No voucher card is rendered for "${voucher.name}"`)
@@ -448,11 +403,9 @@ const voucherCard = (voucher: LinkedPayment): HTMLElement => {
 	return card
 }
 
-/** The confirm control of one candidate voucher. */
 const confirmControlFor = (voucher: LinkedPayment): HTMLElement =>
 	within(voucherCard(voucher)).getByRole('button', { name: 'Reconcile' })
 
-/** The parameter bag of the single reconcile post, parsed back out of the spy. */
 const capturedReconcileRequest = (): { bank_transaction_name: unknown, vouchers: unknown } => {
 	const [payload] = frappePostCall.mock.calls[0] ?? []
 
@@ -463,47 +416,124 @@ const capturedReconcileRequest = (): { bank_transaction_name: unknown, vouchers:
 	return payload as { bank_transaction_name: unknown, vouchers: unknown }
 }
 
-/** Every method a `useFrappePostCall` was instantiated with during the render, de-duplicated. */
 const postEndpointsUsed = (): string[] => [
 	...new Set(frappeSDKMock.useFrappePostCall.mock.calls.map(([method]) => method))
 ]
 
+/** Every dialog surface currently mounted, in document order, whether or not Radix has hidden it. */
+const dialogSurfaces = (): HTMLElement[] =>
+	Array.from(
+		document.querySelectorAll<HTMLElement>('[data-slot="dialog-content"], [data-slot="alert-dialog-content"]')
+	)
+
+/** The text of every mounted dialog's title, again regardless of whether Radix has hidden it. */
+const dialogTitles = (): (string | null)[] =>
+	Array.from(
+		document.querySelectorAll<HTMLElement>('[data-slot="dialog-title"], [data-slot="alert-dialog-title"]')
+	).map((node) => node.textContent)
+
 /**
- * Asserts that the dialog now open is the expected one, then DISMISSES it and waits for it to
- * leave the document.
+ * Asserts that a dialog titled `title` is open, then closes EVERY open dialog and waits for the
+ * document to be clear of them.
  *
- * Closing is not tidiness. A Radix dialog manages document-level state while open - it hides the
- * rest of the tree from assistive technology and takes over pointer handling - and a tree
- * unmounted with one still open can leave that state behind for whatever renders next. Verified
- * the hard way: a test that pressed a keyboard shortcut immediately after a preceding test had
- * unmounted mid-dialog never saw its own dialog appear. Every dialog opened here is therefore
- * closed before the test ends.
+ * ⚠️ WHY THE TITLE IS MATCHED ACROSS ALL DIALOGS RATHER THAN ON `getByRole('dialog')`.
+ * Opening the record-payment body auto-opens a NESTED dialog: `RecordPaymentModalContent.tsx:295`
+ * raises the "Select Invoices" dialog from an effect whenever the rule it was opened from carries a
+ * party, a party type and an account - which the rule fixture here does. Radix marks everything
+ * beneath a nested modal `aria-hidden`, and Testing Library's role queries skip hidden subtrees, so
+ * `getByRole('dialog')` legitimately resolves to the CHILD dialog and never sees the parent's title.
+ * Whether that happens depends only on how quickly the lazily-imported body arrives - i.e. on
+ * whether an earlier test in this file already warmed the module cache - which made the previous
+ * single-dialog query pass in declaration order and fail under `--sequence.shuffle`. Reading the
+ * title slots directly is immune to both the nesting and the timing.
+ *
+ * Closing is not tidiness either. A Radix dialog manages document-level state while open - it hides
+ * the rest of the tree from assistive technology and takes over pointer handling - and a tree
+ * unmounted with one still open leaves that state behind for whatever renders next, which
+ * suppresses the following test's own dialog. One Escape dismisses one layer, so the loop runs
+ * until none is left; each pass must strictly reduce the count, which is what bounds it.
  */
 const expectDialogTitled = async (user: ReturnType<typeof userEvent.setup>, title: string) => {
-	expect(await screen.findByRole('dialog')).toHaveTextContent(title)
-
-	await user.keyboard('{Escape}')
 	await waitFor(() => {
-		expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+		expect(dialogTitles()).toContain(title)
 	})
+
+	while (dialogSurfaces().length > 0) {
+		const openBefore = dialogSurfaces().length
+
+		await user.keyboard('{Escape}')
+		await waitFor(() => {
+			expect(dialogSurfaces().length).toBeLessThan(openBefore)
+		})
+	}
+
+	expect(dialogSurfaces()).toHaveLength(0)
 }
 
-/* ═══ 5. The suites ═══════════════════════════════════════════════════════════════════ */
-
-describe('MatchAndReconcile', () => {
+/*
+ * TIMEOUT: this file declares a per-case budget above Vitest's 5s default, and it is a measurement
+ * rather than a preference.
+ *
+ * These cases mount the whole reconciliation workbench - a virtualised list, the Radix tab shell and
+ * the tooltip/theme providers - and several of them then open a voucher route, which awaits a
+ * DYNAMICALLY IMPORTED modal body: `RecordPaymentModalContent` is 52 KB of source,
+ * `BankEntryModalContent` 34 KB and `TransferModalContent` 24 KB. The first `await import()` of each
+ * pays transform and evaluation cost inside the case that happens to reach it first, and the
+ * remainder are then served from the module cache - so the expense is real but MOVES: under
+ * `--sequence.shuffle` it lands on whichever case runs first, and under `--coverage` V8
+ * instrumentation multiplies it. Measured on a four-core runner: the same case ran at 3.0s
+ * uninstrumented, 5.1s instrumented, and a different case in the same group peaked at 5.7s once the
+ * order changed - i.e. cases whose every assertion passes were failing the `test` and
+ * `test:coverage` gates on timing alone, and never the same case twice.
+ *
+ * A per-case budget was therefore the wrong instrument (it just moves the failure to its neighbour)
+ * and a global `testTimeout` in `vitest.config.ts` would be the wrong place - the other seven suites
+ * are fast and should keep the strict default, which is what catches a genuine hang early. Declaring
+ * it once here scopes the allowance to exactly the suite that needs it: every case in this file
+ * inherits it, no case outside it does, and 20s still fails a real hang rather than running forever.
+ */
+describe('MatchAndReconcile', { timeout: 20000 }, () => {
 	let layoutMeasurement: ReturnType<typeof stubLayoutMeasurement>
+
+	/**
+	 * Loads the three lazily-imported modal bodies ONCE, before any test runs.
+	 *
+	 * They are large - 52 KB, 34 KB and 24 KB of TSX with their own dependency graphs - and each is
+	 * behind a `lazy()` boundary, so whichever test opens one FIRST pays the whole import cost inside
+	 * its own 5 s budget. Under V8 coverage instrumentation with several workers competing that first
+	 * open measured over 5 s, which surfaced as an intermittent timeout rather than as a behavioural
+	 * failure, and it moved from test to test with `--sequence.shuffle`.
+	 *
+	 * Warming the cache here makes the cost a fixed, once-per-file charge on a hook with its own
+	 * budget, and it makes the module-cache state the same for every test regardless of the order the
+	 * runner chose - which is also the second guard against the nested-dialog race documented on
+	 * {@link expectDialogTitled}. Nothing is rendered or asserted here: the imports are evaluated for
+	 * their side effect on the loader cache alone, and every module they reach that talks to a server
+	 * is already mocked above.
+	 */
+	beforeAll(async () => {
+		await Promise.all([
+			import('./RecordPaymentModalContent'),
+			import('./BankEntryModalContent'),
+			import('./TransferModalContent')
+		])
+	}, 60_000)
 
 	beforeEach(() => {
 		// Installed per test rather than once: the shared teardown resets spies created by the
 		// fixture module, and a property getter installed at module scope would outlive this file.
 		layoutMeasurement = stubLayoutMeasurement()
+
+		// The toast spies belong to THIS file rather than to the shared fixture module, so the shared
+		// teardown does not reach them. Reset here so a notification raised by one test can never be
+		// read as another test's.
+		toastSuccess.mockReset()
+		toastError.mockReset()
 	})
 
 	afterEach(() => {
 		layoutMeasurement.mockRestore()
 	})
-
-	/* ─── Before a bank account is chosen ───────────────────────────────────────────── */
 
 	describe('before a bank account is chosen', () => {
 		it('asks for one and renders no transaction rows', () => {
@@ -511,15 +541,11 @@ describe('MatchAndReconcile', () => {
 
 			expect(screen.getByText('Select a bank account to reconcile')).toBeInTheDocument()
 
-			// The rows are deliberately withheld even though the endpoint would have answered with
-			// them, so nothing is presented as reconcilable before an account frames it.
 			expect(screen.queryByText(DEPOSIT_ROW.description ?? '')).not.toBeInTheDocument()
 			expect(screen.queryByText(WITHDRAWAL_ROW.description ?? '')).not.toBeInTheDocument()
 			expect(screen.queryByRole('button', { name: 'Reconcile' })).not.toBeInTheDocument()
 		})
 	})
-
-	/* ─── TC1 ───────────────────────────────────────────────────────────────────────── */
 
 	describe('TC1 - the unreconciled list', () => {
 		it('renders one row per transaction the server returned', async () => {
@@ -530,11 +556,9 @@ describe('MatchAndReconcile', () => {
 			})
 			expect(transactionRow(WITHDRAWAL_ROW)).toBeInTheDocument()
 
-			// Each row is distinguished by its OWN data, so neither is a duplicate of the other.
 			expect(within(transactionRow(DEPOSIT_ROW)).getByText(/ZEN-778/)).toBeInTheDocument()
 			expect(within(transactionRow(WITHDRAWAL_ROW)).getByText(/QUI-991/)).toBeInTheDocument()
 
-			// The result counter agrees with the row count, so nothing was rendered twice or dropped.
 			expect(screen.getByText('2 results')).toBeInTheDocument()
 		})
 
@@ -575,9 +599,6 @@ describe('MatchAndReconcile', () => {
 			const row = transactionRow(partlyAllocated)
 			expect(row.textContent).toMatch(/₹\s?12,500\.00/)
 
-			// The remaining figure is shown only when it differs from the transaction value, which
-			// is exactly the case a reviewer needs to see. Matched loosely because the label shares
-			// its element with the formatted figure.
 			expect(row.textContent).toMatch(/₹\s?9,000\.00/)
 			expect(within(row).getByText(/Unallocated/)).toBeInTheDocument()
 		})
@@ -600,13 +621,10 @@ describe('MatchAndReconcile', () => {
 			})
 
 			const row = transactionRow(DEPOSIT_ROW)
-			// Formatted with the user's own date format, which the harness seeds as `dd-mm-yyyy`.
 			expect(within(row).getByText('15-01-2024')).toBeInTheDocument()
 			expect(within(row).getByText('NEFT')).toBeInTheDocument()
 		})
 	})
-
-	/* ─── TC2 ───────────────────────────────────────────────────────────────────────── */
 
 	describe('TC2 - the rule-suggested match', () => {
 		it('shows the violet rule badge, naming the rule that matched', async () => {
@@ -660,8 +678,6 @@ describe('MatchAndReconcile', () => {
 				expect(screen.getByText(MATCHED_RULE.rule_name)).toBeInTheDocument()
 			})
 
-			// The card restates the rule the badge named, so the reviewer sees WHY it was proposed
-			// and WHAT the rule asks for.
 			expect(screen.getByText(MATCHED_RULE.rule_description ?? '')).toBeInTheDocument()
 			expect(screen.getByText('Recommended Action')).toBeInTheDocument()
 			expect(screen.getByText(`Priority ${MATCHED_RULE.priority}`)).toBeInTheDocument()
@@ -678,16 +694,10 @@ describe('MatchAndReconcile', () => {
 				expect(screen.getByText('No vouchers found for this transaction')).toBeInTheDocument()
 			})
 
-			// Nothing is invented from the stamp alone: the card appears only once the server has
-			// supplied the rule it describes.
 			expect(screen.queryByText('Recommended Action')).not.toBeInTheDocument()
 		})
 
 		it("offers the action the rule's OWN classification calls for", async () => {
-			// The card is not decoration: the classification decides which document the reviewer is
-			// steered towards, so a rule classified as a bank entry must not offer to record a
-			// payment. Each classification is checked separately, because they are three distinct
-			// branches of that decision.
 			const stamped = makeRuleMatchedTransaction({ description: 'Rule-stamped ACME credit' })
 
 			const { unmount } = renderWorkbench({
@@ -719,32 +729,47 @@ describe('MatchAndReconcile', () => {
 			).toBeInTheDocument()
 		})
 
-		it('routes the recommended action to the document the classification names', async () => {
-			// Offering the right label and then opening the wrong document would be worse than
-			// offering nothing, so the routing is asserted for each classification rather than
-			// inferred from the label.
-			const user = userEvent.setup()
+		/**
+		 * Offering the right label and then opening the wrong document would be worse than offering
+		 * nothing, so the routing is asserted for each classification rather than inferred from the
+		 * label.
+		 *
+		 * One case per test, deliberately. Each pass mounts the workbench and then lazily imports a
+		 * modal body of 24-52 KB, so driving all three from a single `it` put one test at ~3 s of the
+		 * 5 s default budget in isolation - and over it whenever coverage instrumentation and worker
+		 * contention were added, which showed up as an intermittent timeout rather than as a
+		 * behavioural failure. Splitting keeps every case comfortably inside the budget and names
+		 * exactly which classification broke when one does.
+		 */
+		const openRecommendedAction = async (
+			user: ReturnType<typeof userEvent.setup>,
+			classification: RuleDocument['classify_as'],
+			expectedTitle: string
+		) => {
+			// One object in both the list and the selection, exactly as the reviewer's own click would
+			// leave it.
 			const stamped = makeRuleMatchedTransaction({ description: 'Rule-stamped ACME credit' })
 
-			const openRecommendedAction = async (
-				classification: RuleDocument['classify_as'],
-				expectedTitle: string
-			) => {
-				const { unmount } = renderWorkbench({
-					transactions: [stamped],
-					selected: [stamped],
-					rule: { ...MATCHED_RULE, classify_as: classification }
-				})
+			renderWorkbench({
+				transactions: [stamped],
+				selected: [stamped],
+				rule: { ...MATCHED_RULE, classify_as: classification }
+			})
 
-				await user.click(await screen.findByRole('button', { name: new RegExp(`Create ${classification}`) }))
-				await expectDialogTitled(user, expectedTitle)
+			await user.click(await screen.findByRole('button', { name: new RegExp(`Create ${classification}`) }))
+			await expectDialogTitled(user, expectedTitle)
+		}
 
-				unmount()
-			}
+		it('routes a Payment Entry classification to the record-payment document', async () => {
+			await openRecommendedAction(userEvent.setup(), 'Payment Entry', 'Record Payment')
+		})
 
-			await openRecommendedAction('Payment Entry', 'Record Payment')
-			await openRecommendedAction('Bank Entry', 'Bank Entry')
-			await openRecommendedAction('Transfer', 'Transfer')
+		it('routes a Bank Entry classification to the bank-entry document', async () => {
+			await openRecommendedAction(userEvent.setup(), 'Bank Entry', 'Bank Entry')
+		})
+
+		it('routes a Transfer classification to the transfer document', async () => {
+			await openRecommendedAction(userEvent.setup(), 'Transfer', 'Transfer')
 		})
 
 		it('reaches the recommended action from the keyboard as well', async () => {
@@ -767,14 +792,7 @@ describe('MatchAndReconcile', () => {
 		})
 	})
 
-	/* ─── Creating a voucher instead of matching one ─────────────────────────────────── */
-
 	describe('creating a voucher instead of matching one', () => {
-		/**
-		 * The three alternatives to matching. Only the DIALOG opening is asserted - each modal body
-		 * is lazily loaded and owns its own behaviour - because what this surface is responsible for
-		 * is offering the right three routes and opening the right one.
-		 */
 		it('opens each create-a-voucher route for the transaction under review', async () => {
 			const user = userEvent.setup()
 			renderWorkbench({ transactions: [DEPOSIT_ROW], selected: [DEPOSIT_ROW] })
@@ -822,8 +840,6 @@ describe('MatchAndReconcile', () => {
 				expect(transactionRow(DEPOSIT_ROW)).toBeInTheDocument()
 			})
 
-			// The tooltips promise these three chords, so they are part of the contract rather than a
-			// convenience: a promised shortcut that does nothing is a defect.
 			await user.keyboard('{Meta>}p{/Meta}')
 			await expectDialogTitled(user, 'Record Payment')
 
@@ -834,8 +850,6 @@ describe('MatchAndReconcile', () => {
 			await expectDialogTitled(user, 'Transfer')
 		})
 	})
-
-	/* ─── Candidate vouchers ────────────────────────────────────────────────────────── */
 
 	describe('the candidate vouchers for the transaction under review', () => {
 		it('invites a selection until one is made', async () => {
@@ -864,14 +878,11 @@ describe('MatchAndReconcile', () => {
 
 			await user.click(transactionRow(DEPOSIT_ROW))
 
-			// Asserted on the surface the click opened, not on the atom: the voucher panel is what
-			// the reviewer now sees.
 			await waitFor(() => {
 				expect(screen.getByRole('button', { name: 'Reconcile' })).toBeInTheDocument()
 			})
 			expect(store.get(SELECTED_TRANSACTION_ATOM).map((row) => row.name)).toEqual([DEPOSIT_ROW.name])
 
-			// A plain click REPLACES the selection rather than accumulating it.
 			await user.click(transactionRow(WITHDRAWAL_ROW))
 			expect(store.get(SELECTED_TRANSACTION_ATOM).map((row) => row.name)).toEqual([WITHDRAWAL_ROW.name])
 		})
@@ -927,11 +938,9 @@ describe('MatchAndReconcile', () => {
 			expect(within(voucherCard(unrelated)).queryByText('Suggested')).not.toBeInTheDocument()
 			expect(within(voucherCard(blankReference)).queryByText('Suggested')).not.toBeInTheDocument()
 
-			// The reference grades the reviewer reads off each card.
 			expect(within(voucherCard(suggested)).getByText('Complete Match')).toBeInTheDocument()
 			expect(within(voucherCard(unrelated)).getByText('No Match')).toBeInTheDocument()
 
-			// A blank reference paints no grade at all rather than an empty label beside one.
 			expect(within(voucherCard(blankReference)).queryByText('No Match')).not.toBeInTheDocument()
 			expect(within(voucherCard(blankReference)).queryByText('Complete Match')).not.toBeInTheDocument()
 		})
@@ -970,8 +979,6 @@ describe('MatchAndReconcile', () => {
 		})
 	})
 
-	/* ─── TC3 ───────────────────────────────────────────────────────────────────────── */
-
 	describe('TC3 - a manual override to a different voucher', () => {
 		/**
 		 * The suggestion and the override, arranged the way the endpoint would return them: the
@@ -998,8 +1005,6 @@ describe('MatchAndReconcile', () => {
 				expect(screen.getByRole('link', { name: different.name })).toBeInTheDocument()
 			})
 
-			// The override is genuinely the non-suggested candidate: it disagrees on amount, so the
-			// test cannot accidentally pass by clicking the suggestion.
 			expect(within(voucherCard(different)).queryByText('Suggested')).not.toBeInTheDocument()
 			expect(different.paid_amount).not.toBe(DEPOSIT_ROW.unallocated_amount)
 
@@ -1039,10 +1044,9 @@ describe('MatchAndReconcile', () => {
 				expect(frappePostCall).toHaveBeenCalledTimes(1)
 			})
 
-			// An EXISTING voucher's doctype and name are what the server keys on to record the link
-			// as `Matched` rather than `Voucher Created`. That is a server-side consequence, so what
-			// is asserted here is the client side of it: an existing voucher was named, and nothing
-			// was created - no document was inserted and no create endpoint was reached.
+			// Posting an existing voucher's doctype and name is what selects the server's `Matched`
+			// path, so the client side of that is what is asserted: an existing voucher was named and
+			// nothing was created.
 			const [{ payment_doctype: doctype, payment_name: name }] = JSON.parse(
 				String(capturedReconcileRequest().vouchers)
 			)
@@ -1067,12 +1071,9 @@ describe('MatchAndReconcile', () => {
 				expect(frappePostCall).toHaveBeenCalledTimes(1)
 			})
 
-			// Exactly one post, and it does not name the suggested voucher anywhere.
 			expect(String(capturedReconcileRequest().vouchers)).not.toContain(suggested.name)
 		})
 	})
-
-	/* ─── TC4 ───────────────────────────────────────────────────────────────────────── */
 
 	describe('TC4 - confirming a match posts the reconciliation', () => {
 		const suggested = makeSuggestedLinkedPayment(DEPOSIT_ROW)
@@ -1112,6 +1113,16 @@ describe('MatchAndReconcile', () => {
 					amount: suggested.paid_amount
 				}
 			])
+
+			// And the reviewer is told it succeeded, once, with an Undo offered - not told it failed.
+			await waitFor(() => {
+				expect(toastSuccess).toHaveBeenCalledTimes(1)
+			})
+			expect(toastSuccess).toHaveBeenCalledWith(
+				'Reconciled',
+				expect.objectContaining({ action: expect.objectContaining({ label: 'Undo' }) })
+			)
+			expect(toastError).not.toHaveBeenCalled()
 		})
 
 		it('refreshes the status from the server instead of inventing it locally', async () => {
@@ -1150,7 +1161,6 @@ describe('MatchAndReconcile', () => {
 			expect(frappeSWRMutate).toHaveBeenCalledWith(UNRECONCILED_KEY)
 			expect(frappeSWRMutate).toHaveBeenCalledWith(CLOSING_BALANCE_KEY)
 
-			// The reviewer stays on the transaction, because there is still something to allocate.
 			expect(store.get(SELECTED_TRANSACTION_ATOM).map((row) => row.name)).toEqual([DEPOSIT_ROW.name])
 		})
 
@@ -1171,7 +1181,6 @@ describe('MatchAndReconcile', () => {
 			const control = await screen.findByRole('button', { name: /Reconciling/ })
 			expect(control).toBeDisabled()
 
-			// The label states what is actually happening, and the idle label is gone.
 			expect(screen.queryByRole('button', { name: 'Reconcile' })).not.toBeInTheDocument()
 		})
 
@@ -1195,8 +1204,6 @@ describe('MatchAndReconcile', () => {
 			expect(frappePostCall).not.toHaveBeenCalled()
 		})
 	})
-
-	/* ─── TC5 / FM3 ─────────────────────────────────────────────────────────────────── */
 
 	describe('TC5 and FM3 - an already-reconciled transaction cannot be reconciled again', () => {
 		/**
@@ -1270,8 +1277,6 @@ describe('MatchAndReconcile', () => {
 		})
 
 		it('leaves the same control enabled for its unreconciled counterpart', async () => {
-			// The other half of the pair, and the half that matters: it is what proves the guard is
-			// evaluating the server's predicate rather than disabling confirm across the board.
 			renderWorkbench({
 				transactions: [stillUnreconciled],
 				selected: [stillUnreconciled],
@@ -1294,8 +1299,6 @@ describe('MatchAndReconcile', () => {
 			const control = await screen.findByRole('button', { name: 'Reconcile' })
 			await user.click(control)
 
-			// Not one post. The server would refuse it anyway - its own guard is the authority - but
-			// the affordance must not offer an action that cannot succeed.
 			expect(frappePostCall).not.toHaveBeenCalled()
 		})
 
@@ -1326,8 +1329,6 @@ describe('MatchAndReconcile', () => {
 
 			const control = await screen.findByRole('button', { name: 'Reconcile' })
 
-			// The tooltip is mounted only when the guard fires, so an enabled control never points at
-			// content that is not rendered.
 			expect(control.parentElement).not.toHaveAttribute('data-slot', 'tooltip-trigger')
 		})
 
@@ -1344,16 +1345,10 @@ describe('MatchAndReconcile', () => {
 			expect(screen.getByText('2 results')).toBeInTheDocument()
 		})
 
-		/**
-		 * The stale-client case FM3 is really about, end to end on this surface.
-		 *
-		 * The client held a row it believed was reconcilable, the server refused the post, and the
-		 * refresh that follows rebuilds the selection from the SERVER'S OWN rows - after which this
-		 * guard is reading the truth and the action closes. Nothing on the path depends on the client
-		 * having guessed the new state: no status is written locally, and the refreshed row is taken
-		 * whole. The all-transactions key is what carries it, because a now-reconciled transaction is
-		 * absent from the unreconciled list by construction (that endpoint filters on
-		 * `unallocated_amount > 0`).
+		/*
+		 * After a rejection the selection is rebuilt from refreshed server rows; no status is written
+		 * locally. A reconciled row can only arrive on the all-transactions key, because the
+		 * unreconciled endpoint filters on `unallocated_amount > 0`.
 		 */
 		it('closes after a refusal, from the server\'s refreshed row', async () => {
 			const user = userEvent.setup()
@@ -1366,8 +1361,6 @@ describe('MatchAndReconcile', () => {
 
 			frappePostCall.mockRejectedValue(makeAlreadyReconciledError(stale.name))
 
-			// The authoritative answer to the post-rejection refresh: the all-transactions view still
-			// reports the row, now settled.
 			frappeSWRMutate.mockImplementation((key: unknown) =>
 				Promise.resolve(key === BANK_TRANSACTIONS_KEY
 					? {
@@ -1386,30 +1379,31 @@ describe('MatchAndReconcile', () => {
 
 			await user.click(control)
 
-			// The refusal is reported in a MODAL dialog, so the page behind it is inert until it is
-			// dismissed - which is exactly the order the reviewer experiences: read the server's own
-			// reason, dismiss it, find the action correctly withheld.
 			await user.click(await screen.findByRole('button', { name: 'Dismiss' }))
 
 			await waitFor(() => {
 				expect(screen.getByRole('button', { name: 'Reconcile' })).toBeDisabled()
 			})
 
-			// The row the guard is now reading is the SERVER's, taken whole rather than patched.
 			expect(store.get(SELECTED_TRANSACTION_ATOM)[0]).toMatchObject({
 				name: stale.name,
 				status: 'Reconciled',
 				unallocated_amount: 0
 			})
-			// One post, and no retry of it anywhere on the rejection path.
 			expect(frappePostCall).toHaveBeenCalledTimes(1)
+
+			// The notification carries the SERVER's own words, and no success is ever claimed - the
+			// dialog and the toast read the same resolved error, so they cannot disagree about it.
+			expect(toastError).toHaveBeenCalledTimes(1)
+			expect(toastError).toHaveBeenCalledWith(
+				'Error',
+				expect.objectContaining({ description: formatAlreadyReconciledMessage(stale.name) })
+			)
+			expect(toastSuccess).not.toHaveBeenCalled()
 		})
 	})
 
-	/* ─── FM5 ───────────────────────────────────────────────────────────────────────── */
-
 	describe('FM5 - a currency mismatch warns without blocking', () => {
-		/** Denominated in the alternate currency, against an account the server reports in {@link TEST_CURRENCY}. */
 		const mismatched = makeCurrencyMismatchTransaction({ description: 'Cross-currency inbound wire' })
 
 		it('shows the advisory chip, naming the transaction currency', async () => {
@@ -1518,8 +1512,6 @@ describe('MatchAndReconcile', () => {
 		})
 	})
 
-	/* ─── The shared error dialog's mount point ─────────────────────────────────────── */
-
 	describe('the shared error dialog', () => {
 		it('renders nothing while no rejection is being reported', async () => {
 			const { container } = renderWorkbench({ transactions: [DEPOSIT_ROW] })
@@ -1535,8 +1527,6 @@ describe('MatchAndReconcile', () => {
 		})
 
 		it('is mounted by this surface, so a rejection reaches the reviewer here', async () => {
-			// Only the MOUNT is asserted: the dialog's own parsing, severity and dismissal behaviour
-			// belong to its own suite and are not restated.
 			renderWorkbench({
 				transactions: [makeReconciledTransaction({ description: 'Already reconciled wire' })],
 				dialogError: makeAlreadyReconciledError('ACC-BTN-2024-00003')
@@ -1544,12 +1534,9 @@ describe('MatchAndReconcile', () => {
 
 			const dialog = await screen.findByRole('alertdialog')
 
-			// The server's own wording, verbatim - no client paraphrasing anywhere on the path.
 			expect(dialog).toHaveTextContent(formatAlreadyReconciledMessage('ACC-BTN-2024-00003'))
 		})
 	})
-
-	/* ─── Narrowing the list ────────────────────────────────────────────────────────── */
 
 	describe('narrowing the list', () => {
 		it('narrows to the searched transaction', async () => {
@@ -1617,12 +1604,8 @@ describe('MatchAndReconcile', () => {
 				expect(transactionRow(DEPOSIT_ROW)).toBeInTheDocument()
 			})
 
-			// The placeholder is composed from the account's currency symbol and its decimal
-			// separator, which is what identifies this input without a test-only hook.
 			const amountInput = screen.getByPlaceholderText('₹0.00')
 
-			// Cleared first, because the field starts showing a zero rather than empty - typing over
-			// it without clearing appends to that zero, exactly as it would for a real reviewer.
 			await user.clear(amountInput)
 			await user.type(amountInput, '4300')
 
@@ -1688,12 +1671,9 @@ describe('MatchAndReconcile', () => {
 				'href',
 				'/statement-importer'
 			)
-			// No filter is in force, so no "clear filters" escape is offered.
 			expect(screen.queryByRole('button', { name: 'Clear Filters' })).not.toBeInTheDocument()
 		})
 	})
-
-	/* ─── While the server has not answered ─────────────────────────────────────────── */
 
 	describe('while the server has not answered', () => {
 		it('shows placeholders instead of an empty list', () => {
@@ -1720,8 +1700,6 @@ describe('MatchAndReconcile', () => {
 			expect(document.querySelectorAll('[data-slot="skeleton"]').length).toBeGreaterThan(0)
 		})
 	})
-
-	/* ─── When the server refuses ───────────────────────────────────────────────────── */
 
 	describe('when the server refuses a read', () => {
 		it("reports the transaction list's own refusal verbatim", async () => {
@@ -1751,8 +1729,6 @@ describe('MatchAndReconcile', () => {
 			expect(screen.queryByRole('button', { name: 'Reconcile' })).not.toBeInTheDocument()
 		})
 	})
-
-	/* ─── Transactions older than the chosen range ──────────────────────────────────── */
 
 	describe('transactions older than the chosen range', () => {
 		it('warns that the opening balance may not tie out, and widens the range on request', async () => {

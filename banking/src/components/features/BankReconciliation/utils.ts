@@ -740,8 +740,14 @@ export const useReconcileTransaction = () => {
  * of the list is the company's default account. `account_currency` is listed separately because
  * it is NOT a `Bank Account` field: the endpoint derives it per row from the linked
  * `Account.account_currency` after the query, which is why it is optional here.
+ *
+ * EXPORTED so a test fixture can be typed by this contract instead of restating it. The
+ * projection is deliberately NOT the same shape as `SelectedBank`, which models the PERSISTED
+ * selection: that one carries `integration_id` (which this endpoint does not project) and omits
+ * `account_subtype` (which it does), so a fixture built from the wrong one silently asserts
+ * against a response the server cannot produce.
  */
-interface BankAccountWithCurrency extends Pick<BankAccount, 'name' | 'bank' | 'account_name' | 'is_credit_card' | 'is_default' | 'company' | 'account' | 'account_type' | 'account_subtype' | 'bank_account_no' | 'last_integration_date'> {
+export interface BankAccountWithCurrency extends Pick<BankAccount, 'name' | 'bank' | 'account_name' | 'is_credit_card' | 'is_default' | 'company' | 'account' | 'account_type' | 'account_subtype' | 'bank_account_no' | 'last_integration_date'> {
     account_currency?: string
 }
 

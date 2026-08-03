@@ -23,7 +23,7 @@ import { BankStatementImportLog } from "@/types/Accounts/BankStatementImportLog"
 import { useFrappeCreateDoc, useFrappeFileUpload, useFrappeGetDocList, useFrappeUpdateDoc } from "frappe-react-sdk"
 import { useAtom, useAtomValue, useSetAtom } from "jotai"
 import { CircleHelpIcon, ListIcon, Loader2Icon } from "lucide-react"
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { useNavigate } from "react-router"
 
 
@@ -49,6 +49,38 @@ const BankStatementImporter = () => {
 
     const isPdf = files[0]?.name?.toLowerCase().endsWith(".pdf") ?? false
 
+    /**
+     * SINGLE FLIGHT over the WHOLE upload chain.
+     *
+     * The chain is three server operations - save the statement password, upload the file, create the
+     * import log - and the Upload control was held closed by `loading || createLoading`, which are the
+     * upload hook's and the create hook's own in-flight flags. Neither covers the FIRST step: the
+     * update hook's `loading` was never read, so for the entire duration of a protected-PDF password
+     * save the control was enabled and a second click started a SECOND chain from the beginning. Each
+     * chain mints its own `new-bank-statement-import-log-…` name, so both complete, and nothing
+     * de-duplicates the two logs afterwards - the same statement can then be imported twice, once
+     * from each. The hook flags also go quiet in the gaps BETWEEN steps, which is a second, narrower
+     * version of the same window.
+     *
+     * A single local flag closes all of it, because it is raised before the first dispatch and stays
+     * raised across every await in between. Deliberately NOT derived from the hooks: their flags
+     * describe individual requests, and what has to be prevented is a second CHAIN.
+     *
+     * It is lowered only when the chain ends without a log having been created - the one state in
+     * which retrying is legitimate. A chain that reaches the log navigates away, so the control must
+     * not reopen behind it. Local state, not an atom: this describes one form's attempt, not
+     * application state, and it must not survive a remount.
+     *
+     * TWO members, for two different jobs. The state drives what the control LOOKS like, and can only
+     * do that job: a state value is read from the closure of the render that produced the click
+     * handler, so two clicks dispatched inside ONE React batch both see `false` and both proceed -
+     * the check-then-act race the `disabled` attribute cannot close either, since it is applied by a
+     * later render. The ref is written synchronously and read back immediately, so the second click
+     * sees the first one's decision. The ref DECIDES; the state DISPLAYS.
+     */
+    const [isUploading, setIsUploading] = useState(false)
+    const uploadInFlight = useRef(false)
+
     // Whether any failure has already been attributed to a specific file. Used only to keep the
     // unattributed hook banners from repeating a message the per-file surface already shows.
     const hasAttributedFailure = Object.keys(preImportFailures).length > 0
@@ -58,6 +90,21 @@ const BankStatementImporter = () => {
         if (!selectedBankAccount) {
             return
         }
+
+        // Belt to the disabled control's braces. A `disabled` attribute is the right affordance but it
+        // is not the guarantee: it is applied by a LATER render, so it cannot close the window between
+        // two clicks that arrive in the same batch, and it does not exist at all for a programmatic
+        // call. The ref is read here, before anything is dispatched, so a second entry is refused on
+        // the strength of the first one's own write rather than on a re-render having happened.
+        if (uploadInFlight.current) {
+            return
+        }
+
+        // Raised BEFORE the first dispatch, so there is no window - however brief - in which a chain
+        // is under way and nothing is holding the control closed. The ref is set first and
+        // synchronously: it is what the guard above reads.
+        uploadInFlight.current = true
+        setIsUploading(true)
 
         const id = `new-bank-statement-import-log-${Date.now()}`
 
@@ -113,6 +160,13 @@ const BankStatementImporter = () => {
             const displayError = toDisplayError(uploadError)
             setErrorDialog(displayError)
             setPreImportFailures((previous) => ({ ...previous, [fileName]: displayError }))
+
+            // The chain ended without an import log, so retrying is the user's to do and the control
+            // reopens. Lowered HERE and nowhere else: a chain that got as far as creating the log
+            // navigates away from this form, and reopening the control behind that hand-off is exactly
+            // what would let the same statement be uploaded a second time.
+            uploadInFlight.current = false
+            setIsUploading(false)
         })
     }
 
@@ -212,12 +266,17 @@ const BankStatementImporter = () => {
                         </div>}
                     </div>}
                     <div className="flex justify-end px-4">
+                        {/*
+                          * `isUploading` is listed FIRST because it is the condition that actually
+                          * spans the chain; the two hook flags are kept alongside it so the control
+                          * still reflects an in-flight request that some other code path started.
+                          */}
                         <Button
                             onClick={onUpload}
                             size='md'
-                            disabled={files.length === 0 || loading || createLoading || !selectedBankAccount || !selectedCompany}>
-                            {loading || createLoading ? <Loader2Icon className="size-4 animate-spin" /> : null}
-                            {loading || createLoading ? _("Uploading...") : _("Upload")}
+                            disabled={isUploading || files.length === 0 || loading || createLoading || !selectedBankAccount || !selectedCompany}>
+                            {isUploading || loading || createLoading ? <Loader2Icon className="size-4 animate-spin" /> : null}
+                            {isUploading || loading || createLoading ? _("Uploading...") : _("Upload")}
                         </Button>
                     </div>
                 </div>

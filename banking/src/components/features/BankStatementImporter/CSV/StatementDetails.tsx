@@ -2,7 +2,7 @@ import _ from '@/lib/translate'
 import { GetStatementDetailsResponse } from '../import_utils'
 import { flt, formatCurrency } from '@/lib/numbers'
 import { formatDate } from '@/lib/date'
-import { bankRecDateAtom, bankRecErrorDialogAtom, bankRecImportFailuresAtom, classifyImportAttempt, withImportAttempt, withoutImportAttempt } from '../../BankReconciliation/bankRecAtoms'
+import { bankRecDateAtom, bankRecErrorDialogAtom, bankRecImportFailuresAtom, classifyImportAttempt, withImportAttempt, withoutImportAttempt, type ImportAttemptStatus } from '../../BankReconciliation/bankRecAtoms'
 import { AlertCircleIcon, ChevronLeftIcon, ChevronRightIcon, ExternalLinkIcon, InfoIcon, Loader2Icon } from 'lucide-react'
 import { H2, H3, Paragraph } from '@/components/ui/typography'
 import { FileTypeIcon } from '@/components/ui/file-dropzone'
@@ -11,7 +11,7 @@ import { Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, Tabl
 import { Separator } from '@/components/ui/separator'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { FrappeContext, useFrappeEventListener, useFrappePostCall, type FrappeConfig } from 'frappe-react-sdk'
+import { FrappeContext, useFrappeEventListener, useFrappePostCall, type FrappeConfig, type FrappeError } from 'frappe-react-sdk'
 import { toast } from 'sonner'
 import ErrorBanner from '@/components/ui/error-banner'
 import { Link, useNavigate } from 'react-router'
@@ -51,6 +51,46 @@ const parseDateFormat = (dateFormat: string) => {
 type Props = {
     data: GetStatementDetailsResponse,
 }
+
+/**
+ * The ONE test for "the server says this import happened".
+ *
+ * `insert_transactions` sets `status = "Completed"` and saves as its LAST act
+ * (`bank_statement_import_log.py:568-569`), and it early-returns a document already in that state,
+ * so a completed status is the server's own record of the import having taken effect - and the only
+ * evidence of it that exists. Nothing else in a response is a substitute: `run_doc_method` always
+ * appends the document it ran the method on (`frappe/handler.py:340`), so a response WITHOUT one
+ * cannot have come from a successful import, and a document that came back still saying
+ * `Not Started` is the server reporting that the import did not complete.
+ *
+ * Used as a type guard so a confirmed document can be handed to a continuation that requires one.
+ */
+const isConfirmedCompletedImport = (doc?: BankStatementImportLog): doc is BankStatementImportLog =>
+    doc?.status === 'Completed'
+
+/**
+ * What the reviewer is shown when the request SUCCEEDED at the transport level but the response
+ * carried no confirmation of the import - no document, an empty `docs`, or a document that still
+ * reports a nonterminal status.
+ *
+ * Built here rather than through `toDisplayError`, which exists for the different case of a
+ * rejection with no envelope at all and whose copy opens "No response arrived from the server".
+ * That sentence would be false here - a response DID arrive - and a message the reviewer can tell
+ * is wrong about what happened is worse than no message. The rest of the reasoning is identical to
+ * that layer's, and deliberately so: a response that cannot be relied on proves only that the
+ * client did not learn the answer, never that the server failed to apply the request, so the copy
+ * names the outcome as unknown and sends the reviewer to the server's own record instead of
+ * inviting a blind re-import of work that may already exist.
+ *
+ * A function rather than a constant, so the wording is resolved through the translation layer at
+ * the moment it is needed rather than at module load.
+ */
+const unconfirmedImportError = (): FrappeError => ({
+    httpStatus: 0,
+    httpStatusText: 'Unconfirmed',
+    message: _('The server did not confirm this import, so it is not known whether the transactions were recorded. Open this import to check its current state before importing the file again.'),
+    exception: ''
+})
 
 const StatementDetails = ({ data }: Props) => {
     const dateFormat = parseDateFormat(data.date_format)
@@ -125,6 +165,14 @@ const StatementDetails = ({ data }: Props) => {
      * rejection path can run the identical continuation when its authoritative re-read shows the
      * import did complete after all - the two paths must not be allowed to drift apart.
      *
+     * The parameter is REQUIRED, and every call site has to satisfy {@link isConfirmedCompletedImport}
+     * first. That is what makes "confirmed" structural rather than a promise: the first thing this
+     * function does is record success locally and its last is to navigate away, so it must never be
+     * reachable with a document that does not say the import happened. It used to accept an optional
+     * document and was called with `response.docs ? response.docs[0] : undefined`, so a 200 that
+     * carried no document at all - a truncated or rewritten response - was presented to the reviewer
+     * as a completed import, complete with success toast and hand-off.
+     *
      * The order here is deliberate and each step depends on the one before it:
      *
      *  1. Resolve the date range from the SERVER's copy of the document. The import derives the
@@ -142,15 +190,15 @@ const StatementDetails = ({ data }: Props) => {
      * Steps 3 and 4 are bounded and never reject, so a slow or unavailable worker delays this
      * hand-off but cannot strand the user on the import screen.
      */
-    const onImportCompleted = async (doc?: BankStatementImportLog) => {
+    const onImportCompleted = async (doc: BankStatementImportLog) => {
 
         // Recorded FIRST, before any awaiting: from here on the server has confirmed the import, so
         // the Import control must be gone for the whole of the continuation below rather than
         // reappearing the moment the request settles.
         setAttemptState('completed')
 
-        const fromDate = doc?.start_date
-        const toDate = doc?.end_date
+        const fromDate = doc.start_date
+        const toDate = doc.end_date
 
         if (fromDate && toDate) {
             setDates({
@@ -171,11 +219,13 @@ const StatementDetails = ({ data }: Props) => {
     }
 
     /**
-     * Handles a rejected import ATTEMPT.
+     * Settles an attempt whose RESPONSE did not establish that the import completed - whether
+     * because the server refused it, or because what came back carried no confirmation.
      *
-     * A rejection is not by itself evidence that the import did not happen: the request may have
-     * been received and committed with only the response lost. The server is therefore asked what
-     * the log actually says before anything is recorded or shown, and its answer decides:
+     * Neither of those is by itself evidence that the import did not happen: the request may have
+     * been received and committed with only the acknowledgement lost or rewritten. The server is
+     * therefore asked what the log actually says before anything is recorded or shown, and its
+     * answer decides:
      *
      *  - status `Completed`  -> server truth wins outright. No error is surfaced, no marker is
      *    written, any earlier marker is retired, and the success continuation runs.
@@ -188,9 +238,23 @@ const StatementDetails = ({ data }: Props) => {
      * The classification itself lives in `classifyImportAttempt`, which takes an OBSERVATION rather
      * than a verdict, so this function cannot express "mark it failed" - only "here is what I saw".
      *
+     * Both entry points share this one function ON PURPOSE. An unconfirmed success used to be
+     * indistinguishable from a confirmed one, so it took the SUCCESS continuation; giving it its own
+     * private handler instead would have re-created the same class of divergence one layer down.
+     *
+     * `serverRejected` is the caller's OBSERVATION, never a re-derivation: only the rejection path
+     * has an envelope to judge, and a 200 that simply carried no document is not a refusal, so it
+     * must never be classified as one.
+     *
      * Nothing here creates a transaction: only the server-side import does that.
      */
-    const recordImportRejection = async (importError: unknown): Promise<void> => {
+    const settleUnconfirmedImport = async (
+        { serverRejected, displayError, transientMessage }: {
+            serverRejected: boolean,
+            displayError: FrappeError,
+            transientMessage: string
+        }
+    ): Promise<void> => {
         let confirmedLog: BankStatementImportLog | undefined
         try {
             confirmedLog = await db.getDoc<BankStatementImportLog>('Bank Statement Import Log', data.doc.name)
@@ -200,32 +264,44 @@ const StatementDetails = ({ data }: Props) => {
         }
 
         const outcome = classifyImportAttempt({
-            // A genuine Frappe envelope is the evidence that the server answered at all. Without
-            // one there is no response to reason about - `frappe-js-sdk` dereferences
-            // `error.response.data` unguarded, so a lost response surfaces as its own TypeError.
-            serverRejected: isFrappeErrorEnvelope(importError),
+            serverRejected,
             confirmedStatus: confirmedLog?.status
         })
 
-        if (outcome === 'completed') {
+        if (outcome === 'completed' && isConfirmedCompletedImport(confirmedLog)) {
             // The freshly fetched log is passed rather than the local copy: it is the document the
             // import wrote, so it is the one carrying the resolved statement date range.
+            //
+            // The two conditions are ONE condition twice: `classifyImportAttempt` answers
+            // `completed` for exactly the status `isConfirmedCompletedImport` accepts. It is written
+            // as a guard rather than a cast so that if the two rules ever disagree, control falls
+            // through to the not-completed handling below - fail closed - instead of handing an
+            // unconfirmed document to a continuation that reports success.
             await onImportCompleted(confirmedLog)
             return
         }
 
+        /*
+         * `completed` could only survive the guard above if the classification and the confirmation
+         * predicate disagreed, which they cannot by construction. If they ever did, the attempt is
+         * recorded as `unknown` - the honest reading of "the client could not establish what
+         * happened" - rather than as a completion nothing here was able to verify.
+         */
+        const marker: ImportAttemptStatus = outcome === 'completed' ? 'unknown' : outcome
+
         // The attempt ended without the import having taken effect, so re-offering it is correct -
-        // this is the one path on which the control may legitimately reopen.
+        // this is the one path on which the control may legitimately reopen. The server refuses a
+        // log it has already completed, so a retry cannot double-import.
         setAttemptState('idle')
 
         // Normalised through the SAME layer the reconciliation seam uses, so a genuine envelope is
         // passed through BY IDENTITY - the backend's own message, title and severity reach the user
-        // verbatim - while a response-less rejection becomes outcome-indeterminate transport copy
+        // verbatim - while a rejection with no envelope becomes outcome-indeterminate transport copy
         // instead of the SDK's internal TypeError text. Untrusted markup inside a server message is
         // neutralised at the rendering boundary, not by rewriting the envelope here.
-        toast.error(_("There was an error while importing the bank statement."))
-        setErrorDialog(toDisplayError(importError))
-        setImportFailures((previousAttempts) => withImportAttempt(previousAttempts, data.doc.bank_account, data.doc.name, outcome))
+        toast.error(transientMessage)
+        setErrorDialog(displayError)
+        setImportFailures((previousAttempts) => withImportAttempt(previousAttempts, data.doc.bank_account, data.doc.name, marker))
     }
 
     const onImport = () => {
@@ -244,12 +320,47 @@ const StatementDetails = ({ data }: Props) => {
             docs: data.doc,
             method: 'insert_transactions'
         }).then((response) => {
-            return onImportCompleted(response.docs ? response.docs[0] : undefined)
+            const returnedLog = response?.docs?.[0]
+
+            if (isConfirmedCompletedImport(returnedLog)) {
+                return onImportCompleted(returnedLog)
+            }
+
+            /*
+             * A 200 IS NOT A CONFIRMATION. `run_doc_method` returns the document it ran the method
+             * on, and the import's last act is to set the status to `Completed` and save - so a
+             * response with no document, an empty `docs`, or a document still reporting
+             * `Not Started` did not come from an import that took effect. It used to be treated as
+             * success anyway: the control was retired, a success toast was raised, the
+             * reconciliation range was moved and the reviewer was handed off to a workbench that
+             * had nothing new in it.
+             *
+             * It is not treated as a failure either, because that is equally unknowable from here.
+             * It is settled the same way a rejection is: ask the server what the log says and let
+             * THAT decide. `serverRejected` is false - nothing was refused - so a log that is not
+             * confirmed completed is recorded as `unknown`, which is the honest reading of "the
+             * response could not be relied on".
+             */
+            return settleUnconfirmedImport({
+                serverRejected: false,
+                displayError: unconfirmedImportError(),
+                transientMessage: _("The import could not be confirmed.")
+                // Terminated HERE rather than in the catch below, which would otherwise re-run the
+                // whole settlement and judge this handler's own failure as though the SERVER had
+                // refused the import.
+            }).catch((handlerError) => console.error(handlerError))
         }).catch((importError: unknown) => {
             // Handled asynchronously because the server must be consulted before any outcome is
             // recorded; the terminal catch keeps that handler from ever escaping as an unhandled
             // rejection.
-            return recordImportRejection(importError).catch((handlerError) => console.error(handlerError))
+            return settleUnconfirmedImport({
+                // A genuine Frappe envelope is the evidence that the server answered at all. Without
+                // one there is no response to reason about - `frappe-js-sdk` dereferences
+                // `error.response.data` unguarded, so a lost response surfaces as its own TypeError.
+                serverRejected: isFrappeErrorEnvelope(importError),
+                displayError: toDisplayError(importError),
+                transientMessage: _("There was an error while importing the bank statement.")
+            }).catch((handlerError) => console.error(handlerError))
         })
 
     }

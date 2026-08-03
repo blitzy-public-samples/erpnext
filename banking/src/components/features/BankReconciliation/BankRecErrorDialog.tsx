@@ -153,26 +153,26 @@ const BankRecErrorDialog = () => {
 			{/* Radix marks the rest of the page inert but does not emit `aria-modal`, so the
 				modal semantics are declared explicitly here. The focus trap, Escape handling
 				and `role="alertdialog"` all remain Radix's. */}
-			{/* WIDTH: no unconditional MINIMUM width. `min-w-*` beats the primitive's own
-				`max-w-[calc(100%-2rem)]` in the CSS cascade, which forced a fixed 672px dialog
-				onto every viewport and pushed ~300px of the server's message off-screen on a
-				phone - the one message the user most needs to read. Widening through
-				`max-width` instead leaves the primitive's ladder intact and simply adds a rung
-				above it, so the dialog always fits: below 640px the gutter rule governs, from
-				640px the primitive's own `sm:max-w-lg` (512px) does, and from 768px this
-				`md:max-w-2xl` (672px) does - each value comfortably inside its own range.
-
-				The `data-[size=default]:` qualifier is REQUIRED rather than cosmetic. The
-				primitive's class is attribute-qualified, so it carries higher specificity than a
-				bare `md:max-w-2xl` would and would win at every width; matching the qualifier
-				puts both classes on equal specificity, which leaves source order to decide -
-				and Tailwind always emits `sm` before `md`. The rendered desktop width is
-				therefore unchanged at 2xl, exactly as before.
+			{/* WIDTH: `min-w-2xl`, copied verbatim from the canonical pattern this dialog
+				imitates - `BankTransactionUnreconcileModal.tsx:37` - because the Agent Action
+				Plan fixes the content width by reference to it rather than leaving it to
+				judgement: "Follow the unreconcile modal's structure exactly, INCLUDING ITS
+				CONTENT WIDTH" (AAP §0.8.2.2) and "Content width follows the unreconcile modal
+				precedent" (§0.8.5.2). The same class is named in this file's own
+				specification. It is therefore a deliberate PATTERN MATCH, not a styling
+				preference, and it is the one literal className this component needs: every
+				other value it renders resolves to a design token through the primitives. Do not
+				substitute a `max-width` ladder here - a wider dialog reached that way is not
+				the width the plan specifies, and this application's other dialogs
+				(`min-w-7xl` on the importer's instructions dialog) set the same minimum-width
+				convention.
 
 				HEIGHT: `max-h-[90vh]` is the bound `ui/dialog.tsx` already applies to the
-				ordinary dialog primitive. An arbitrarily long or multi-message backend error
-				would otherwise grow the dialog past the viewport and carry the only Dismiss
-				control off-screen with it.
+				ordinary dialog primitive, and it is orthogonal to the width contract above -
+				the plan specifies no height, so the vertical axis is hardened on its own
+				merits. An arbitrarily long or multi-message backend error would otherwise grow
+				the dialog past the viewport and carry the only Dismiss control off-screen with
+				it.
 
 				`grid-rows-[auto_minmax(0,1fr)_auto]` is what makes that bound actually bite,
 				and it is REQUIRED rather than belt-and-braces. The primitive is `display:
@@ -187,12 +187,8 @@ const BankRecErrorDialog = () => {
 				three tracks pins the header and footer at their natural heights and lets ONLY
 				the middle one shrink, which is why Dismiss now stays on screen at every
 				height. The count is exact because this dialog renders exactly three children,
-				unconditionally: header, message region, footer.
-
-				Radix marks the rest of the page inert but does not emit `aria-modal`, so the
-				modal semantics are declared explicitly here. The focus trap, Escape handling
-				and `role="alertdialog"` all remain Radix's. */}
-			<AlertDialogContent aria-modal="true" className="max-h-[90vh] grid-rows-[auto_minmax(0,1fr)_auto] data-[size=default]:md:max-w-2xl" onOpenAutoFocus={onOpenAutoFocus} onCloseAutoFocus={onCloseAutoFocus}>
+				unconditionally: header, message region, footer. */}
+			<AlertDialogContent aria-modal="true" className="min-w-2xl max-h-[90vh] grid-rows-[auto_minmax(0,1fr)_auto]" onOpenAutoFocus={onOpenAutoFocus} onCloseAutoFocus={onCloseAutoFocus}>
 				<AlertDialogHeader>
 					{/* This chrome is deliberately outcome-NEUTRAL. It is rendered
 					    unconditionally, before the rejection has been inspected, and a

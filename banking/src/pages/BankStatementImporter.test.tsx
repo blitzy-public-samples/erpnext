@@ -1,4 +1,4 @@
-/**
+/*
  * Colocated suite for the statement-importer page.
  *
  * WHAT IT PROVES.
@@ -14,16 +14,30 @@
  *     neither overrides the document. The authoritative server `status` is asserted to WIN over a
  *     stale marker, and a stale marker is asserted to be RETIRED once the server reports the
  *     import as completed.
+ *   • The SCOPE and the CONTRACT of what this page sends, which no rendering assertion can reach:
+ *       – the import-log list query asks only about the SELECTED account, with the exact projection
+ *         the row needs and the server's own ordering. A list that lost that filter would show one
+ *         account's statement history — file names, closing balances, transaction counts — on
+ *         another's screen, and every rendering assertion here would still pass;
+ *       – the detail-view route is asserted by the `:id` it was reached WITH, not merely by having
+ *         been reached, so a hard-coded, stale or `undefined` destination cannot satisfy it;
+ *       – the three writes of the upload chain are asserted argument by argument: the statement
+ *         passphrase goes to the selected Bank Account and nowhere else, the file is uploaded
+ *         PRIVATELY and attached to the log about to be created, and that log is created under the
+ *         same id, pointing at the URL the server returned, for the selected account;
+ *       – the chain STOPS at the step that was refused, and runs at most ONCE per click, including
+ *         while a passphrase save is still pending — the window in which a second chain used to
+ *         create a second import log for the same statement.
  *
  * WHAT IT DELIBERATELY DOES NOT DO.
  *   • It does not assert client-side de-duplication of re-imported rows: FM4 mandates that as a
  *     NON-change, so there is no behaviour to assert. Rows render exactly as the endpoint returns
  *     them, which is why the ordering assertion below reads the server's order back unchanged.
  *   • It does not assert client-side transaction creation. Only the server creates transactions.
- *   • It does not reach into component state. Every assertion is on rendered output or on the
- *     disabled state of a control. The two `store.get(...)` reads are of a SHARED, exported
- *     application atom — the same public contract the import step writes — not of anything
- *     private to a component.
+ *   • It does not reach into component state. Every assertion is on rendered output, on the
+ *     disabled state of a control, or on the ARGUMENTS handed to an SDK seam. The `store.get(...)`
+ *     reads are of a SHARED, exported application atom — the same public contract the import step
+ *     writes — not of anything private to a component.
  *   • It does not duplicate FM1, FM3 or FM5, which belong to the reconciliation surface and are
  *     covered by that folder's suites, nor the error dialog's own internals, which
  *     `BankRecErrorDialog.test.tsx` covers. What is asserted here is only this page's MOUNT of
@@ -34,17 +48,13 @@
  *      />}`), so every scenario that expects a table, an empty state or a list error seeds
  *      `selectedBankAccountAtom`. One test deliberately does not, to prove the gate.
  *   2. `StatementImportLog` destructures only `{ data, error }` — there is NO loading state and no
- *      skeleton. `data: []` and `data: undefined` therefore reach the SAME empty branch, and both
- *      are covered.
- *
- * Vitest's API is exposed at runtime by `globals: true` but is NOT typed ambiently, because
- * `tsconfig.app.json` declares no `types` array — hence the explicit `'vitest'` imports.
+ *      skeleton, so `data: []` and `data: undefined` reach the SAME empty branch.
  */
 
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Provider, createStore } from 'jotai'
-import { MemoryRouter, Route, Routes } from 'react-router'
+import { MemoryRouter, Route, Routes, useParams } from 'react-router'
 import { describe, expect, it, vi } from 'vitest'
 
 import {
@@ -65,10 +75,9 @@ import {
 	makeWarningServerMessagesError
 } from '@/test/factories'
 
-// The page imports four SDK hooks at module scope, and its subtree reaches `useSWRConfig` through
-// `BankPicker -> utils.ts`. Replacing the package wholesale with the ONE shared mock is what keeps
-// every one of those seams resolvable and unable to reach a real transport. `vi.mock` is hoisted
-// above the imports, so the factory runs lazily on first import of the mocked module.
+// The page imports four SDK hooks at module scope and its subtree reaches `useSWRConfig` through
+// `BankPicker -> utils.ts`, so the package is replaced wholesale to keep every one of those seams
+// resolvable and unable to reach a real transport.
 vi.mock('frappe-react-sdk', () => createFrappeSDKMock())
 
 import BankStatementImporter from './BankStatementImporter'
@@ -82,35 +91,42 @@ import {
 import { TooltipProvider } from '@/components/ui/tooltip'
 import type { BankStatementImportLog } from '@/types/Accounts/BankStatementImportLog'
 
-/**
- * `FrappeError` is only ever reached here through the factories, so the type is derived from one
- * of them rather than imported from the mocked package — the convention the sibling suites use.
- */
 type FrappeErrorFixture = ReturnType<typeof makeFrappeError>
 
-/** The doctype the page queries; the mock branches on it so no other list query is disturbed. */
 const IMPORT_LOG_DOCTYPE = 'Bank Statement Import Log'
 
-/** Mirrors `App.tsx`, where the importer is the index child of this path. */
 const IMPORTER_ROUTE = '/statement-importer'
 
 /**
  * Stands in for `ViewBankStatementImportLog` at the `:id` child route. Proving navigation with a
  * sentinel ROUTE rather than a mocked `useNavigate` keeps the assertion about observable
  * behaviour — the detail view is reached — instead of about which function was called.
+ *
+ * It renders the `:id` it was reached WITH, because "a detail view opened" is a materially weaker
+ * claim than "the detail view of THIS log opened". A constant sentinel is satisfied by navigating
+ * to a hard-coded name, to the wrong row's name, or to `/statement-importer/undefined` — and the
+ * last of those is a real possibility here, since the destination is read off a document the
+ * server returns. Every navigation assertion below therefore reads the parameter back.
  */
 const DETAIL_SENTINEL = 'import-log-detail-reached'
 
+const ImportLogDetailProbe = () => {
+	const { id } = useParams()
+
+	return <div>{DETAIL_SENTINEL}:{id}</div>
+}
+
+/** The exact text the probe renders for one log — nothing else can satisfy it. */
+const detailViewFor = (logName: string): string => `${DETAIL_SENTINEL}:${logName}`
+
 const SELECTED_BANK = makeSelectedBank()
 
-/* ── Import-log fixtures ──────────────────────────────────────────────────────────────
- * Four rows, each with a DISTINCT `name` so a bank-scoped marker can target exactly one, and
- * each with a slash-bearing `file` so `file.split('/').pop()` yields a real displayed name.
- * `status` uses only the two values the DocType declares; there is no third value and no error
- * field on that DocType, which is precisely why the failure states below come from a marker.
- * ────────────────────────────────────────────────────────────────────────────────────── */
+/*
+ * Each row carries a slash-bearing `file` so `file.split('/').pop()` yields a real displayed name.
+ * `status` uses only the two values the DocType declares; it has no third value and no error field,
+ * which is why every failure state below comes from a client-side marker instead.
+ */
 
-/** A fully populated, server-completed import. The row that exercises every cell. */
 const COMPLETED_LOG = makeBankStatementImportLog({
 	name: 'BSIL-2024-00001',
 	file: '/files/hdfc-statement-jan-2024.csv',
@@ -122,11 +138,6 @@ const COMPLETED_LOG = makeBankStatementImportLog({
 	closing_balance: 152300.75
 })
 
-/**
- * A log the server has not advanced and that the client has observed nothing about. Its statement
- * dates are absent, which is the state a not-yet-parsed import is really in — so this row also
- * covers the date-range fallback.
- */
 const NOT_STARTED_LOG = makeBankStatementImportLog({
 	name: 'BSIL-2024-00002',
 	file: '/files/hdfc-statement-feb-2024.xlsx',
@@ -138,7 +149,6 @@ const NOT_STARTED_LOG = makeBankStatementImportLog({
 	closing_balance: 0
 })
 
-/** A log whose import the SERVER refused; a follow-up read confirmed it is still not completed. */
 const FAILED_LOG = makeBankStatementImportLog({
 	name: 'BSIL-2024-00003',
 	file: '/files/hdfc-statement-mar-2024.pdf',
@@ -150,7 +160,6 @@ const FAILED_LOG = makeBankStatementImportLog({
 	closing_balance: 0
 })
 
-/** A log whose attempt did not succeed but where nothing observed amounts to the server saying so. */
 const INDETERMINATE_LOG = makeBankStatementImportLog({
 	name: 'BSIL-2024-00004',
 	file: '/files/hdfc-statement-apr-2024.csv',
@@ -185,26 +194,19 @@ const ATTEMPT_MARKERS: ImportAttemptMarkers = {
 	}
 }
 
-/* ── Render harness ──────────────────────────────────────────────────────────────────── */
-
 interface ImporterScenario {
 	/** What the list query answers with. `undefined` is the pre-arrival state, not a loading state. */
 	logs?: BankStatementImportLog[]
-	/** A rejection from the list query, which renders above the table/empty branch. */
 	listError?: FrappeErrorFixture
-	/** Bank-scoped attempt markers seeded into the shared atom. */
 	markers?: ImportAttemptMarkers
-	/** Seeds the shared error-dialog atom, which is what makes the mounted dialog visible. */
 	dialogError?: FrappeErrorFixture
-	/** Failures attributed to a FILE because no import log existed yet. */
 	preImportFailures?: Record<string, FrappeErrorFixture>
-	/** An error on the file-upload hook, which drives one of the unattributed banners. */
 	uploadError?: FrappeErrorFixture
-	/** Set to `false` to leave the bank unselected and prove the render gate. */
 	withSelectedBank?: boolean
+	/** The account to select. Overridden only to prove the query scope is DERIVED from it. */
+	selectedBank?: ReturnType<typeof makeSelectedBank>
 }
 
-/** The five members the page destructures from an SWR-backed list query. */
 const listQueryResponse = (logs?: BankStatementImportLog[], listError?: FrappeErrorFixture) => ({
 	data: logs,
 	error: listError,
@@ -224,7 +226,6 @@ const installImportLogQuery = (logs?: BankStatementImportLog[], listError?: Frap
 	)
 }
 
-/** Puts an error on the file-upload hook, matching the shape the library declares for it. */
 const installFileUploadError = (uploadError: FrappeErrorFixture) => {
 	frappeSDKMock.useFrappeFileUpload.mockImplementation(() => ({
 		upload: frappeFileUpload,
@@ -236,13 +237,8 @@ const installFileUploadError = (uploadError: FrappeErrorFixture) => {
 	}))
 }
 
-/**
- * Renders the page inside a fresh jotai store and a router whose shape mirrors `App.tsx`: the
- * importer is the index child of `/statement-importer` and the detail view is its `:id` child.
- *
- * A store PER TEST is required because the harness performs no global atom reset and
- * `selectedBankAccountAtom` is backed by `localStorage`.
- */
+// A store PER TEST is required because the harness performs no global atom reset and
+// `selectedBankAccountAtom` is backed by `localStorage`.
 const renderImporter = ({
 	logs,
 	listError,
@@ -250,7 +246,8 @@ const renderImporter = ({
 	dialogError,
 	preImportFailures,
 	uploadError,
-	withSelectedBank = true
+	withSelectedBank = true,
+	selectedBank = SELECTED_BANK
 }: ImporterScenario = {}) => {
 	installImportLogQuery(logs, listError)
 
@@ -261,7 +258,7 @@ const renderImporter = ({
 	const store = createStore()
 
 	if (withSelectedBank) {
-		store.set(selectedBankAccountAtom, SELECTED_BANK)
+		store.set(selectedBankAccountAtom, selectedBank)
 	}
 	if (markers) {
 		store.set(bankRecImportFailuresAtom, markers)
@@ -275,20 +272,14 @@ const renderImporter = ({
 
 	const utils = render(
 		<Provider store={store}>
-			{/*
-			  * `TooltipProvider` mirrors `App.tsx`, which mounts it once around the whole application.
-			  * The page itself deliberately does NOT mount a local one, so anything in its subtree
-			  * that reaches for a tooltip - the `Unknown` status chip carries its explanation on one -
-			  * throws "`Tooltip` must be used within `TooltipProvider`" without it, and the failure is
-			  * the harness's rather than the page's. Placed here, outside the router, exactly as the
-			  * application nests it.
-			  */}
+			{/* The page mounts no local provider, so the `Unknown` chip's tooltip throws without this
+			  * one; `App.tsx` supplies it outside the router in production. */}
 			<TooltipProvider>
 				<MemoryRouter initialEntries={[IMPORTER_ROUTE]}>
 					<Routes>
 						<Route path={IMPORTER_ROUTE}>
 							<Route index element={<BankStatementImporter />} />
-							<Route path=":id" element={<div>{DETAIL_SENTINEL}</div>} />
+							<Route path=":id" element={<ImportLogDetailProbe />} />
 						</Route>
 					</Routes>
 				</MemoryRouter>
@@ -299,14 +290,9 @@ const renderImporter = ({
 	return { ...utils, store }
 }
 
-/** The displayed file name for a log — the same `split('/').pop()` the row itself renders. */
 const displayedFileName = (log: BankStatementImportLog): string =>
 	log.file.split('/').pop() ?? log.file
 
-/**
- * The table row for one log, located through its file link. Scoping every per-row assertion to the
- * row it belongs to is what stops four rows cross-contaminating one another's matches.
- */
 const rowFor = (log: BankStatementImportLog): HTMLElement => {
 	const link = screen.getByRole('link', { name: displayedFileName(log) })
 	const row = link.closest<HTMLElement>('[data-slot="table-row"]')
@@ -365,16 +351,9 @@ const csvStatementFile = (name = 'hdfc-statement-jan-2024.csv'): File =>
 const pdfStatementFile = (name = 'hdfc-statement-jan-2024.pdf'): File =>
 	new File(['%PDF-1.7 statement'], name, { type: 'application/pdf' })
 
-/**
- * Typed into the PDF passphrase field. An obvious placeholder by design: it is never a credential,
- * it matches no provider's secret format, and naming it here keeps that intent unmistakable to a
- * reader and to any secret scanner reading this file.
- */
 const PLACEHOLDER_PDF_PASSPHRASE = 'not-a-real-passphrase'
 
 describe('BankStatementImporter', () => {
-
-	/* ── TC1: the import-log list ────────────────────────────────────────────────────── */
 
 	describe('previous imports list (TC1)', () => {
 
@@ -413,11 +392,6 @@ describe('BankStatementImporter', () => {
 			])
 		})
 
-		/**
-		 * The per-row cells are asserted together because the FM2 edit touched exactly one of the
-		 * six — the status cell. Proving the other five still render the values the endpoint
-		 * projected is how that one-condition change is shown not to have disturbed the row.
-		 */
 		it('renders every projected cell of a fully populated row', () => {
 			renderImporter({ logs: [COMPLETED_LOG] })
 
@@ -426,8 +400,6 @@ describe('BankStatementImporter', () => {
 			expect(row.getByText('15th Jan 2024')).toBeInTheDocument()
 			expect(row.getByText('1st Jan 2024 to 31st Jan 2024')).toBeInTheDocument()
 			expect(row.getByText('24')).toBeInTheDocument()
-			// The currency symbol comes from the harness's `locals[':Currency']`; the amount is
-			// what this cell exists to show, so the assertion is anchored on the number.
 			expect(row.getByText(/152,300\.75/)).toBeInTheDocument()
 
 			const fileLink = row.getByRole('link', { name: 'hdfc-statement-jan-2024.csv' })
@@ -450,13 +422,126 @@ describe('BankStatementImporter', () => {
 			await userEvent.click(rowFor(FAILED_LOG))
 
 			// Reaching the `:id` child route is the observable outcome of
-			// `navigate(`/statement-importer/${item.name}`)`.
-			expect(await screen.findByText(DETAIL_SENTINEL)).toBeInTheDocument()
+			// `navigate(`/statement-importer/${item.name}`)` — and the parameter it was reached with
+			// is what makes this THAT log's detail view rather than merely a detail view. Every row
+			// on screen has a distinct name, so a handler that closed over the wrong one, or over a
+			// constant, cannot satisfy this.
+			expect(await screen.findByText(detailViewFor(FAILED_LOG.name))).toBeInTheDocument()
 			expect(screen.queryByText('Previous Imports')).not.toBeInTheDocument()
+		})
+
+		it('opens each row on its own log, never a neighbour and never nothing', async () => {
+			// Run per row rather than once, because a single-row assertion is also satisfied by a
+			// handler that ignores its argument when only one candidate exists.
+			for (const log of [COMPLETED_LOG, NOT_STARTED_LOG, INDETERMINATE_LOG]) {
+				const { unmount } = renderImporter({ logs: ALL_LOGS })
+
+				await userEvent.click(rowFor(log))
+
+				expect(await screen.findByText(detailViewFor(log.name))).toBeInTheDocument()
+				// Not a stale or hard-coded destination, and not the `undefined` a missing name
+				// would produce.
+				ALL_LOGS.filter((other) => other.name !== log.name).forEach((other) => {
+					expect(screen.queryByText(detailViewFor(other.name))).not.toBeInTheDocument()
+				})
+				expect(screen.queryByText(detailViewFor('undefined'))).not.toBeInTheDocument()
+
+				unmount()
+			}
 		})
 	})
 
-	/* ── FM2: the per-file failure indicator, row form ───────────────────────────────── */
+	/* ── The list query itself: scope, projection and ordering ───────────────────────── */
+
+	/**
+	 * WHAT THE QUERY ASKS FOR IS PART OF THE BEHAVIOUR.
+	 *
+	 * The rows above are asserted from a mocked answer, so nothing in them can tell whether the
+	 * question was scoped. `Bank Statement Import Log` is readable by System Manager, and a statement
+	 * import log names the file, the closing balance and the transaction count of a bank account — so
+	 * a list that lost its `bank_account` filter would show one company's statement history on
+	 * another account's screen, and every rendering assertion in this suite would still pass.
+	 *
+	 * These assertions are on the ARGUMENTS the page hands the SDK, for the same reason the
+	 * reconciliation suite pins its endpoint parameters: it is the only place the scope exists.
+	 */
+	describe('import-log query scope', () => {
+
+		/** The call the page makes for THIS doctype, with the arguments it made it with. */
+		const importLogQueryCall = () => {
+			const call = frappeSDKMock.useFrappeGetDocList.mock.calls
+				.find(([doctype]) => doctype === IMPORT_LOG_DOCTYPE)
+
+			if (!call) {
+				throw new Error('The page issued no import-log list query')
+			}
+
+			return call
+		}
+
+		it("asks only for the selected account's logs, newest first, ten at a time", () => {
+			renderImporter({ logs: ALL_LOGS })
+
+			const [, args] = importLogQueryCall()
+
+			// The filter is the whole of the data-isolation boundary on this screen.
+			expect(args?.filters).toEqual([['bank_account', '=', SELECTED_BANK.name]])
+			// Exactly the eight fields the row projects — no `password`-bearing or unrelated field is
+			// fetched "just in case", and none the row needs is missing.
+			expect(args?.fields).toEqual([
+				'name',
+				'file',
+				'status',
+				'number_of_transactions',
+				'start_date',
+				'end_date',
+				'closing_balance',
+				'creation'
+			])
+			// The server orders the rows; the client renders them as produced (FM4).
+			expect(args?.orderBy).toEqual({ field: 'creation', order: 'desc' })
+			expect(args?.limit).toBe(10)
+		})
+
+		it('scopes the query to whichever account is selected, not to a fixed one', () => {
+			// Derivation, proven by changing the input: the same page against a second account must
+			// ask about that account. A hard-coded or stale filter passes the test above and fails
+			// this one.
+			const secondBank = makeSelectedBank({
+				name: 'Second Bank - Test Company',
+				account_name: 'Second Bank Savings'
+			})
+
+			renderImporter({ logs: [], selectedBank: secondBank })
+
+			const [, args] = importLogQueryCall()
+
+			expect(args?.filters).toEqual([['bank_account', '=', 'Second Bank - Test Company']])
+			expect(args?.filters).not.toEqual([['bank_account', '=', SELECTED_BANK.name]])
+		})
+
+		it('asks nothing at all until an account has been selected', () => {
+			// The list lives behind `{selectedBankAccount && <StatementImportLog />}`, so with no
+			// account there is no account whose logs could be listed and the query is never issued —
+			// which is the stronger form of the `null`-key guard the component also passes for it.
+			renderImporter({ logs: ALL_LOGS, withSelectedBank: false })
+
+			expect(
+				frappeSDKMock.useFrappeGetDocList.mock.calls
+					.filter(([doctype]) => doctype === IMPORT_LOG_DOCTYPE)
+			).toHaveLength(0)
+		})
+
+		it('does not revalidate the list on window focus', () => {
+			// Pinned because the page compensates for it elsewhere: server truth retires client
+			// markers from THIS fetch, so a change of revalidation policy changes when that happens.
+			renderImporter({ logs: ALL_LOGS })
+
+			const [, , , options] = importLogQueryCall()
+
+			expect(options).toEqual({ revalidateOnFocus: false })
+		})
+	})
 
 	describe('per-row status chip (FM2)', () => {
 
@@ -512,14 +597,10 @@ describe('BankStatementImporter', () => {
 		})
 
 		/*
-		 * `Unknown` is the one label of the four that cannot carry its own meaning. "Completed",
-		 * "Not Started" and "Failed" each say what happened; "Unknown" says only that the client
-		 * could not find out, which is useless to a reviewer without the rest of the sentence - and
-		 * the rest of the sentence lives in the dialog raised at the MOMENT of the attempt, which is
-		 * long gone by the time anybody reads this row. The marker, meanwhile, persists. The group
-		 * below pins that the explanation travels with the chip for pointer, keyboard and
-		 * assistive-technology users alike, and that the other three chips are left exactly as they
-		 * are.
+		 * `Unknown` is the one label that cannot carry its own meaning: it says only that the client
+		 * could not find out, and the rest of the sentence lived in a dialog raised at the moment of
+		 * the attempt, which the marker outlives. The explanation therefore has to travel with the
+		 * chip for pointer, keyboard and assistive-technology users alike.
 		 */
 		describe('the indeterminate chip explains itself', () => {
 
@@ -529,8 +610,6 @@ describe('BankStatementImporter', () => {
 				const label = statusBadgeIn(rowFor(INDETERMINATE_LOG)).getAttribute('aria-label')
 
 				expect(label).toBeTruthy()
-				// It REPLACES the bare word rather than supplementing it, so assistive technology
-				// gets the whole meaning without hovering.
 				expect(label).toContain('Unknown')
 				expect(label).toContain('did not finish')
 				// Outcome-INDETERMINATE wording, deliberately: the client not learning the answer is
@@ -546,8 +625,6 @@ describe('BankStatementImporter', () => {
 				const icon = statusBadgeIn(rowFor(INDETERMINATE_LOG)).querySelector('svg')
 
 				expect(icon).toBeTruthy()
-				// Hidden from assistive technology: the accessible name already says everything the
-				// glyph means, so announcing it twice would only add noise.
 				expect(icon).toHaveAttribute('aria-hidden', 'true')
 			})
 
@@ -590,8 +667,6 @@ describe('BankStatementImporter', () => {
 						.toBeGreaterThan(0)
 				})
 
-				// And it is ASSOCIATED with the chip rather than merely being on screen somewhere,
-				// which is what makes it the chip's description to a screen reader.
 				await waitFor(() => {
 					expect(chip.getAttribute('aria-describedby')).toBeTruthy()
 				})
@@ -600,7 +675,6 @@ describe('BankStatementImporter', () => {
 			})
 		})
 
-		/** The marker lookup must be genuinely keyed, not applied across the whole list. */
 		it('leaves rows with no marker untouched', () => {
 			renderImporter({ logs: ALL_LOGS, markers: ATTEMPT_MARKERS })
 
@@ -629,13 +703,10 @@ describe('BankStatementImporter', () => {
 			expect(statusBadgeIn(rowFor(NOT_STARTED_LOG))).toHaveAttribute('data-theme', 'gray')
 		})
 
-		/**
-		 * SERVER AUTHORITY. A marker is an observation of one attempt; the document is the record.
-		 * When the fetched log says `Completed`, that is what renders — and the stale marker is
-		 * retired, so it cannot outlive the condition it described.
-		 *
-		 * The marker map is a shared, exported atom — the public contract the import step writes —
-		 * so reading it back is observing this module's output, not a component's internals.
+		/*
+		 * A marker is an observation of one attempt; the document is the record. A fetched
+		 * `Completed` status therefore wins, and the stale marker is retired so it cannot outlive the
+		 * condition it described.
 		 */
 		it('lets an authoritative Completed status beat a stale failure marker, and retires it', async () => {
 			const { store } = renderImporter({
@@ -653,7 +724,6 @@ describe('BankStatementImporter', () => {
 			})
 		})
 
-		/** Retirement is scoped to the account whose logs were actually re-read. */
 		it('retires only the completed log of the account this list queried', async () => {
 			const { store } = renderImporter({
 				logs: [COMPLETED_LOG],
@@ -673,8 +743,6 @@ describe('BankStatementImporter', () => {
 		})
 	})
 
-
-	/* ── FM2: the per-file failure indicator, pre-log form ───────────────────────────── */
 
 	describe('per-file failure banner for a failure before any import log exists (FM2)', () => {
 
@@ -697,10 +765,6 @@ describe('BankStatementImporter', () => {
 			expect(screen.getByText(message)).toBeInTheDocument()
 		})
 
-		/**
-		 * No client-side transaction creation, and nothing optimistic: a rejected import leaves the
-		 * list exactly as the server last reported it.
-		 */
 		it('creates no rows of its own — the list stays as the server reported it', () => {
 			renderImporter({
 				logs: [],
@@ -733,7 +797,6 @@ describe('BankStatementImporter', () => {
 			expect(screen.getAllByRole('alert')).toHaveLength(1)
 		})
 
-		/** The suppression is conditional, not a blanket removal of the hook banners. */
 		it('still shows the hook banner when no failure has been attributed to a file', () => {
 			const unattributed = 'Unattributed upload-hook rejection.'
 
@@ -743,8 +806,6 @@ describe('BankStatementImporter', () => {
 			expect(screen.getByRole('alert')).toBeInTheDocument()
 		})
 	})
-
-	/* ── The empty branch, which is also the pre-arrival branch ──────────────────────── */
 
 	describe('empty state', () => {
 
@@ -767,8 +828,6 @@ describe('BankStatementImporter', () => {
 			expect(screen.queryByRole('table')).not.toBeInTheDocument()
 		})
 	})
-
-	/* ── The list-query rejection ────────────────────────────────────────────────────── */
 
 	describe('list query rejection', () => {
 
@@ -813,7 +872,6 @@ describe('BankStatementImporter', () => {
 			expect(screen.getByRole('alert')).toHaveClass('text-ink-red-3')
 		})
 
-		/** The banner renders ABOVE the branch, so a rejection does not hide the empty state. */
 		it('reports the rejection without claiming the account has imports', () => {
 			renderImporter({ listError: makeServerMessagesError('Permission denied.') })
 
@@ -822,8 +880,6 @@ describe('BankStatementImporter', () => {
 			expect(screen.queryByRole('table')).not.toBeInTheDocument()
 		})
 	})
-
-	/* ── The shared error dialog, as mounted by THIS page ────────────────────────────── */
 
 	describe('shared error dialog mount', () => {
 
@@ -862,19 +918,14 @@ describe('BankStatementImporter', () => {
 				expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
 			})
 
-			// The row is still exactly what the server reported: nothing was mutated optimistically.
 			expect(statusBadgeIn(rowFor(COMPLETED_LOG))).toHaveTextContent('Completed')
 		})
 	})
 
-	/* ── The upload chain, which is where the pre-log FM2 marker is written ──────────── */
-
-	/**
+	/*
 	 * These drive the page's OWN upload handler, because that handler is where the pre-log failure
-	 * marker is written — seeding the atom proves the rendering, but only running the chain proves
-	 * the attribution. The assertions stay on rendered output and on the route reached; the SDK
-	 * operations are configured as seams, never inspected as internals, and nothing here reaches
-	 * into the CSV import step, which is its own module's to test.
+	 * marker is written: seeding the atom proves the rendering, but only running the chain proves the
+	 * attribution.
 	 */
 	describe('statement upload', () => {
 
@@ -900,7 +951,11 @@ describe('BankStatementImporter', () => {
 			await chooseStatementFile(container, csvStatementFile())
 			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
 
-			expect(await screen.findByText(DETAIL_SENTINEL)).toBeInTheDocument()
+			// The destination is the name the SERVER gave the document it created — read back off the
+			// route, so navigating to a client-minted id, to the previous row's id, or to
+			// `/statement-importer/undefined` cannot satisfy it.
+			expect(await screen.findByText(detailViewFor('BSIL-2024-00009'))).toBeInTheDocument()
+			expect(screen.queryByText(detailViewFor('undefined'))).not.toBeInTheDocument()
 		})
 
 		/**
@@ -921,13 +976,9 @@ describe('BankStatementImporter', () => {
 				await screen.findByText('hdfc-statement-jan-2024.csv could not be uploaded.')
 			).toBeInTheDocument()
 
-			// The same envelope also raises the shared dialog, so the refusal cannot be missed.
 			const dialog = await screen.findByRole('alertdialog')
 			expect(within(dialog).getByText(message)).toBeInTheDocument()
 
-			// Nothing was created client-side: the list still shows what the server last reported,
-			// and no import-log document was requested after the refusal — the upload is the FIRST
-			// step of the chain, so a refusal there must stop it rather than press on.
 			expect(screen.getByText('No bank statements imported yet')).toBeInTheDocument()
 			expect(screen.queryByRole('table')).not.toBeInTheDocument()
 			expect(frappeCreateDoc).not.toHaveBeenCalled()
@@ -951,8 +1002,6 @@ describe('BankStatementImporter', () => {
 				await screen.findByText('hdfc-statement-jan-2024.csv could not be uploaded.')
 			).toBeInTheDocument()
 
-			// The identical normalised envelope reaches the per-file banner and the dialog, so the
-			// copy is asserted inside the dialog rather than document-wide.
 			const dialog = await screen.findByRole('alertdialog')
 			expect(
 				within(dialog).getByText(/it is not known whether this request was recorded/)
@@ -990,7 +1039,11 @@ describe('BankStatementImporter', () => {
 			expect(screen.getAllByText(/could not be uploaded\.$/)).toHaveLength(1)
 		})
 
-		/** A failure in the password step has no banner of its own, so it must still be attributed. */
+		/**
+		 * A failure in the password step has no banner of its own, so it must still be attributed.
+		 * That the chain also STOPS there — nothing uploaded, no log created — is asserted under
+		 * "the upload chain's call contract" below, where the step's arguments live.
+		 */
 		it('attributes a failure in the statement-password step to the file as well', async () => {
 			const message = 'Not permitted to update Bank Account.'
 			frappeUpdateDoc.mockRejectedValue(makeServerMessagesError(message))
@@ -999,8 +1052,6 @@ describe('BankStatementImporter', () => {
 
 			await chooseStatementFile(container, pdfStatementFile())
 
-			// The password field is offered only for a PDF, and only then is it worth persisting.
-			// The value typed here is deliberately an obvious non-credential placeholder.
 			const passwordField = screen.getByLabelText('PDF Password')
 			await userEvent.type(passwordField, PLACEHOLDER_PDF_PASSPHRASE)
 			expect(passwordField).toHaveValue(PLACEHOLDER_PDF_PASSPHRASE)
@@ -1012,9 +1063,415 @@ describe('BankStatementImporter', () => {
 			).toBeInTheDocument()
 			expect(within(await screen.findByRole('alertdialog')).getByText(message)).toBeInTheDocument()
 		})
+
+		/**
+		 * A failure in the LAST step is the one with something already on the server: the file has
+		 * been uploaded and only the log is missing. It must still be attributed and must still not
+		 * hand the reviewer to a document that does not exist.
+		 */
+		it('attributes a failure in the log-creation step to the file as well', async () => {
+			const message = 'Not permitted to create Bank Statement Import Log.'
+			frappeFileUpload.mockResolvedValue(makeFileUploadResponse())
+			frappeCreateDoc.mockRejectedValue(makeServerMessagesError(message))
+
+			const { container } = renderImporter({ logs: [] })
+
+			await chooseStatementFile(container, csvStatementFile())
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+			expect(
+				await screen.findByText('hdfc-statement-jan-2024.csv could not be uploaded.')
+			).toBeInTheDocument()
+			expect(within(await screen.findByRole('alertdialog')).getByText(message)).toBeInTheDocument()
+
+			// No hand-off to a log that was never created.
+			expect(screen.queryByText(new RegExp(DETAIL_SENTINEL))).not.toBeInTheDocument()
+			expect(screen.getByText('No bank statements imported yet')).toBeInTheDocument()
+		})
 	})
 
-	/* ── The page shell around the list ─────────────────────────────────────────────── */
+	/* ── The upload chain's call contract ────────────────────────────────────────────── */
+
+	/**
+	 * WHAT THE CHAIN SENDS, AND IN WHAT ORDER.
+	 *
+	 * The three operations of the upload chain are the most sensitive writes this SPA makes: one
+	 * persists a statement PASSPHRASE on a Bank Account, one puts a customer's bank statement into
+	 * file storage, and one creates the document the import will then run from. The rendering
+	 * assertions above are satisfied by any arguments at all — they only ever observe that the chain
+	 * resolved — so the arguments are asserted here, at the seam, because there is nowhere else they
+	 * are visible.
+	 *
+	 * Each assertion below corresponds to something that would be a real defect and would otherwise
+	 * be invisible: a passphrase written against the WRONG account, a statement uploaded PUBLICLY or
+	 * attached to nothing, a log created for a DIFFERENT account or pointing at a different file than
+	 * the one uploaded, the passphrase travelling somewhere it does not belong, and the chain pressing
+	 * on after a step was refused.
+	 */
+	describe("the upload chain's call contract", () => {
+
+		/** The docname the page minted for this attempt, read off the upload it performed. */
+		const uploadedDocname = (): string => {
+			const args = frappeFileUpload.mock.calls[0]?.[1]
+
+			if (!args || typeof args.docname !== 'string') {
+				throw new Error('The page uploaded no file, or uploaded it without a docname')
+			}
+
+			return args.docname
+		}
+
+		/** Runs the whole chain for a PDF with a passphrase typed, resolving every step. */
+		const uploadProtectedPdf = async (): Promise<void> => {
+			frappeUpdateDoc.mockResolvedValue(makeSelectedBank())
+			frappeFileUpload.mockResolvedValue(makeFileUploadResponse())
+			frappeCreateDoc.mockResolvedValue(makeBankStatementImportLog({ name: 'BSIL-2024-00011' }))
+
+			const { container } = renderImporter({ logs: [] })
+
+			await chooseStatementFile(container, pdfStatementFile())
+			await userEvent.type(screen.getByLabelText('PDF Password'), PLACEHOLDER_PDF_PASSPHRASE)
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+			await waitFor(() => {
+				expect(screen.getByText(detailViewFor('BSIL-2024-00011'))).toBeInTheDocument()
+			})
+		}
+
+		it('saves the passphrase on the SELECTED bank account, and only there', async () => {
+			await uploadProtectedPdf()
+
+			// One write, to one account, carrying one field. A wrong `docname` here would store this
+			// account's passphrase against another company's bank account.
+			expect(frappeUpdateDoc).toHaveBeenCalledTimes(1)
+			expect(frappeUpdateDoc).toHaveBeenCalledWith(
+				'Bank Account',
+				SELECTED_BANK.name,
+				{ statement_password: PLACEHOLDER_PDF_PASSPHRASE }
+			)
+		})
+
+		it('uploads the chosen file PRIVATELY, attached to the log it is about to create', async () => {
+			await uploadProtectedPdf()
+
+			expect(frappeFileUpload).toHaveBeenCalledTimes(1)
+
+			const [uploadedFile, args] = frappeFileUpload.mock.calls[0]
+
+			// The file the user chose, not a re-read or a re-encoding of it.
+			expect(uploadedFile).toBeInstanceOf(File)
+			expect(uploadedFile.name).toBe('hdfc-statement-jan-2024.pdf')
+
+			// `isPrivate` is the whole of the access control on the stored statement: a public file
+			// URL is readable by anyone who has it, signed in or not.
+			expect(args.isPrivate).toBe(true)
+			// Attached to the document, in the field the import reads, under the name the log will be
+			// created with — an attachment pointing at nothing is orphaned in file storage.
+			expect(args.doctype).toBe('Bank Statement Import Log')
+			expect(args.fieldname).toBe('file')
+			expect(args.docname).toMatch(/^new-bank-statement-import-log-\d+$/)
+		})
+
+		it('creates the log under the SAME id it uploaded against, for the selected account', async () => {
+			await uploadProtectedPdf()
+
+			expect(frappeCreateDoc).toHaveBeenCalledTimes(1)
+			expect(frappeCreateDoc).toHaveBeenCalledWith('Bank Statement Import Log', {
+				// The same generated name the attachment was made against. Two different ids here
+				// would leave the uploaded statement attached to a document that never existed and
+				// create a log with no file.
+				name: uploadedDocname(),
+				// The URL the SERVER returned for the stored file — private, and never a client-built
+				// path.
+				file: makeFileUploadResponse().file_url,
+				bank_account: SELECTED_BANK.name
+			})
+		})
+
+		it('keeps the passphrase out of the upload and out of the import log', async () => {
+			await uploadProtectedPdf()
+
+			// The passphrase belongs to the Bank Account, which stores it encrypted, and to nothing
+			// else. Serialising each payload is the only way to prove it is absent from ALL of it
+			// rather than merely absent from the field somebody thought to check.
+			const uploadArgs = JSON.stringify(frappeFileUpload.mock.calls[0][1])
+			const createPayload = JSON.stringify(frappeCreateDoc.mock.calls[0][1])
+
+			expect(uploadArgs).not.toContain(PLACEHOLDER_PDF_PASSPHRASE)
+			expect(createPayload).not.toContain(PLACEHOLDER_PDF_PASSPHRASE)
+			expect(createPayload).not.toContain('statement_password')
+
+			// Nor does it reach the route, where it would land in browser history.
+			expect(screen.queryByText(new RegExp(PLACEHOLDER_PDF_PASSPHRASE))).not.toBeInTheDocument()
+		})
+
+		it('never writes a passphrase for a statement that has no password field', async () => {
+			// The field is offered for PDFs only, so a CSV upload must not touch the Bank Account at
+			// all — writing a blank passphrase would clear the one the account already had.
+			frappeFileUpload.mockResolvedValue(makeFileUploadResponse())
+			frappeCreateDoc.mockResolvedValue(makeBankStatementImportLog({ name: 'BSIL-2024-00012' }))
+
+			const { container } = renderImporter({ logs: [] })
+
+			await chooseStatementFile(container, csvStatementFile())
+			expect(screen.queryByLabelText('PDF Password')).not.toBeInTheDocument()
+
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+			await screen.findByText(detailViewFor('BSIL-2024-00012'))
+
+			expect(frappeUpdateDoc).not.toHaveBeenCalled()
+		})
+
+		it('writes no passphrase for a PDF whose password field was left blank', async () => {
+			// Blank means "use whatever the account already has", so there is nothing to save.
+			frappeFileUpload.mockResolvedValue(makeFileUploadResponse())
+			frappeCreateDoc.mockResolvedValue(makeBankStatementImportLog({ name: 'BSIL-2024-00013' }))
+
+			const { container } = renderImporter({ logs: [] })
+
+			await chooseStatementFile(container, pdfStatementFile())
+			expect(screen.getByLabelText('PDF Password')).toHaveValue('')
+
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+			await screen.findByText(detailViewFor('BSIL-2024-00013'))
+
+			expect(frappeUpdateDoc).not.toHaveBeenCalled()
+			expect(frappeFileUpload).toHaveBeenCalledTimes(1)
+		})
+
+		it('STOPS when the passphrase cannot be saved — nothing is uploaded and no log is created', async () => {
+			// Pressing on would upload a protected statement the server has no password for, and
+			// create a log whose import can only fail — after the reviewer has been navigated to it.
+			frappeUpdateDoc.mockRejectedValue(makeServerMessagesError('Not permitted to update Bank Account.'))
+
+			const { container } = renderImporter({ logs: [] })
+
+			await chooseStatementFile(container, pdfStatementFile())
+			await userEvent.type(screen.getByLabelText('PDF Password'), PLACEHOLDER_PDF_PASSPHRASE)
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+			await screen.findByRole('alertdialog')
+
+			expect(frappeFileUpload).not.toHaveBeenCalled()
+			expect(frappeCreateDoc).not.toHaveBeenCalled()
+			expect(screen.queryByText(new RegExp(DETAIL_SENTINEL))).not.toBeInTheDocument()
+		})
+
+		it('STOPS when the upload is refused — no log is created for a file that was not stored', async () => {
+			frappeFileUpload.mockRejectedValue(makeServerMessagesError('Invalid file type.'))
+
+			const { container } = renderImporter({ logs: [] })
+
+			await chooseStatementFile(container, csvStatementFile())
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+			await screen.findByRole('alertdialog')
+
+			expect(frappeCreateDoc).not.toHaveBeenCalled()
+			expect(screen.queryByText(new RegExp(DETAIL_SENTINEL))).not.toBeInTheDocument()
+		})
+	})
+
+	/* ── Single flight across the whole chain ────────────────────────────────────────── */
+
+	/**
+	 * ONE CLICK, ONE CHAIN.
+	 *
+	 * The chain is three sequential server operations, and the control used to be held closed by the
+	 * upload hook's and the create hook's own in-flight flags only. Neither describes the FIRST
+	 * operation: the update hook's `loading` was never read, so for the whole duration of a
+	 * protected-PDF passphrase save the control was enabled. A second click there started a second
+	 * chain from the beginning, each chain minted its own `new-bank-statement-import-log-…` name, and
+	 * BOTH completed — leaving two import logs for one file, with no same-file de-duplication
+	 * anywhere to reconcile them. Importing from each then creates every transaction twice.
+	 *
+	 * FM4 forbids client-side de-duplication of transactions, which is exactly why this matters: the
+	 * duplicates are not going to be cleaned up downstream. The single click has to stay single.
+	 *
+	 * Each test below holds one step of the chain open with a deferred promise — the only way to
+	 * observe the window rather than race it — and then asserts both halves: the control is closed,
+	 * and each operation ran at most once.
+	 */
+	describe('single flight across the whole chain', () => {
+
+		/** A promise this test resolves by hand, so one step of the chain can be held open. */
+		const deferred = <T,>() => {
+			let resolve: (value: T) => void = () => undefined
+			const promise = new Promise<T>((res) => { resolve = res })
+
+			return { promise, resolve }
+		}
+
+		const uploadButton = (): HTMLElement => screen.getByRole('button', { name: /Upload/ })
+
+		/**
+		 * Clicks Upload again while a chain is in flight.
+		 *
+		 * `pointerEventsCheck` is disabled because the control carries
+		 * `disabled:pointer-events-none`, which makes user-event refuse the interaction outright and
+		 * report the harness's own objection instead of exercising the page. Turning the check off
+		 * lets the click be delivered exactly as a rapid second press would deliver it, and leaves
+		 * the page — not the test helper — to be the thing that refuses it.
+		 */
+		const clickUploadAgain = async (): Promise<void> => {
+			await userEvent.click(uploadButton(), { pointerEventsCheck: 0 })
+		}
+
+		it('starts no second chain while the passphrase save is pending', async () => {
+			const passwordSave = deferred<unknown>()
+			frappeUpdateDoc.mockReturnValue(passwordSave.promise)
+			frappeFileUpload.mockResolvedValue(makeFileUploadResponse())
+			frappeCreateDoc.mockResolvedValue(makeBankStatementImportLog({ name: 'BSIL-2024-00014' }))
+
+			const { container } = renderImporter({ logs: [] })
+
+			await chooseStatementFile(container, pdfStatementFile())
+			await userEvent.type(screen.getByLabelText('PDF Password'), PLACEHOLDER_PDF_PASSPHRASE)
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+			// THE WINDOW: the passphrase save is in flight and neither hook flag says so.
+			expect(frappeUpdateDoc).toHaveBeenCalledTimes(1)
+			expect(uploadButton()).toBeDisabled()
+			expect(screen.getByRole('button', { name: 'Uploading...' })).toBeInTheDocument()
+
+			await clickUploadAgain()
+			await clickUploadAgain()
+
+			// No second chain: the passphrase is not written twice, and nothing has run ahead.
+			expect(frappeUpdateDoc).toHaveBeenCalledTimes(1)
+			expect(frappeFileUpload).not.toHaveBeenCalled()
+			expect(frappeCreateDoc).not.toHaveBeenCalled()
+
+			// Releasing the step lets the ONE chain finish, proving the window was transient.
+			await act(async () => {
+				passwordSave.resolve(makeSelectedBank())
+			})
+
+			expect(await screen.findByText(detailViewFor('BSIL-2024-00014'))).toBeInTheDocument()
+			expect(frappeUpdateDoc).toHaveBeenCalledTimes(1)
+			expect(frappeFileUpload).toHaveBeenCalledTimes(1)
+			expect(frappeCreateDoc).toHaveBeenCalledTimes(1)
+		})
+
+		it('starts no second chain while the file upload is pending', async () => {
+			const fileUpload = deferred<ReturnType<typeof makeFileUploadResponse>>()
+			frappeFileUpload.mockReturnValue(fileUpload.promise)
+			frappeCreateDoc.mockResolvedValue(makeBankStatementImportLog({ name: 'BSIL-2024-00015' }))
+
+			const { container } = renderImporter({ logs: [] })
+
+			await chooseStatementFile(container, csvStatementFile())
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+			await waitFor(() => expect(frappeFileUpload).toHaveBeenCalledTimes(1))
+			expect(uploadButton()).toBeDisabled()
+
+			await clickUploadAgain()
+
+			// One upload, and no log created from a file that has not finished being stored.
+			expect(frappeFileUpload).toHaveBeenCalledTimes(1)
+			expect(frappeCreateDoc).not.toHaveBeenCalled()
+
+			await act(async () => {
+				fileUpload.resolve(makeFileUploadResponse())
+			})
+
+			expect(await screen.findByText(detailViewFor('BSIL-2024-00015'))).toBeInTheDocument()
+			expect(frappeFileUpload).toHaveBeenCalledTimes(1)
+			expect(frappeCreateDoc).toHaveBeenCalledTimes(1)
+		})
+
+		it('starts no second chain while the import log is being created', async () => {
+			// The most expensive window to lose: a second chain here creates a SECOND log for the
+			// same statement, and both survive.
+			const logCreation = deferred<ReturnType<typeof makeBankStatementImportLog>>()
+			frappeFileUpload.mockResolvedValue(makeFileUploadResponse())
+			frappeCreateDoc.mockReturnValue(logCreation.promise)
+
+			const { container } = renderImporter({ logs: [] })
+
+			await chooseStatementFile(container, csvStatementFile())
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+			await waitFor(() => expect(frappeCreateDoc).toHaveBeenCalledTimes(1))
+			expect(uploadButton()).toBeDisabled()
+
+			await clickUploadAgain()
+
+			expect(frappeCreateDoc).toHaveBeenCalledTimes(1)
+			expect(frappeFileUpload).toHaveBeenCalledTimes(1)
+
+			await act(async () => {
+				logCreation.resolve(makeBankStatementImportLog({ name: 'BSIL-2024-00016' }))
+			})
+
+			expect(await screen.findByText(detailViewFor('BSIL-2024-00016'))).toBeInTheDocument()
+			expect(frappeCreateDoc).toHaveBeenCalledTimes(1)
+		})
+
+		it('refuses a second entry dispatched inside the SAME batch as the first', async () => {
+			/*
+			 * The check-then-act race itself, which the `disabled` attribute cannot close: it is
+			 * applied by a later render, and both handlers below run against the closure of the render
+			 * that is already on screen. A guard reading component STATE would therefore see `false`
+			 * twice and admit both chains. Two clicks are dispatched inside one `act` scope so they
+			 * are processed before any re-render, which is the only way to reach that case.
+			 */
+			const fileUpload = deferred<ReturnType<typeof makeFileUploadResponse>>()
+			frappeFileUpload.mockReturnValue(fileUpload.promise)
+			frappeCreateDoc.mockResolvedValue(makeBankStatementImportLog({ name: 'BSIL-2024-00017' }))
+
+			const { container } = renderImporter({ logs: [] })
+
+			await chooseStatementFile(container, csvStatementFile())
+
+			const button = uploadButton()
+			await act(async () => {
+				button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+				button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+			})
+
+			expect(frappeFileUpload).toHaveBeenCalledTimes(1)
+
+			await act(async () => {
+				fileUpload.resolve(makeFileUploadResponse())
+			})
+
+			// One file stored, one log created, one hand-off.
+			expect(frappeFileUpload).toHaveBeenCalledTimes(1)
+			expect(frappeCreateDoc).toHaveBeenCalledTimes(1)
+			expect(await screen.findByText(detailViewFor('BSIL-2024-00017'))).toBeInTheDocument()
+		})
+
+		it('reopens the control only for a chain that created nothing', async () => {
+			// A refused chain leaves no log, so the retry is the reviewer's to make and the control
+			// must come back. This is the counterpart to the tests above: the guard closes the window,
+			// it does not lock the form.
+			frappeFileUpload.mockRejectedValue(makeServerMessagesError('Invalid file type.'))
+
+			const { container } = renderImporter({ logs: [] })
+
+			await chooseStatementFile(container, csvStatementFile())
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+			await screen.findByRole('alertdialog')
+
+			// Dismissed first: an open alert dialog marks the rest of the page inert, so the control
+			// is deliberately absent from the accessibility tree until the reviewer has acknowledged
+			// the refusal.
+			await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+			await waitFor(() => {
+				expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+			})
+
+			expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
+
+			// And a retry genuinely dispatches again rather than being swallowed by a stuck guard.
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+			await waitFor(() => expect(frappeFileUpload).toHaveBeenCalledTimes(2))
+		})
+	})
 
 	describe('page shell', () => {
 
@@ -1064,4 +1521,3 @@ describe('BankStatementImporter', () => {
 		})
 	})
 })
-

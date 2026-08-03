@@ -60,7 +60,7 @@ import { vi } from 'vitest'
 
 import { createContext, createElement, Fragment, type ReactNode } from 'react'
 
-import type { LinkedPayment, UnreconciledTransaction } from '@/components/features/BankReconciliation/utils'
+import type { BankAccountWithCurrency, LinkedPayment, UnreconciledTransaction } from '@/components/features/BankReconciliation/utils'
 import type { ImportAttemptStatus, SelectedBank } from '@/components/features/BankReconciliation/bankRecAtoms'
 import type { BankTransaction } from '@/types/Accounts/BankTransaction'
 import type { BankStatementImportLog } from '@/types/Accounts/BankStatementImportLog'
@@ -87,6 +87,17 @@ import type {
 export const TEST_COMPANY = 'Test Company'
 
 export const TEST_CURRENCY = 'INR'
+
+/**
+ * The cost centre on the harness's `locals[':Company']` record, mirroring `src/test/setup.ts`.
+ *
+ * Exported for the same reason {@link TEST_COMPANY} is: `getCompanyCostCenter()` reads it straight
+ * out of that map, so a suite asserting the EXACT value it returns has to name the harness's value
+ * rather than restate a literal that could drift away from it. Asserting only that "some string"
+ * came back would pass for the wrong cost centre, which on a posting surface is a wrong GL
+ * dimension.
+ */
+export const TEST_COMPANY_COST_CENTER = 'Main - TC'
 
 /**
  * The harness's second registered currency. Pairing it with {@link TEST_CURRENCY} is what makes a
@@ -322,6 +333,57 @@ export const makeSelectedBank = (overrides: Partial<SelectedBank> = {}): Selecte
 	// manually maintained account.
 	integration_id: undefined,
 	last_integration_date: undefined,
+	account_currency: TEST_CURRENCY,
+	...overrides
+})
+
+/**
+ * ONE ROW OF `bank_account.get_list`, exactly as that endpoint projects it — the fixture for a
+ * SERVER RESPONSE, as distinct from {@link makeSelectedBank}, which models the PERSISTED selection.
+ *
+ * THE BACKEND CONTRACT (`bank_account.py:152-176`) selects ELEVEN fields:
+ *
+ *   name · account · company · account_name · is_default · bank · account_type ·
+ *   account_subtype · bank_account_no · last_integration_date · is_credit_card
+ *
+ * and then attaches a TWELFTH, `account_currency`, per row from the linked
+ * `Account.account_currency`. All twelve are written out below, so the projection is auditable by
+ * reading the builder.
+ *
+ * WHY THIS IS A SEPARATE BUILDER, AND WHY IT MATTERS. The two shapes are NOT interchangeable, and
+ * the differences run in both directions:
+ *   • `integration_id` is on `SelectedBank` but is NOT projected by this endpoint, so a response
+ *     built from the selection fixture carries a column the server never sends;
+ *   • `account_subtype` IS projected here but is absent from `SelectedBank`, so that same response
+ *     omits a column the server always sends.
+ * A suite answering the endpoint with the selection fixture is therefore asserting against a row
+ * the backend cannot produce, which is exactly the fidelity the specification's "the existing
+ * backend contract wins on API shapes and field names" rule exists to protect. The logo members
+ * (`logo`, `logoDark`, `darkModeInvert`, `logoClassName`) are likewise absent by design: they are
+ * added CLIENT-side by `useGetBankAccounts`, so a fixture that pre-supplied them could not detect
+ * the resolution failing.
+ *
+ * `order_by` is `is_default desc`, so the first row of a multi-row answer is the company's default
+ * account; `is_default: 1` here matches that. Override `account_currency` with `undefined` to model
+ * a row whose GL account carries no currency — an absence the currency advisory must read as
+ * "nothing to compare" rather than as a mismatch.
+ */
+export const makeBankAccountListRow = (
+	overrides: Partial<BankAccountWithCurrency> = {}
+): BankAccountWithCurrency => ({
+	name: TEST_BANK_ACCOUNT,
+	account: TEST_BANK_LEDGER_ACCOUNT,
+	company: TEST_COMPANY,
+	account_name: 'Test Bank Current Account',
+	is_default: 1,
+	bank: TEST_BANK,
+	account_type: 'Bank',
+	account_subtype: 'Current',
+	bank_account_no: '000123456789',
+	// Set only for accounts fed by an external banking integration; this row models a manually
+	// maintained account, so the endpoint returns it as NULL.
+	last_integration_date: undefined,
+	is_credit_card: 0,
 	account_currency: TEST_CURRENCY,
 	...overrides
 })
@@ -793,9 +855,9 @@ export const makeImportFailures = (
  * the file upload and all twelve `FrappeContext` operations. A resolved-by-default
  * operation is the more dangerous choice, because production `.then` handlers then run on a
  * payload the test never supplied — the reconcile flow would log an action and toast success
- * with `res.message` undefined (`utils.ts:313-341`), and the importer would navigate away on
- * a response with no `docs` (`StatementDetails.tsx:77-86`) — so a suite could assert a
- * "successful" flow it never actually configured. Rejecting makes that omission fail loudly
+ * with `res.message` undefined (`utils.ts:313-341`), and the importer would run its
+ * unconfirmed-response path on a payload nobody supplied (`StatementDetails.tsx:323-350`) — so a
+ * suite could assert an outcome it never actually configured. Rejecting makes that omission fail loudly
  * and immediately, naming the operation and how to configure it. None of these fires during
  * mount — every one is reached from a user-event handler — so the rejection only ever
  * appears once a test drives the flow it forgot to set up.
@@ -1128,10 +1190,14 @@ export const makeReconcileSuccessResponse = (
 /**
  * The success payload of the statement import, shaped exactly as its hook declares it:
  * `useFrappePostCall<{ docs: BankStatementImportLog[] }>('run_doc_method')`
- * (`StatementDetails.tsx:58`).
+ * (`StatementDetails.tsx:98`).
  *
  * The importer reads `response.docs[0].start_date` and `.end_date` to move the reconciliation
- * date range (`StatementDetails.tsx:78-84`), so the default carries one fully populated log.
+ * date range (`StatementDetails.tsx:200-207`) — but only from a document whose `status` is
+ * `Completed`, because nothing else in a response confirms that the import took effect
+ * (`StatementDetails.tsx:53-69`). The factory's own default log is `Completed`, so the default
+ * payload here is a CONFIRMING one; a suite that needs the unconfirmed path passes a log with a
+ * nonterminal status, or no log at all.
  */
 export const makeImportSuccessResponse = (
 	logs: BankStatementImportLog[] = [makeBankStatementImportLog()]
@@ -1214,9 +1280,9 @@ export const frappeHookMutate = vi.fn<MockedHookMutate>(() => Promise.resolve(un
  *
  * Unconfigured, it REJECTS. Resolving would run the production success handler on a payload
  * the test never supplied — logging an action and toasting "Reconciled" with `res.message`
- * undefined (`utils.ts:313-341`), or navigating away from the importer on a response with no
- * `docs` (`StatementDetails.tsx:77-86`) — and a suite could then assert a success it never
- * configured.
+ * undefined (`utils.ts:313-341`), or driving the importer's unconfirmed-response path on a
+ * payload nobody supplied (`StatementDetails.tsx:323-350`) — and a suite could then assert an
+ * outcome it never configured.
  *
  * When a component holds several post calls and a suite must distinguish them, override
  * the hook instead and branch on its `method` argument:
