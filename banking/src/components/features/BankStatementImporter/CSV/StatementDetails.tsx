@@ -76,6 +76,45 @@ const StatementDetails = ({ data }: Props) => {
 
     const direction = useDirection()
 
+    /**
+     * The client's own view of where this import has got to, for the window in which neither of the
+     * two signals the Import control used to read is telling the truth.
+     *
+     *   - `data` is the PARENT's `get_statement_details` response. It is not revalidated anywhere in
+     *     the success continuation, so `data.doc.status` still reads `Not Started` for the whole
+     *     time that continuation runs - including after the server has recorded the import.
+     *   - `loading` from the post hook answers a narrower question still ("is the request in
+     *     flight?") and flips back to false the instant the response lands, which is BEFORE the
+     *     continuation - the bounded rule-evaluation wait and the cache invalidation - has finished.
+     *
+     * Between those two, the Import control re-rendered ENABLED, reading "Import N transactions",
+     * for work the server had already committed, and invited a re-click on it. (Re-clicking was
+     * never able to double-post: the server refuses a completed log and rejects a stale resubmit.
+     * The defect is that the affordance said the opposite of what was true.)
+     *
+     *   - `attempting` - a request is in flight, or its confirmed-completed continuation is still
+     *     running. The control stays closed for all of it.
+     *   - `completed`  - the server has CONFIRMED the import. The control is REPLACED by the same
+     *     green badge the server-derived status renders, which is the strongest form of closed:
+     *     there is nothing left to click.
+     *
+     * It returns to `idle` only when an attempt ends without the import having taken effect, which
+     * is exactly when a retry is legitimate. Local state, deliberately: this describes one
+     * component's attempt, not application state, and it must not survive a remount that re-reads
+     * the document.
+     */
+    const [attemptState, setAttemptState] = useState<'idle' | 'attempting' | 'completed'>('idle')
+
+    /** True whenever an attempt is being carried out, whether or not its request is still in flight. */
+    const isImporting = loading || attemptState === 'attempting'
+
+    /**
+     * True once EITHER the fetched document or this attempt says the import is done. The server's
+     * own status is still consulted first, so a log that was already completed before this screen
+     * was opened renders exactly as it did before.
+     */
+    const isImported = data.doc.status === 'Completed' || attemptState === 'completed'
+
     /** Retires this log's attempt marker. A marker must never outlive the condition it described. */
     const clearImportAttempt = () => {
         setImportFailures((previousAttempts) => withoutImportAttempt(previousAttempts, data.doc.bank_account, data.doc.name))
@@ -104,6 +143,11 @@ const StatementDetails = ({ data }: Props) => {
      * hand-off but cannot strand the user on the import screen.
      */
     const onImportCompleted = async (doc?: BankStatementImportLog) => {
+
+        // Recorded FIRST, before any awaiting: from here on the server has confirmed the import, so
+        // the Import control must be gone for the whole of the continuation below rather than
+        // reappearing the moment the request settles.
+        setAttemptState('completed')
 
         const fromDate = doc?.start_date
         const toDate = doc?.end_date
@@ -170,6 +214,10 @@ const StatementDetails = ({ data }: Props) => {
             return
         }
 
+        // The attempt ended without the import having taken effect, so re-offering it is correct -
+        // this is the one path on which the control may legitimately reopen.
+        setAttemptState('idle')
+
         // Normalised through the SAME layer the reconciliation seam uses, so a genuine envelope is
         // passed through BY IDENTITY - the backend's own message, title and severity reach the user
         // verbatim - while a response-less rejection becomes outcome-indeterminate transport copy
@@ -181,6 +229,10 @@ const StatementDetails = ({ data }: Props) => {
     }
 
     const onImport = () => {
+
+        // Raised BEFORE the request is dispatched, so there is no render - however brief - in which
+        // an attempt is under way and nothing is holding the control closed.
+        setAttemptState('attempting')
 
         // A retry supersedes whatever the previous attempt observed, so the stale marker is
         // discarded BEFORE the request goes out rather than after it resolves - otherwise the
@@ -229,10 +281,16 @@ const StatementDetails = ({ data }: Props) => {
                             {_("Back")}
                         </Link>
                     </Button>
-                    {data.doc.status === 'Completed' ? <Badge theme='green'>{_("Completed")}</Badge> :
-                        <Button onClick={onImport} disabled={loading || data.final_transactions?.length === 0} size='sm' type='button'>
-                            {loading ? <Loader2Icon className='size-4 animate-spin' /> : null}
-                            {loading ? _("Importing...") : _("Import {0} transactions", [data.final_transactions?.length?.toString() || "0"])}</Button>
+                    {/*
+                      * The control is driven by `isImported` / `isImporting` rather than by
+                      * `data.doc.status` and `loading` directly, so that the window between the
+                      * server confirming the import and this screen being replaced cannot present an
+                      * enabled "Import" action for work that is already recorded. See `attemptState`.
+                      */}
+                    {isImported ? <Badge theme='green'>{_("Completed")}</Badge> :
+                        <Button onClick={onImport} disabled={isImporting || data.final_transactions?.length === 0} size='sm' type='button'>
+                            {isImporting ? <Loader2Icon className='size-4 animate-spin' /> : null}
+                            {isImporting ? _("Importing...") : _("Import {0} transactions", [data.final_transactions?.length?.toString() || "0"])}</Button>
                     }
                 </div>
                 <div className='flex items-start gap-4'>

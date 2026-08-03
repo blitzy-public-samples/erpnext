@@ -409,9 +409,26 @@ const RULE_EVALUATION_POLL_ATTEMPTS = 8
  * remaining is a positive statement that evaluation has been applied to this range - not an
  * inference from a matched-rule count, which would be indistinguishable from "no rule matched".
  *
- * Returns `true` when the range drained, `false` when the bound expired or the count could not be
- * read. It NEVER rejects and never blocks indefinitely: a caller that gets `false` has simply
- * learned that suggested matches may still be arriving, which is a display concern, not an error.
+ * WHY IT ASKS HOW MANY RULES EXIST FIRST. The evaluator's own first act is to read every
+ * `Bank Transaction Rule` and `return` immediately if there are none - WITHOUT stamping anything.
+ * On a site with no rules, therefore, `is_rule_evaluated` stays 0 for every imported transaction
+ * no matter how many times the evaluator runs, the exit condition below is unreachable, and the
+ * poll can only ever exhaust its full bound. That is not a slow wait, it is a wait that is
+ * guaranteed to fail, and it delayed EVERY import on a default site by the whole bound while the
+ * reviewer looked at a screen that had already finished its work. There is also nothing to
+ * trigger in that state, so the re-invocation is skipped along with the poll.
+ *
+ * The rule count deliberately carries NO filters, because the evaluator's query carries none
+ * either: it considers every rule, disabled or not, so any narrowing here could disagree with the
+ * server about whether there is work to wait for. A count that cannot be READ is a different
+ * matter - `Bank Transaction Rule` is a separate permission grant from the `Bank Transaction` read
+ * this endpoint requires - and is NOT treated as "no rules": the bounded trigger and poll run as
+ * before, because failing to read the count is not evidence about the site's configuration.
+ *
+ * Returns `true` when the range drained or when there is no rule that could ever stamp it, `false`
+ * when the bound expired or the pending count could not be read. It NEVER rejects and never blocks
+ * indefinitely: a caller that gets `false` has simply learned that suggested matches may still be
+ * arriving, which is a display concern, not an error.
  */
 export const useWaitForRuleEvaluation = () => {
 
@@ -419,6 +436,20 @@ export const useWaitForRuleEvaluation = () => {
     const { call: runRuleEvaluation } = useFrappePostCall('erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule.run_rule_evaluation')
 
     return useCallback(async (bankAccountName: string, fromDate: string, toDate: string): Promise<boolean> => {
+
+        // Nothing can stamp these transactions, so there is nothing to trigger and nothing that
+        // waiting could ever observe. Reported as converged because that is the honest answer to
+        // the question the caller is asking - no suggested match is still on its way.
+        try {
+            const ruleCount = await db.getCount('Bank Transaction Rule')
+
+            if (ruleCount === 0) {
+                return true
+            }
+        } catch (ruleCountError) {
+            // Unreadable, not absent. Fall through to the bounded wait rather than assume either way.
+            console.error(ruleCountError)
+        }
 
         // Enqueued post-commit, so unlike the server-side call this one is guaranteed to see the
         // rows the import just created. A failure here is not fatal: the scheduled evaluation will
@@ -462,15 +493,41 @@ export const useWaitForRuleEvaluation = () => {
 }
 
 /**
- * Re-reads every transaction-list and balance query a statement import invalidates, for the date
- * range the import actually resolved.
+ * The invalidation form these keys require: EMPTY the cache entry rather than ask it to revalidate.
+ *
+ * WHY A BARE `mutate(key)` IS NOT ENOUGH - AND WHY IT FAILS SILENTLY. SWR's keyed mutate treats a
+ * call with no data argument as "revalidate this key", which it performs by invoking the key's
+ * registered revalidator. Revalidators are registered by MOUNTED subscribers. At the moment a
+ * statement import finishes, the reconciliation page is not mounted - the importer is - so the
+ * imported range's keys have NO revalidator, the revalidate request has nothing to run, and the
+ * populated entry is left exactly as it was. The call still resolves, so nothing anywhere reports
+ * a problem. Then `useGetUnreconciledTransactions` mounts with `revalidateIfStale` disabled, and
+ * SWR skips its mount fetch precisely BECAUSE the entry still holds data. The page renders the
+ * pre-import list, and the reviewer is shown a statement whose new transactions are missing.
+ *
+ * Passing `undefined` as the DATA argument is what changes the outcome: that is a cache WRITE, so
+ * it applies with or without a subscriber, and it leaves the entry holding no data. SWR's mount
+ * check is "fetch if there is no data OR if stale revalidation is enabled", so an emptied entry
+ * refetches on mount even under this application's `revalidateIfStale: false` configuration. The
+ * in-app hand-off is thereby made to behave exactly like the full page reload that always showed
+ * the correct list.
+ *
+ * `revalidate: true` covers the other case in the same call: when a subscriber IS mounted, the
+ * emptied entry is refilled immediately rather than waiting for a remount. `populateCache: true`
+ * is SWR's default and is stated explicitly because it is the load-bearing half of the fix.
+ */
+const EVICT_CACHE_ENTRY = { revalidate: true, populateCache: true } as const
+
+/**
+ * Empties every transaction-list and balance cache entry a statement import invalidates, for the
+ * date range the import actually resolved, so the next render of that range reads the server.
  *
  * WHY AWAITING THIS MATTERS. `useGetUnreconciledTransactions` runs with `revalidateIfStale` and
  * `revalidateOnFocus` both disabled, so remounting it - which is exactly what navigating to the
- * reconciliation page does - does NOT refetch. If the entry for the imported range is already
- * populated, the page renders that cached copy and the freshly imported transactions are simply
- * absent, with no error anywhere to explain it. The keys therefore have to be mutated, and the
- * mutation has to be awaited BEFORE navigation, or the caller races the very refresh it asked for.
+ * reconciliation page does - does NOT refetch while its entry still holds data. The entries
+ * therefore have to be emptied (see `EVICT_CACHE_ENTRY` above for why revalidation alone is not
+ * enough), and that has to happen BEFORE navigation, or the caller races the very refresh it asked
+ * for.
  *
  * The DATES ARE PASSED IN, deliberately, rather than read from `bankRecDateAtom`. The import
  * resolves the statement's own start and end dates server-side and returns them on the saved
@@ -478,6 +535,11 @@ export const useWaitForRuleEvaluation = () => {
  * atom here would risk building keys from the previous range - the one being navigated away from -
  * and invalidating entries nobody is about to look at while leaving the one about to be rendered
  * untouched. Passing them makes the caller state which range it means.
+ *
+ * All four keys are EXISTING families, built by the same builders the query hooks use, so no key
+ * text changes and no sixth family appears. Nothing is written into the cache except emptiness:
+ * this hook never supplies data of its own, so it cannot put a differently-parameterised response
+ * where a query's own answer belongs, and the server stays the only source of what is displayed.
  *
  * `allSettled`, because a balance query failing must not prevent the transaction lists from
  * refreshing; the caller is continuing to a page whose value comes mostly from those lists.
@@ -488,10 +550,10 @@ export const useRefreshImportedTransactions = () => {
 
     return useCallback(async (bankAccountName: string, fromDate: string, toDate: string): Promise<void> => {
         await Promise.allSettled([
-            mutate(bankRecUnreconciledTransactionsKey(bankAccountName, fromDate, toDate)),
-            mutate(bankRecBankTransactionsKey(bankAccountName, fromDate, toDate)),
-            mutate(bankRecClosingBalanceKey(bankAccountName, toDate)),
-            mutate(bankRecClosingBalanceAsPerStatementKey(bankAccountName, toDate))
+            mutate(bankRecUnreconciledTransactionsKey(bankAccountName, fromDate, toDate), undefined, EVICT_CACHE_ENTRY),
+            mutate(bankRecBankTransactionsKey(bankAccountName, fromDate, toDate), undefined, EVICT_CACHE_ENTRY),
+            mutate(bankRecClosingBalanceKey(bankAccountName, toDate), undefined, EVICT_CACHE_ENTRY),
+            mutate(bankRecClosingBalanceAsPerStatementKey(bankAccountName, toDate), undefined, EVICT_CACHE_ENTRY)
         ])
     }, [mutate])
 }

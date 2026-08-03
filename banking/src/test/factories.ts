@@ -64,6 +64,7 @@ import type { LinkedPayment, UnreconciledTransaction } from '@/components/featur
 import type { ImportAttemptStatus, SelectedBank } from '@/components/features/BankReconciliation/bankRecAtoms'
 import type { BankTransaction } from '@/types/Accounts/BankTransaction'
 import type { BankStatementImportLog } from '@/types/Accounts/BankStatementImportLog'
+import type { BankTransactionRule } from '@/types/Accounts/BankTransactionRule'
 // Type-only imports, so nothing here loads the SDK module — which matters, because a suite
 // replaces it wholesale with `vi.mock`. Every name below is exported by the package root
 // (`frappe-react-sdk/dist/lib/index.d.ts:12-14,401,502`), which is what lets the spy
@@ -438,6 +439,61 @@ export const makeNullReferenceLinkedPayment = (overrides: Partial<LinkedPayment>
 		party: 'Globex Supplies',
 		...overrides
 	})
+
+/**
+ * The rule DOCUMENT behind a `matched_transaction_rule` stamp — as distinct from the stamp itself,
+ * which is a single field on the transaction row.
+ *
+ * The workbench reads this document (`useGetRuleForTransaction`, `utils.ts:872`) to describe what the
+ * matched rule would DO, so every field that surface renders is populated by default: `rule_name` and
+ * `rule_description` for the heading, `classify_as` for both the badge and the action button's
+ * wording, `priority` for the priority badge, and `account` / `party_type` / `party` for the detail
+ * rows.
+ *
+ * Defaults follow the DocType: `transaction_type` is `"Any"` (its declared default) and
+ * `description_rules` is present because the DocType marks that table required — a rule with no
+ * condition rows is a document the server cannot produce. `name` matches
+ * {@link TEST_TRANSACTION_RULE} so this document and {@link makeRuleMatchedTransaction} line up
+ * without either having to be overridden.
+ *
+ * `classify_as` has exactly three values (`Bank Entry`, `Payment Entry`, `Transfer`) and each one
+ * routes the reviewer to a DIFFERENT modal, so a suite exercising that routing must override it
+ * rather than assume the default.
+ */
+export const makeBankTransactionRule = (
+	overrides: Partial<BankTransactionRule> = {}
+): BankTransactionRule => ({
+	name: TEST_TRANSACTION_RULE,
+	creation: TEST_CREATION_TIMESTAMP,
+	modified: TEST_MODIFIED_TIMESTAMP,
+	owner: TEST_USER,
+	modified_by: TEST_USER,
+	docstatus: 0,
+	rule_name: 'ACME inbound transfers',
+	transaction_type: 'Any',
+	priority: 1,
+	rule_description: 'Credits from ACME Traders are settlement receipts',
+	company: TEST_COMPANY,
+	description_rules: [{
+		name: 'row000000001',
+		creation: TEST_CREATION_TIMESTAMP,
+		modified: TEST_MODIFIED_TIMESTAMP,
+		owner: TEST_USER,
+		modified_by: TEST_USER,
+		docstatus: 0,
+		parent: TEST_TRANSACTION_RULE,
+		parentfield: 'description_rules',
+		parenttype: 'Bank Transaction Rule',
+		idx: 1,
+		check: 'Contains',
+		value: 'ACME'
+	}],
+	classify_as: 'Payment Entry',
+	account: TEST_BANK_LEDGER_ACCOUNT,
+	party_type: 'Customer',
+	party: 'ACME Traders',
+	...overrides
+})
 
 /**
  * A statement import log row.

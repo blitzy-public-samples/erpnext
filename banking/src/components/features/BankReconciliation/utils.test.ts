@@ -849,7 +849,7 @@ describe('useRefreshImportedTransactions', () => {
 		frappeSWRMutate.mockResolvedValue(undefined)
 	})
 
-	it('revalidates the four keys the imported range affects, byte-for-byte', async () => {
+	it('invalidates the four keys the imported range affects, byte-for-byte', async () => {
 		const { result } = renderHook(() => useRefreshImportedTransactions())
 
 		await act(async () => {
@@ -862,6 +862,54 @@ describe('useRefreshImportedTransactions', () => {
 			`bank-reconciliation-account-closing-balance-${TEST_BANK_ACCOUNT}-${TO_DATE}`,
 			`bank-reconciliation-account-closing-balance-as-per-statement-${TEST_BANK_ACCOUNT}-${TO_DATE}`
 		])
+	})
+
+	/*
+	 * THE DEFECT THIS PINS. SWR's keyed mutate performs a bare `mutate(key)` by invoking the key's
+	 * registered revalidator, and revalidators are registered by MOUNTED subscribers. When an import
+	 * finishes, the reconciliation page is not mounted, so the imported range's keys have none: the
+	 * call resolves, nothing is fetched, and the populated entry survives. The unreconciled query
+	 * then mounts with `revalidateIfStale: false` and skips its mount fetch precisely BECAUSE the
+	 * entry still holds data - so a second import into an already-cached range rendered the
+	 * pre-import list with no error anywhere to explain it.
+	 *
+	 * Passing `undefined` as the DATA argument is a cache WRITE, which applies with or without a
+	 * subscriber and leaves the entry holding nothing; SWR's mount check ("fetch if there is no
+	 * data OR stale revalidation is enabled") then fetches. Every call must therefore carry three
+	 * arguments, and the second must be `undefined` - a two-argument call is the silent no-op.
+	 */
+	it('EMPTIES each entry rather than merely asking it to revalidate', async () => {
+		const { result } = renderHook(() => useRefreshImportedTransactions())
+
+		await act(async () => {
+			await result.current(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)
+		})
+
+		expect(frappeSWRMutate).toHaveBeenCalledTimes(4)
+
+		frappeSWRMutate.mock.calls.forEach((call) => {
+			// Three arguments, not one: the length is what decides between a cache write and a
+			// revalidate-only request inside SWR.
+			expect(call).toHaveLength(3)
+			const [, data, options] = call
+			expect(data).toBeUndefined()
+			// `revalidate` covers the case where a subscriber IS mounted, so the emptied entry is
+			// refilled at once instead of waiting for a remount.
+			expect(options).toEqual({ revalidate: true, populateCache: true })
+		})
+	})
+
+	// Nothing but emptiness is written. A hook that supplied its own payload could put a
+	// differently-parameterised response where a query's own answer belongs; the server stays the
+	// only source of what is displayed.
+	it('never writes data of its own into any entry', async () => {
+		const { result } = renderHook(() => useRefreshImportedTransactions())
+
+		await act(async () => {
+			await result.current(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)
+		})
+
+		expect(frappeSWRMutate.mock.calls.every(([, data]) => data === undefined)).toBe(true)
 	})
 
 	// The dates are arguments, not atom reads, precisely so the range invalidated is the one the
@@ -907,14 +955,77 @@ describe('useRefreshImportedTransactions', () => {
  */
 describe('useWaitForRuleEvaluation', () => {
 
+	/**
+	 * The hook reads TWO counts of two different doctypes - how many rules exist, then how many
+	 * transactions in the range are still unevaluated - so the stub answers by doctype rather than
+	 * with one blanket value. A blanket value would have the rule read swallow the answer meant for
+	 * the pending read, which is a silent mis-setup rather than a failure.
+	 */
+	const stubCounts = ({ rules, pending }: { rules: number | Error, pending: number | Error }) => {
+		frappeContextValue.db.getCount.mockImplementation(async (doctype: string) => {
+			const answer = doctype === 'Bank Transaction Rule' ? rules : pending
+			if (answer instanceof Error) {
+				throw answer
+			}
+			return answer
+		})
+	}
+
+	/** Every call the hook made against the pending-transaction count, in order. */
+	const pendingCountCalls = () =>
+		frappeContextValue.db.getCount.mock.calls.filter(([doctype]) => doctype === 'Bank Transaction')
+
 	beforeEach(() => {
 		frappePostCall.mockReset()
 		frappePostCall.mockResolvedValue({ message: null })
 		frappeContextValue.db.getCount.mockReset()
 	})
 
+	/*
+	 * THE DEFECT THIS PINS. `_run_rule_evaluation` reads every `Bank Transaction Rule` and returns
+	 * immediately when there are none - WITHOUT stamping anything. So on a site with no rules
+	 * `is_rule_evaluated` stays 0 for every imported transaction however often the evaluator runs,
+	 * the hook's exit condition is unreachable, and the poll exhausts its whole bound EVERY time.
+	 * That delayed every import on a default site by the full bound while the server had already
+	 * finished. Nothing is triggered either: there is no work for the evaluator to do.
+	 */
+	it('does not trigger evaluation or poll at all when the site has no rules', async () => {
+		stubCounts({ rules: 0, pending: 2 })
+
+		const { result } = renderHook(() => useWaitForRuleEvaluation())
+
+		let converged: boolean | undefined
+		await act(async () => {
+			converged = await result.current(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)
+		})
+
+		// Converged, because no suggested match is still on its way - none will ever arrive.
+		expect(converged).toBe(true)
+		expect(frappePostCall).not.toHaveBeenCalled()
+		expect(pendingCountCalls()).toHaveLength(0)
+		expect(frappeContextValue.db.getCount).toHaveBeenCalledTimes(1)
+	})
+
+	/*
+	 * The rule count must carry NO filters, because the evaluator's own query carries none - it
+	 * considers every rule, disabled or not. Narrowing here could disagree with the server about
+	 * whether there is any work to wait for.
+	 */
+	it('mirrors the evaluator\'s unfiltered rule query', async () => {
+		stubCounts({ rules: 0, pending: 0 })
+
+		const { result } = renderHook(() => useWaitForRuleEvaluation())
+		await act(async () => {
+			await result.current(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)
+		})
+
+		const [doctype, filters] = frappeContextValue.db.getCount.mock.calls[0]
+		expect(doctype).toBe('Bank Transaction Rule')
+		expect(filters).toBeUndefined()
+	})
+
 	it('re-triggers evaluation and reports convergence once nothing is left unevaluated', async () => {
-		frappeContextValue.db.getCount.mockResolvedValue(0)
+		stubCounts({ rules: 1, pending: 0 })
 
 		const { result } = renderHook(() => useWaitForRuleEvaluation())
 
@@ -925,7 +1036,27 @@ describe('useWaitForRuleEvaluation', () => {
 
 		expect(converged).toBe(true)
 		expect(frappePostCall).toHaveBeenCalledTimes(1)
-		expect(frappeContextValue.db.getCount).toHaveBeenCalledTimes(1)
+		expect(pendingCountCalls()).toHaveLength(1)
+	})
+
+	/*
+	 * An unreadable rule count is NOT evidence that there are no rules: `Bank Transaction Rule` read
+	 * access is a separate grant from the `Bank Transaction` read this endpoint requires. The
+	 * bounded trigger and poll therefore still run.
+	 */
+	it('still triggers and polls when the rule count cannot be read', async () => {
+		stubCounts({ rules: new Error('no permission on Bank Transaction Rule'), pending: 0 })
+
+		const { result } = renderHook(() => useWaitForRuleEvaluation())
+
+		let converged: boolean | undefined
+		await act(async () => {
+			converged = await result.current(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)
+		})
+
+		expect(converged).toBe(true)
+		expect(frappePostCall).toHaveBeenCalledTimes(1)
+		expect(pendingCountCalls()).toHaveLength(1)
 	})
 
 	/*
@@ -936,14 +1067,14 @@ describe('useWaitForRuleEvaluation', () => {
 	 * indistinguishable from "evaluated, and no rule matched" - it would never converge.
 	 */
 	it('counts unevaluated transactions in the imported range, mirroring the evaluator\'s filters', async () => {
-		frappeContextValue.db.getCount.mockResolvedValue(0)
+		stubCounts({ rules: 1, pending: 0 })
 
 		const { result } = renderHook(() => useWaitForRuleEvaluation())
 		await act(async () => {
 			await result.current(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)
 		})
 
-		const [doctype, filters] = frappeContextValue.db.getCount.mock.calls[0]
+		const [doctype, filters] = pendingCountCalls()[0]
 		expect(doctype).toBe('Bank Transaction')
 		expect(filters).toEqual([
 			['bank_account', '=', TEST_BANK_ACCOUNT],
@@ -958,7 +1089,7 @@ describe('useWaitForRuleEvaluation', () => {
 	// reach these rows, so a failed trigger must not stop the client observing convergence.
 	it('still polls when the re-trigger itself is refused', async () => {
 		frappePostCall.mockRejectedValue(new Error('enqueue refused'))
-		frappeContextValue.db.getCount.mockResolvedValue(0)
+		stubCounts({ rules: 1, pending: 0 })
 
 		const { result } = renderHook(() => useWaitForRuleEvaluation())
 
@@ -971,8 +1102,8 @@ describe('useWaitForRuleEvaluation', () => {
 	})
 
 	// Not converged is reported honestly rather than retried blindly.
-	it('reports not-converged, without looping, when the count cannot be read', async () => {
-		frappeContextValue.db.getCount.mockRejectedValue(new Error('no permission'))
+	it('reports not-converged, without looping, when the pending count cannot be read', async () => {
+		stubCounts({ rules: 1, pending: new Error('no permission') })
 
 		const { result } = renderHook(() => useWaitForRuleEvaluation())
 
@@ -982,7 +1113,7 @@ describe('useWaitForRuleEvaluation', () => {
 		})
 
 		expect(converged).toBe(false)
-		expect(frappeContextValue.db.getCount).toHaveBeenCalledTimes(1)
+		expect(pendingCountCalls()).toHaveLength(1)
 	})
 
 	// The wait is a convenience, never a correctness requirement, so it must always END. A worker
@@ -990,7 +1121,9 @@ describe('useWaitForRuleEvaluation', () => {
 	it('gives up after a bounded number of attempts rather than waiting forever', async () => {
 		vi.useFakeTimers()
 		try {
-			frappeContextValue.db.getCount.mockResolvedValue(3)
+			// Rules DO exist here, so the wait is legitimate: what is being pinned is that a range
+			// which never drains still ends, rather than that it is skipped.
+			stubCounts({ rules: 2, pending: 3 })
 
 			const { result } = renderHook(() => useWaitForRuleEvaluation())
 
@@ -1002,8 +1135,8 @@ describe('useWaitForRuleEvaluation', () => {
 
 			expect(converged).toBe(false)
 			// Bounded: a fixed number of polls, not one per tick of the clock.
-			expect(frappeContextValue.db.getCount.mock.calls.length).toBeLessThanOrEqual(10)
-			expect(frappeContextValue.db.getCount.mock.calls.length).toBeGreaterThan(1)
+			expect(pendingCountCalls().length).toBeLessThanOrEqual(10)
+			expect(pendingCountCalls().length).toBeGreaterThan(1)
 		} finally {
 			vi.useRealTimers()
 		}

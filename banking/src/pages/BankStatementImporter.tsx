@@ -11,6 +11,7 @@ import { FileDropzone } from "@/components/ui/file-dropzone"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { H3, Paragraph } from "@/components/ui/typography"
 import { toDisplayError } from "@/components/features/BankReconciliation/utils"
 import { useCurrentCompany } from "@/hooks/useCurrentCompany"
@@ -21,7 +22,7 @@ import { cn } from "@/lib/utils"
 import { BankStatementImportLog } from "@/types/Accounts/BankStatementImportLog"
 import { useFrappeCreateDoc, useFrappeFileUpload, useFrappeGetDocList, useFrappeUpdateDoc } from "frappe-react-sdk"
 import { useAtom, useAtomValue, useSetAtom } from "jotai"
-import { ListIcon, Loader2Icon } from "lucide-react"
+import { CircleHelpIcon, ListIcon, Loader2Icon } from "lucide-react"
 import { useEffect, useState } from "react"
 import { useNavigate } from "react-router"
 
@@ -309,9 +310,54 @@ const ImportLogStatusBadge = ({ status, attempt }: { status?: BankStatementImpor
     }
 
     if (attempt === 'unknown') {
-        // `orange` is the compound variant that resolves to the amber surface tokens; the Badge
-        // primitive exposes no literal `amber` theme.
-        return <Badge theme="orange">{_("Unknown")}</Badge>
+        /*
+         * The one state whose LABEL cannot carry its own meaning. "Completed", "Not Started" and
+         * "Failed" each say what happened; "Unknown" says only that the client could not find out,
+         * which is useless to a reviewer without the rest of the sentence - and the rest of the
+         * sentence was previously only ever available in the dialog raised at the moment of the
+         * attempt, or in an inline banner belonging to whatever fetch was failing at the time. Both
+         * are gone by the time the reviewer is looking at this row, while the marker persists.
+         *
+         * So the explanation is attached to the chip itself: an `aria-label` carrying the whole
+         * meaning (assistive technology gets it without hovering, and it replaces the bare word
+         * rather than supplementing it), a question-mark glyph so the state is distinguishable from
+         * `Failed` without relying on fill or hue, and a tooltip for pointer and keyboard users.
+         * The chip's own tokens are deliberately unchanged - `orange` is the compound variant that
+         * resolves to the amber surface tokens, since the Badge primitive exposes no literal
+         * `amber` theme - so the four states keep the exact colours they are verified against.
+         *
+         * The copy is outcome-INDETERMINATE on purpose, for the same reason the dialog's is: the
+         * client not learning the answer is not evidence the import did not happen, and telling a
+         * reviewer it failed would invite a re-import of work that may already exist.
+         */
+        const unknownExplanation = _("The last import attempt for this file did not finish, and it could not be established whether the server recorded it. Open this import to check its current state before importing the file again.")
+
+        return <Tooltip>
+            <TooltipTrigger asChild>
+                {/*
+                  * `tabIndex` and the focus ring are BOTH required, and neither comes for free.
+                  * Radix's tooltip trigger is a focusable button by default, but `asChild` hands that
+                  * role to this Badge - a `<span>` - and Radix adds no `tabIndex` of its own, so
+                  * without this the chip is skipped by Tab entirely and the tooltip is reachable by
+                  * POINTER ONLY. The `aria-label` above already covers screen readers; this covers
+                  * the sighted keyboard-only reviewer, who otherwise has no route to the explanation.
+                  * The ring uses the amber focus token, matching the chip's own theme, because a new
+                  * tab stop with no visible focus state would trade one accessibility gap for
+                  * another. Both are additive: no colour, size or variant of the chip changes.
+                  */}
+                <Badge
+                    theme="orange"
+                    tabIndex={0}
+                    className="outline-none focus-visible:shadow-focus-amber"
+                    aria-label={`${_("Unknown")}. ${unknownExplanation}`}>
+                    <CircleHelpIcon aria-hidden="true" />
+                    {_("Unknown")}
+                </Badge>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-xs">
+                {unknownExplanation}
+            </TooltipContent>
+        </Tooltip>
     }
 
     return <Badge theme="gray">{status}</Badge>
