@@ -36,6 +36,7 @@ and TypeScript, and it is served by the host ERPNext app at `/banking`.
 - [Workflow behaviour and the five failure modes](#workflow-behaviour-and-the-five-failure-modes)
 - [Scope boundaries](#scope-boundaries)
 - [Intentionally unchanged files](#intentionally-unchanged-files)
+- [Residual risks and known gaps](#residual-risks-and-known-gaps)
 
 ## Stack
 
@@ -237,10 +238,9 @@ suite hand-rolls its own module mock.
 | `src/components/features/BankReconciliation/MatchAndReconcile.test.tsx` | The workbench: transaction list, suggested match, manual override, confirm, the already-reconciled guard, the currency advisory |
 | `src/components/features/BankReconciliation/utils.test.ts` | The typed API-client hook layer, its cache keys, and the post-rejection revalidation |
 | `src/components/features/BankReconciliation/BankRecErrorDialog.test.tsx` | The dismissible error dialog — server text rendered verbatim, severity, dismissal |
-| `src/components/features/BankStatementImporter/CSV/StatementDetails.test.tsx` | The import step: the `Completed`-doc outcome requirement, backend-error surfacing, the cache eviction and rule hand-off before review, and the realtime progress listener |
-| `src/pages/BankStatementImporter.test.tsx` | The importer surface: the single-flight upload chain, server-owned log identity, per-file status for failures with and without a log, and the log's own currency |
-| `src/pages/ViewBankStatementImportLog.test.tsx` | The import-log detail route's render-branch order — a refused read shows the server's message and a way back, never a blank page |
-| `src/lib/frappe.test.ts` | Frappe error parsing: the nested JSON-string case, the fallback chain, and the malformed/non-array/message-less envelopes that must not throw |
+| `src/components/features/BankStatementImporter/CSV/StatementDetails.test.tsx` | The import step: the `Completed`-doc outcome requirement, backend-error surfacing, the cache eviction before review, the realtime progress listener, and the negative assertion that this surface posts to **no** endpoint but the document-method bridge |
+| `src/pages/BankStatementImporter.test.tsx` | The importer surface: the single-flight upload chain, server-owned log identity, the uploaded file's lifecycle (cleanup and relink retry), per-file status for failures with and without a log, the log's own currency, and negative authorisation |
+| `src/lib/frappe.test.ts` | Frappe error parsing: the nested JSON-string case, the fallback chain, and the two specified **limits** of this frozen shared parser — it throws on a malformed or non-array envelope, and keeps message-less entries — which is why the failure paths read through `readServerMessages` instead |
 | `src/lib/company.test.ts` | The `locals[':Company']` readers |
 | `src/lib/currency.test.ts` | The currency readers and formatters |
 
@@ -271,21 +271,34 @@ patterns", and the gate passes on a file nothing measured. Generating both from 
 makes that impossible. Whatever the `All files` row of the text reporter prints is therefore exactly
 what is enforced.
 
-The ten gated units, and their measured line coverage:
+**`COVERED_UNITS` is a superset of the files this work changed, and that is checkable rather than
+asserted.** `git diff --name-only <baseline> -- 'src/**'`, with the suites and the harness removed,
+yields exactly the six source files listed first below. The three `src/lib` entries are *unchanged*
+and measured anyway, because every message, company and currency the failure paths resolve goes
+through them, so a regression in one of them is a regression in FM1, FM2 or FM5 whether or not the
+file appears in a diff.
 
-| Unit | Lines |
-| --- | --- |
-| `src/components/features/BankReconciliation/utils.ts` | 98.87% |
-| `src/components/features/BankReconciliation/bankRecAtoms.ts` | 95.45% |
-| `src/components/features/BankReconciliation/BankRecErrorDialog.tsx` | 100% |
-| `src/components/features/BankReconciliation/MatchAndReconcile.tsx` | 98.01% |
-| `src/components/features/BankStatementImporter/CSV/StatementDetails.tsx` | 100% |
-| `src/pages/BankStatementImporter.tsx` | 98.64% |
-| `src/pages/ViewBankStatementImportLog.tsx` | 100% |
-| `src/lib/frappe.ts` | 100% |
-| `src/lib/company.ts` | 100% |
-| `src/lib/currency.ts` | 100% |
-| **Aggregate** | **98.89%** |
+`src/components/ui/markdown.tsx` is deliberately **not** measured, and the reason is a scope fact:
+it is byte-identical to the baseline. It is one of the design-system primitives this change set may
+not touch, so it is not a boundary this work changed. The untrusted-markup sink this work *did*
+introduce is the error dialog, which sanitises at its own boundary and is gated below like
+everything else — see [Residual risks](#residual-risks-and-known-gaps) for what that does and does
+not cover.
+
+The nine gated units, and their measured line coverage:
+
+| Unit | Changed here? | Lines |
+| --- | --- | --- |
+| `src/components/features/BankReconciliation/utils.ts` | yes | 98.97% |
+| `src/components/features/BankReconciliation/bankRecAtoms.ts` | yes | 95.45% |
+| `src/components/features/BankReconciliation/BankRecErrorDialog.tsx` | yes (new) | 100% |
+| `src/components/features/BankReconciliation/MatchAndReconcile.tsx` | yes | 98.01% |
+| `src/components/features/BankStatementImporter/CSV/StatementDetails.tsx` | yes | 100% |
+| `src/pages/BankStatementImporter.tsx` | yes | 98.86% |
+| `src/lib/frappe.ts` | no | 100% |
+| `src/lib/company.ts` | no | 100% |
+| `src/lib/currency.ts` | no | 100% |
+| **Aggregate** | — | **98.91%** |
 
 `coverage.exclude` is retained as a guard so that broadening `include` back to a directory glob can
 never silently re-admit generated DocType declarations (`src/types/**`), the harness itself
@@ -470,13 +483,32 @@ and the importer list, which live in different route trees), and it passes the F
 envelope through **unmodified** so the backend's own wording, title and severity reach the reviewer
 verbatim. It closes on `Escape` and on **Dismiss**, and dismissing it changes nothing else.
 
+Two boundaries in that path are worth naming, because both were places where a failure could have
+denied the reviewer the account of a refusal they were owed:
+
+- **The parse cannot throw.** `lib/frappe.ts` is the shared parser every `ErrorBanner` in the SPA
+  reads through, and it is frozen by this change set — it calls `JSON.parse` on `_server_messages`
+  unguarded. Every failure path here therefore reads through `readServerMessages` /
+  `readErrorText` in `BankReconciliation/utils.ts`, which is total. That matters because the parse
+  used to run *before* the dialog was raised, the selection cleared and the caches revalidated, so a
+  truncated response would have abandoned all three. When the envelope is unreadable, resolution
+  falls back through the shared module's own `_error_message → exception → message` chain rather
+  than to silence.
+- **Server markup is sanitised before it is rendered — at this dialog only.** `_server_messages` is
+  HTML and the shared renderer runs `rehypeRaw` with no sanitiser after it, so the dialog filters
+  every message body through an element/attribute allow-list with a same-origin URL boundary, parsed
+  inside a detached `<template>` whose contents HTML specifies as inert (scripts do not run, images
+  do not load). Text is preserved character for character; only markup is removed. The ~20
+  pre-existing *inline* `ErrorBanner` call sites elsewhere in the SPA keep the shared renderer's
+  baseline behaviour — see [Residual risks](#residual-risks-and-known-gaps).
+
 | # | Situation | Behaviour |
 | --- | --- | --- |
-| **FM1** | The confirm/post request fails — refused by the server, or no response at all | The dialog shows the server's own message, passed through **unmodified**: the client paraphrases nothing and adds no wording of its own. Confirm/post is **one** server-side call and **nothing is mutated optimistically**, so the transaction stays unreconciled with its state unchanged and no partial or duplicate posting is possible. The rejection handler then does two things and only two: it **clears the transaction selection**, which withdraws the Reconcile affordance outright (see FM3), and it revalidates the two transaction-list cache keys so the next render is built from the server's current figures. |
+| **FM1** | The confirm/post request fails — refused by the server, or no response at all | The dialog shows the server's own message, passed through **unmodified**: the client paraphrases nothing and adds no wording of its own, and the parse cannot throw (see the note under the table). Confirm/post is **one** server-side call and **nothing is mutated optimistically**, so *this client* contributes no partial state: the transaction stays unreconciled with its state unchanged. The rejection handler then does two things and only two: it **clears the transaction selection**, which withdraws the Reconcile affordance outright (see FM3), and it revalidates the two transaction-list cache keys so the next render is built from the server's current figures. **What this does not claim:** that a partial or duplicate posting is impossible *in general*. Within one browser a second post is refused by a shared single-flight guard, and the server's own state check refuses an already-reconciled transaction — but that check is not atomic across concurrent sessions, which is a server-side gap recorded under [Residual risks](#residual-risks-and-known-gaps). |
 | **FM2** | A malformed or empty statement file | The server refuses the import synchronously and rolls it back; the refusal reaches the reviewer twice over. It opens the shared dialog in the server's own words, and it marks that **one file** on the importer list: a red **Failed** chip in place of the stored status, carrying the server's message as its tooltip and on its accessible name, and reachable by keyboard as well as pointer. No transaction is ever created client-side. The chip is driven from the observed rejection rather than from the document because `Bank Statement Import Log` has exactly two status values — `Not Started` and `Completed` — and **no error field**: a rolled-back import leaves the row saying `Not Started`, indistinguishable from one merely waiting to be imported, so the failure has nowhere else to live. The marker is held in memory, keyed by import-log name, and is deliberately **not** persisted. |
 | **FM3** | The transaction has already been reconciled | Confirm is **disabled**, on the backend's own predicate — `status === 'Reconciled'` or `unallocated_amount <= 0`, which the server derives from one another — and a tooltip on a focusable wrapper says why. This is an affordance, not the control: the authoritative guard is the first statement of the first method `reconcile_vouchers` invokes, and this SPA never decides a financial outcome for itself. A stale client that gets through is refused by the server, and the refusal is handled **fail-closed**: the selection is cleared *unconditionally*, so the Reconcile control is withdrawn rather than merely greyed, and it cannot come back on its own — not on a timer, and not because a revalidation request also failed. The affordance returns only when the reviewer selects a transaction again, against list data re-read from the server. |
 | **FM4** | A re-import produces duplicate transactions | Rendered exactly as the backend produces them. **There is no client-side deduplication, and none may be added.** |
-| **FM5** | The transaction's currency differs from the bank account's | A **non-blocking** amber advisory badge beside the rule badge, with its explanation in a tooltip and in an `sr-only` description sharing the same string. It does **not** disable confirm; whatever the backend enforces is what happens, and a rejection surfaces through the FM1 path. The account currency it compares against is read from the **current** `bank_account.get_list` response — through `useSelectedBankAccountCurrency()`, which reads the account list already in the SWR cache and therefore issues no extra request — and *not* from the `selectedBankAccountAtom` snapshot in `localStorage`, which is written once when an account is picked and is never refreshed while that account stays selected. Both sides therefore resolve the same value by the same lookup (`Bank Account.account` → `Account.account_currency`), so the advisory cannot contradict the server. Where no account currency is known yet, there is nothing to compare and no badge is shown. |
+| **FM5** | The transaction's currency differs from the bank account's | A **non-blocking** amber advisory badge beside the rule badge, with its explanation in a tooltip and in an `sr-only` description sharing the same string. It does **not** disable confirm. The account currency it compares against is read from the **current** `bank_account.get_list` response — through `useSelectedBankAccountCurrency()`, which reads the account list already in the SWR cache and therefore issues no extra request — and *not* from the `selectedBankAccountAtom` snapshot in `localStorage`, which is written once when an account is picked and is never refreshed while that account stays selected. Both sides resolve the value by the same lookup (`Bank Account.account` → `Account.account_currency`). Where no account currency is known yet, there is nothing to compare and no badge is shown. **What this does not claim:** that the backend enforces the mismatch on this path. `Bank Transaction.validate_currency()` is invoked from `validate()`, and `reconcile_vouchers` saves an already-submitted document, which Frappe routes through `update_after_submit` — so `validate()` never runs and **no server-side currency check happens during a reconcile**. The advisory is therefore a client-side observation only, and the copy says exactly that rather than promising a check that does not occur. Recorded under [Residual risks](#residual-risks-and-known-gaps). |
 
 ## Scope boundaries
 
@@ -484,12 +516,12 @@ What this package does **not** do, stated so a reader does not go looking:
 
 | Boundary | Status |
 | --- | --- |
-| Backend endpoints | **None added.** Every call the workflow makes already existed and was already whitelisted. |
+| Backend endpoints | **None added.** Every call the workflow makes already existed and was already whitelisted. Their own authorisation and atomicity gaps are recorded under [Residual risks](#residual-risks-and-known-gaps) rather than fixed here. |
 | DocType schema | **No** field, status option, JSON edit, migration or patch entry. |
 | REST/RPC contract | Unchanged, including the call style: module functions by dotted path, the one document method through the generic `run_doc_method` bridge. |
 | Routes and providers | Unchanged. The dialog is mounted inside existing trees; no route or provider was added. |
 | Design system | **No** new token and **no** new primitive. New affordances compose the primitives in `src/components/ui/`. |
-| CI workflows | Unchanged. The Python suites are already discovered on both database engines; the frontend gate (`yarn typecheck && yarn lint && yarn test:coverage`) is **not** yet wired into a workflow — doing so is a workflow-file change and belongs to whoever owns those files. |
+| CI workflows | Unchanged. The Python suites are already discovered on both database engines; the frontend gate (`yarn typecheck && yarn lint && yarn test:coverage`) is **not** yet wired into a workflow — doing so is a workflow-file change and belongs to whoever owns those files. Recorded as R13 under [Residual risks](#residual-risks-and-known-gaps). |
 | `frappe/` submodule | Untouched, pointer and contents. `frappe/cypress/` is referenced for **conventions only**; no Cypress spec is added here. |
 | Backend diff | **One file**: two test methods appended to `erpnext/accounts/doctype/bank_transaction_rule/test_bank_transaction_rule.py`, covering rule-based auto-match, which had no coverage anywhere. Additive only — none of the 20 existing tests is touched, and no backend source file changes. |
 
@@ -509,6 +541,18 @@ everything under `src/components/ui/` · everything under `src/types/` · and th
 `"version": "0.0.0"` field in `package.json` — a Vite-scaffold artefact, not a statement about how
 complete this application is.
 
+Four more files are frozen and are called out separately, because each one is somewhere a
+well-intentioned improvement genuinely belongs and is still out of bounds *here*. Each carries a
+known limitation that is documented under [Residual risks](#residual-risks-and-known-gaps) rather
+than fixed in place:
+
+| Frozen file | Why it is tempting, and why it is frozen anyway |
+| --- | --- |
+| `src/lib/frappe.ts` | The shared error parser. It calls `JSON.parse` on `_server_messages` unguarded and keeps message-less entries, both of which matter. It is frozen as the error-transport contract, so the totality lives in `readServerMessages` / `readErrorText` at the boundary this work owns. `src/lib/frappe.test.ts` specifies its real behaviour, limits included. |
+| `src/components/ui/markdown.tsx` | The shared Markdown renderer, which runs `rehypeRaw` with **no** sanitiser after it. One shared sanitiser here would protect every consumer and would be the better design — but it is a design-system primitive, frozen. The new error dialog sanitises at its own boundary instead. |
+| `src/components/features/BankStatementImporter/import_utils.ts` | `GetStatementDetailsResponse` declares a top-level `currency` that `get_statement_details` never returns. Every screen therefore reads `data.doc.currency`, and the suite defends that with a runtime sentinel rather than with the compiler. |
+| `src/pages/ViewBankStatementImportLog.tsx` | Its render guards run no-data before error, and `useFrappeGetCall` reports no data on a *failed* read too — so a refused read shows a blank page. Out of scope here; recorded below. |
+
 That list is a **requirement of this change set, not a preference**: the plan this work implements
 freezes the build, TypeScript and lint configuration, so a convenience edit to any of them puts a
 file in the diff that does not belong there. Two of them are the reason for caveats documented
@@ -522,28 +566,110 @@ above rather than fixed in place:
 
 ### What this work did change
 
-Twenty-five files under this workspace — sixteen of source, configuration and documentation plus the
-nine test suites — and one additive backend test module. The source edits are small and each has a
-comment at its site explaining itself:
+**Twenty-two paths**, and the count is exact because it is the acceptance criterion: nine files
+updated, twelve created, none deleted — plus `yarn.lock`, which the mandated dependency additions
+necessarily regenerate. Twenty-one of the twenty-two are under this workspace; the twenty-second is
+an additive backend test module. `git diff --name-status <baseline>` should show precisely this set
+and nothing else.
 
-| File | The change |
-| --- | --- |
-| `package.json` | Four scripts (`test`, `test:coverage`, `typecheck`, `typecheck:vitest-config`), seven exactly-pinned test dependencies, and the [`resolutions` override](#the-resolutions-override--do-not-remove-it). |
-| `yarn.lock` | Regenerated by the install that added those seven packages. It is committed deliberately: `yarn install --frozen-lockfile` is the documented install command, and it cannot resolve the new dependencies from a lockfile that predates them. |
-| `proxyOptions.ts` | Two lines: an `import type` for the Node HTTP request type, and the parameter annotation that removes the one implicit-`any` error in the package. |
-| `vitest.config.ts`, `src/test/setup.ts`, `src/test/factories.ts` | New — the runner configuration, the Desk-runtime harness and the fixtures. |
-| `BankRecErrorDialog.tsx` | New — the dismissible dialog, composed from the existing `AlertDialog` and `ErrorBanner`, with server markup reduced to an element/attribute allow-list before it is rendered. |
-| `bankRecAtoms.ts` | Three plain in-memory atoms appended to the sixteen already there: the dialog payload, the per-log failure markers, and the reconcile single-flight guard — plus the account-and-file map behind pre-log import failures. |
-| `src/lib/frappe.ts` | The server-message parser made **total**: a malformed `_server_messages` can no longer throw out of it and abort the caller's error path, and an entry with no readable message no longer suppresses the fallback chain. Every `ErrorBanner` in the SPA reads through it. |
-| `utils.ts` | The reconcile rejection handler (dialog + fail-closed selection clear + revalidation), the single-flight guard, the authoritative-currency rehydration, and `useSelectedBankAccountCurrency()`. |
-| `MatchAndReconcile.tsx` | Four sites: the dialog mount, the currency advisory, the already-reconciled guard on the confirm control, and the shared in-flight guard on every candidate row. |
-| `CSV/StatementDetails.tsx` | The import outcome now requires a `Completed` doc from the server; the rejection callback *takes* the error, records the per-file failure and opens the dialog; the imported range's caches are evicted and the rule evaluator re-triggered before the hand-off to review; progress renders as a percentage. |
-| `BankStatementImporter/import_utils.ts` | One removal: the top-level `currency` that `get_statement_details` never returns. It is why `data.currency` type-checked while resolving to `undefined`, and the compiler is now what guarantees no such read exists. |
-| `pages/BankStatementImporter.tsx` | The single-flight upload chain, server-owned log identity with a private-file relink, pre-log failure rows, the third per-file badge state with `Completed` outranking a stale marker, the statement's own currency on the closing balance, and the dialog mount. |
-| `pages/ViewBankStatementImportLog.tsx` | Three lines reordered: `loading → error → no data`. The no-data guard ran first, and `useFrappeGetCall` reports no data on a *failed* read too — so every refusal rendered a blank page with no message and no way back. |
-| `README.md` | This file, replacing the stock Vite scaffold text. |
-| Nine `*.test.{ts,tsx}` files | The suites listed under [Testing](#suites). |
+Six of the twenty-two are application source, and each edit is small and carries a comment at its
+site explaining itself:
+
+| File | Op | The change |
+| --- | --- | --- |
+| `package.json` | update | Four scripts (`test`, `test:coverage`, `typecheck`, `typecheck:vitest-config`), seven exactly-pinned test dependencies, and the [`resolutions` override](#the-resolutions-override--do-not-remove-it). |
+| `yarn.lock` | update | Regenerated by the install that added those seven packages. It is committed deliberately: `yarn install --frozen-lockfile` is the documented install command, and it cannot resolve the new dependencies from a lockfile that predates them. |
+| `proxyOptions.ts` | update | Two lines: an `import type` for the Node HTTP request type, and the parameter annotation that removes the one implicit-`any` error in the package. |
+| `README.md` | update | This file, replacing the stock Vite scaffold text. |
+| `bankRecAtoms.ts` | update | Five plain in-memory constructs appended to the sixteen atoms already there — the dialog payload, the per-log failure markers, the pre-log failure map and its key function, and the reconcile single-flight guard — each traced in the file to the requirement that forces it. No existing atom and no persisted key is touched. |
+| `utils.ts` | update | The total server-message readers (`readServerMessages` / `readErrorText`), the reconcile rejection handler (dialog + fail-closed selection clear + revalidation), the single-flight guard, the authoritative-currency rehydration with its fail-closed clear when the selected account is absent from a permission-filtered response, and `useSelectedBankAccountCurrency()`. |
+| `MatchAndReconcile.tsx` | update | Four sites: the dialog mount, the currency advisory, the already-reconciled guard on the confirm control, and the shared in-flight guard on every candidate row. |
+| `CSV/StatementDetails.tsx` | update | The import outcome now requires a `Completed` doc from the server; the rejection callback *takes* the error, records the per-file failure and opens the dialog; the imported range's caches are evicted before the hand-off to review; progress renders as a percentage. It posts to **one** endpoint — the document-method bridge — and deliberately does **not** call the rule evaluator (see [Residual risks](#residual-risks-and-known-gaps)). |
+| `pages/BankStatementImporter.tsx` | update | The single-flight upload chain; server-owned log identity, with the uploaded private file deleted if the log insert is refused and the relink retried once then reported as an actionable warning; pre-log failure rows; the third per-file badge state with `Completed` outranking a stale marker; the statement's own currency on the closing balance; and the dialog mount. |
+| `BankRecErrorDialog.tsx` | create | The dismissible dialog, composed from the existing `AlertDialog` and `ErrorBanner`, with server markup reduced to an element/attribute allow-list — parsed inside a detached, spec-inert `<template>` — before it is rendered. |
+| `vitest.config.ts`, `src/test/setup.ts`, `src/test/factories.ts` | create | The runner configuration, the Desk-runtime harness and the fixtures. |
+| Eight `*.test.{ts,tsx}` files | create | The suites listed under [Testing](#suites). |
+| `bank_transaction_rule/test_bank_transaction_rule.py` | update | Two appended test methods covering rule-based auto-match. Additive only — none of the twenty existing tests is touched. |
 
 The same care as the frozen list applies to `vitest.config.ts`'s independence from
 `vite.config.ts` and to the `resolutions` field: both look like tidy-up candidates and both are
 load-bearing, which is why each has its own section above.
+
+## Residual risks and known gaps
+
+**Read this before treating anything above as a security guarantee.** Everything here was
+identified during review of this change set and is *not* fixed by it, because the fix falls outside
+the paths this change set may touch (see [Scope boundaries](#scope-boundaries) and
+[Intentionally unchanged files](#intentionally-unchanged-files)). Each entry names where the problem
+lives, what it means in practice, and what closing it requires — so the team that owns that code can
+act on it rather than rediscover it.
+
+Nothing below is mitigated by a client-side control. The client-side controls this package *does*
+add — the already-reconciled guard, the shared single-flight guard, the fail-closed selection clear,
+the private upload, the redacted diagnostics, the sanitising error dialog — are defence in depth.
+**They are not authorisation, and they are not atomicity.**
+
+### Server-side: authorisation and atomicity
+
+These live in banking controllers this change set treats as reference-only. The SPA calls them, so
+they bound what the workflow can honestly promise.
+
+| # | Where | What it means in practice | What closing it requires |
+| --- | --- | --- | --- |
+| R1 | `bank_reconciliation_tool.py` `reconcile_vouchers` → `bank_transaction.py` `add_payment_entries` | The already-reconciled state check and the allocation/clearance/save are **not atomic**. Two authorised concurrent requests can both read the same stale `unallocated_amount`, both clear vouchers, and last-write-win the parent and its child rows. This is why FM1 above does not claim that a partial or duplicate posting is impossible in general. | Lock and reload the Bank Transaction, or use an atomic conditional state transition around the guard, the allocation, the clearance and the save. |
+| R2 | `bank_statement_import_log.py` `insert_transactions` | The `status == "Completed"` check has no row lock or claim state, so two concurrent calls for the same log can both parse and both insert — duplicating submitted Bank Transactions. | Atomically claim an in-progress state, or row-lock the log, before parsing and inserting. |
+| R3 | `bank_reconciliation_tool.py` `get_linked_payments` | No explicit read-permission check on the named transaction, no Bank Account resource validation, no permission-aware voucher predicates, no result bound, and no HTTP-method restriction — so a predictable transaction name can enumerate candidate vouchers and run an expensive query. | Explicit document checks, server-derived scope, permission-aware queries, an allowed-type list, date and result bounds, and a GET-only declaration. |
+| R4 | `bank_transaction_rule.py` `run_rule_evaluation` | Authorises an **unscoped background write across every company and every bank account** on `Bank Transaction` *read* permission alone. This is why the statement-import step deliberately does not call it, and why its test suite asserts that it never does: rule evaluation of imported rows is left server-owned inside `insert_transactions`. | Require manager/write authority and an authorised company/account scope, or evaluate only server-owned imported rows. Deduplicate and rate-limit the jobs. |
+| R5 | `bank_transaction.py` `unreconcile_transaction` | State-changing but reachable by **GET**, which Frappe does not CSRF-check — so an authorised victim can be induced to clear allocations and cancel vouchers. | Restrict to POST and add GET/CSRF rejection tests. |
+| R6 | `bank_statement_import_log.py` | A statement yielding **zero** valid transactions still reports progress 100, triggers rule evaluation and saves `Completed`. The UI refuses to submit an empty import, but a direct document-method call is not the UI. | Reject an empty final transaction set on the server, before any side effect or status change. |
+| R7 | `bank_transaction.py` `validate_currency` / `before_update_after_submit` | `validate_currency()` is invoked from `validate()`, which `update_after_submit` does not run — so **no currency check happens during a reconcile**. This is exactly why the FM5 advisory is described above as a client-side observation and nothing more. | Validate currency explicitly on the reconcile/update-after-submit path, inside the same transaction lock as R1. |
+| R8 | `bank_reconciliation_tool.py` balance and count endpoints; `bank_account.py` | The client-supplied company is not bound to the Bank Account; the closing-balance read lacks an explicit named-account check; and the older-transaction count bypasses permissions, which can make it an existence oracle through differing responses. | Derive company server-side, check account read permission explicitly, use one permission-aware query, and answer an empty result without a differential exception. |
+| R9 | `bank_reconciliation_tool.py` `reconcile_vouchers`; `bank_transaction.py` voucher clearance | Transaction write permission is not checked until the final save; voucher clearance is written through permission-bypassing DB writes; and a client-supplied `is_new_voucher` flag governs later cancellation provenance. | Check transaction write authority before any read or mutation, validate voucher scope and permission, and derive the reconciliation type from the server-owned creation flow. |
+
+### Client-side gaps this change set does not close
+
+| # | Where | What it means in practice | What closing it requires |
+| --- | --- | --- | --- |
+| R10 | `src/components/ui/markdown.tsx`, consumed by `src/components/ui/error-banner.tsx` | The shared renderer runs `rehypeRaw` with **no sanitiser**, so every *inline* `ErrorBanner` call site in the SPA (roughly twenty of them) renders server-supplied HTML as live DOM. The dismissible error dialog this change set adds is sanitised; those pre-existing inline sites are not. | One shared AST sanitiser after `rehypeRaw` in the primitive, with a restrictive schema, tested across every `ErrorBanner`/`Markdown` consumer. That is a design-system change, which this change set may not make. |
+| R11 | `bankRecAtoms.ts` `selectedBankAccountAtom` and `bankRecActionLog` | The full selected bank row — including `bank_account_no`, the company and GL identifiers — is persisted in **user-agnostic** `localStorage`, and the action log persists transaction/voucher metadata in user-agnostic `sessionStorage`. On a shared browser, a previous user's financial metadata survives until something overwrites it. This change set narrows the window (a selection absent from a permission-filtered response is now discarded) but does not change the storage shape, because the existing persistence conventions are frozen. | Persist a site + user + company namespaced **identifier only**, resolve the details from current permission-filtered data, and clear on logout, user change or a missing row. Namespace or clear the action log the same way. |
+| R12 | `src/pages/ViewBankStatementImportLog.tsx` | Its guards test no-data before error, and `useFrappeGetCall` reports no data on a failed read as well as a pending one — so a refused `get_statement_details` renders a blank page with no message and no way back. | Reorder to loading → error → no data. Three lines, in a file this change set may not touch. |
+| R13 | Frontend test suite | Every suite runs under **jsdom**, which does not execute scripts and does not load subresources. Structural sanitisation, fail-closed behaviour and the allow-list are all specified well, but no committed suite proves real-browser script or network behaviour, and the frontend gate is not wired into CI. | A browser-driven regression suite and a CI job running `yarn typecheck && yarn lint && yarn test:coverage`. Both are file additions outside this change set's permitted paths — the frontend gate in particular is a workflow-file change belonging to whoever owns those files. |
+| R14 | Backend test suite | Nothing exercises concurrent posts, cross-session races, or the authorisation boundaries in R3–R5. Note that such a test is not merely absent but currently *inexpressible*: observing one session's uncommitted transaction from another requires `frappe.db.commit()`, which this repository's own `semgrep/test-correctness.yml` bans in tests at ERROR severity. | Integration tests outside the unit harness, or a harness change agreed with whoever owns those rules. |
+
+### Dependencies
+
+`yarn audit` currently exits **12** (17 high, 1 moderate paths across 582 dependencies). **Every
+vulnerable version below is byte-identical at the baseline this change set started from** — verified
+by comparing the committed `yarn.lock` — so none was introduced by the seven test packages added
+here, and none is upgraded here either: the change set freezes every existing runtime and development
+dependency at its current version. Deliberately recorded rather than silently upgraded, with the
+fixed floors, so the upgrade can be planned as its own change:
+
+| Package | Resolved | Fixed floor | Reachability |
+| --- | --- | --- | --- |
+| `brace-expansion` | `1.1.15` | `>= 1.1.18` | CPU/OOM advisories in development and CI glob tooling; not in the browser bundle. |
+| `brace-expansion` | `5.0.7` | `>= 5.0.9` | OOM and mitigation-bypass advisories in the same tooling. |
+| `react-router` | `8.1.0` | `>= 8.3.0` | An RSC-action CSRF advisory. This SPA uses the declarative `BrowserRouter`, not the unstable RSC mode, so the advisory is not on a path this app takes — upgrade as defence in depth. |
+| `socket.io-parser` | `4.2.6` | `>= 4.2.7` | Zero-attachment reconstruction memory exhaustion. The intended peer is the trusted same-origin Frappe server. |
+| `ws` | `8.17.1` | `>= 8.21.0` | Uninitialised-memory disclosure and fragment OOM. The browser build uses the native `WebSocket`; the Node fallback and tooling remain exposed. |
+
+Yarn Classic also emits Node's `DEP0169` deprecation warning for `url.parse()`. It is tooling-only
+and is fixed by migrating the package manager, which is a repository-wide governance decision.
+
+### Development server
+
+The `dev` script binds to **`0.0.0.0`**, and `proxyOptions.ts` derives the upstream Frappe hostname
+from the incoming request's **`Host` header**. Together those mean:
+
+- **Run the dev server on a trusted network only.** Bound to `0.0.0.0` it is reachable by anything
+  that can route to the machine, and Vite documents that permissive host handling exposes a
+  development server to DNS-rebinding attacks.
+- If you need it reachable off-host, prefer an explicit `server.allowedHosts` list over the open
+  binding, and keep the binding on the loopback interface wherever the workflow allows it.
+- Because the proxy target is derived from an untrusted header, a request carrying a crafted `Host`
+  influences where the dev server forwards it. This affects **development only** — `build` produces
+  static assets served by Frappe itself, and `proxyOptions.ts` is not part of the bundle.
+
+Both are frozen files here (`vite.config.ts`, and `proxyOptions.ts` beyond its one type annotation),
+so this is guidance rather than a configuration change.
+

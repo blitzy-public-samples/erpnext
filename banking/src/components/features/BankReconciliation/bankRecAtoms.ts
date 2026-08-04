@@ -99,16 +99,52 @@ export const bankRecActionLog = atomWithStorage<ActionLog[]>('bank-rec-action-lo
     getOnInit: true,
 })
 
-/* ------------------------------------------------------------------------------------------------
+/* ================================================================================================
  * Failure-path state (FM1, FM2, FM3)
  *
- * Both atoms below are PLAIN IN-MEMORY atoms, and that deliberately diverges from every atom above
- * them: the bank selection, date range and match filters are `atomWithStorage` over localStorage and
- * the action log is `createJSONStorage` over sessionStorage. Neither of these may be persisted,
- * because both describe a single observation of a single failed request. A reload re-reads the
- * server, so a dialog or a marker that survived it would be asserting something about state nobody
- * has re-checked.
- * ---------------------------------------------------------------------------------------------- */
+ * PERSISTENCE. Every construct below is a PLAIN IN-MEMORY atom, and that deliberately diverges from
+ * every atom above it: the bank selection, date range and match filters are `atomWithStorage` over
+ * localStorage and the action log is `createJSONStorage` over sessionStorage. None of these may be
+ * persisted, because each describes a single observation of a single request. A reload re-reads the
+ * server, so a dialog, a marker or an in-flight guard that survived one would be asserting something
+ * about state nobody has re-checked - and, for the guard, would permanently disable an affordance no
+ * request is actually open for.
+ *
+ * ─── AAP STATE-CONTRACT RECONCILIATION ──────────────────────────────────────────────────────────
+ *
+ * The Agent Action Plan's change list for this file (sections 0.6.1.3 and 0.9.1.3) is "two additive
+ * atoms": the error-dialog payload and the import-failure map. FIVE constructs are delivered. Each
+ * additional one is traced to the binding requirement that forces it and to the reason it cannot be
+ * folded into one of the two planned atoms, so the divergence is auditable rather than implicit:
+ *
+ *   1. `bankRecErrorDialogAtom`          — PLANNED. FM1/FM3's dismissible dialog payload.
+ *   2. `bankRecImportFailuresAtom`       — PLANNED. FM2's per-file marker, keyed by import-log name
+ *                                          exactly as section 0.3.1.6 specifies.
+ *   3. `bankRecPreLogImportFailuresAtom` — FM2, second half. Section 0.3.1.6 requires the indicator
+ *                                          "per file", and the entire first half of the upload chain
+ *                                          runs BEFORE any import log exists, so its refusals have no
+ *                                          log name to be keyed by. They cannot live in (2) without
+ *                                          making "is this log known to have failed?" answerable by
+ *                                          something that is not a log name. See the atom's own note.
+ *   4. `preLogImportFailureKey`          — the key function for (3). A pure helper, not state; it is
+ *                                          here rather than in a consumer because both the writer
+ *                                          (the upload chain) and the reader (the importer list) must
+ *                                          compute the identical key.
+ *   5. `bankRecReconcileInFlightAtom`    — FM1's "no partial or duplicate postings". Section 0.4.2.6
+ *                                          judged in-flight duplication already covered by the
+ *                                          existing per-hook `loading` disable; that judgement does
+ *                                          not hold, because every candidate voucher row instantiates
+ *                                          `useReconcileTransaction` for ITSELF, so `loading` is
+ *                                          per-instance and one row learns nothing about another
+ *                                          row's open request. Two candidates for the same
+ *                                          transaction could each dispatch a `reconcile_vouchers`
+ *                                          post. Shared state is the only thing every row can read,
+ *                                          which is why this is an atom and not hook state.
+ *
+ * Nothing here changes any of the sixteen pre-existing atoms, and no persisted key is added, renamed
+ * or re-shaped - so the AAP's other state commitment, that the existing persistence conventions are
+ * preserved (sections 0.2.10 and 0.8.4), holds exactly.
+ * ============================================================================================== */
 
 /**
  * The rejection currently being reported by the shared dismissible error dialog, or `null` when the

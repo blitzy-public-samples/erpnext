@@ -340,6 +340,30 @@ describe('BankRecErrorDialog', () => {
 	 *
 	 * TEXT is never sacrificed to achieve this: each case that removes an element also asserts the
 	 * words the server wrote are still readable.
+	 *
+	 * ⚠️ WHAT THIS ENVIRONMENT CAN AND CANNOT PROVE, STATED UP FRONT
+	 * -------------------------------------------------------------
+	 * These suites run under jsdom, which by design does NOT execute scripts and does NOT load
+	 * subresources unless explicitly configured to, and `vitest.config.ts` configures neither. That has
+	 * one important consequence for how the assertions below must be read:
+	 *
+	 *   • What they DO prove, and prove well: the STRUCTURAL outcome of the sanitiser as rendered
+	 *     through the real shared pipeline - which elements and attributes survive, which are dropped
+	 *     with their contents, which are unwrapped, and that the server's text is never lost. That is a
+	 *     genuine and sufficient specification of the allow-list.
+	 *   • What they CANNOT prove: that a real browser executes nothing and requests nothing. An
+	 *     assertion that `window.__pwned` is undefined, or that no request was issued, is satisfied by
+	 *     jsdom's defaults whether or not the sanitiser works - so it is not security evidence and is
+	 *     not claimed as such anywhere below. Every such assertion is labelled and kept only as a
+	 *     tripwire against a future harness that DOES enable those features.
+	 *
+	 * The browser-level guarantee rests instead on the parsing primitive and is asserted directly, in
+	 * `parses untrusted markup on an INERT document, never on this one`: HTML specifies that
+	 * `<template>` contents are inert - scripts do not run, images do not load - and that inertness is
+	 * a property of the owner document, which IS observable here. Real-browser network behaviour is
+	 * verified separately at runtime rather than simulated here; no browser-automation spec is added,
+	 * because the Agent Action Plan rejects one (section 0.9.3.3: `frappe/` is immutable and ERPNext
+	 * maintains no Cypress suite of its own).
 	 * ============================================================================================== */
 	describe('sanitises server-controlled markup before the shared renderer sees it', () => {
 		/** Every message body the banner rendered, as markup, so element-level absence can be asserted. */
@@ -347,7 +371,7 @@ describe('BankRecErrorDialog', () => {
 			getBanner().querySelector('[data-slot="alert-description"]')?.innerHTML ?? ''
 
 		describe('script and active content', () => {
-			it('drops a <script> subtree outright and executes nothing', () => {
+			it('drops a <script> subtree, its source text with it, and keeps the words around it', () => {
 				renderDialog(
 					makeServerMessagesError(
 						'Import refused<script>window.__pwned = true</script> — fix the file'
@@ -356,13 +380,46 @@ describe('BankRecErrorDialog', () => {
 
 				expect(getBannerMarkup()).not.toContain('<script')
 				expect(getBanner().querySelector('script')).toBeNull()
-				// The script's own SOURCE goes with it: it is code, not text a reader should see.
+				// The script's own SOURCE goes with it: it is code, not text a reader should see. This is
+				// the substantive claim - `textContent` on an unsanitised tree WOULD include it, so this
+				// assertion fails if the subtree is unwrapped instead of dropped.
 				expect(getBannerMessageText()).not.toContain('window.__pwned')
-				expect((window as unknown as Record<string, unknown>).__pwned).toBeUndefined()
 
 				// ...and the server's actual words survive on both sides of it.
 				expect(getBannerMessageText()).toContain('Import refused')
 				expect(getBannerMessageText()).toContain('fix the file')
+
+				// TRIPWIRE ONLY, not evidence: jsdom does not execute scripts, so this holds regardless of
+				// the sanitiser. Kept so a harness that ever enables script execution fails here.
+				expect((window as unknown as Record<string, unknown>).__pwned).toBeUndefined()
+			})
+
+			it('parses untrusted markup on an INERT document, never on this one', () => {
+				/*
+				 * The one browser-level guarantee this environment CAN establish, and the reason the
+				 * sanitiser parses into a detached `<template>` rather than with `DOMParser`.
+				 *
+				 * Ordering is the whole problem: an allow-list walk necessarily runs AFTER parsing, so a
+				 * primitive whose parse fetches subresources has already made the request by the time the
+				 * hostile node is removed. HTML answers that by specifying `<template>` contents as inert -
+				 * scripts do not run, images do not load - because they are owned by the "template contents
+				 * owner", a document with NO browsing context. That absence of a browsing context is
+				 * observable, and it is what is asserted here: `defaultView === null`, and an owner document
+				 * that is not the one this dialog renders into.
+				 *
+				 * Asserted on the primitive rather than on the component because the property belongs to the
+				 * primitive; the rest of this block then proves the walk applied to it. A regression to
+				 * `DOMParser`, or to `innerHTML` on a detached ordinary element, is what this is aimed at.
+				 */
+				const template = document.createElement('template')
+				template.innerHTML = '<img src="https://tracker.example/pixel.png"><p>text</p>'
+
+				expect(template.content.ownerDocument).not.toBe(document)
+				expect(template.content.ownerDocument.defaultView).toBeNull()
+				// The nodes really are parsed - the inertness is not the absence of a parse - so the walk
+				// downstream has something to filter.
+				expect(template.content.querySelector('img')).not.toBeNull()
+				expect(template.content.querySelector('p')?.textContent).toBe('text')
 			})
 
 			it('strips every event-handler attribute while keeping the element and its text', () => {
@@ -403,13 +460,17 @@ describe('BankRecErrorDialog', () => {
 				expect(getBannerMessageText()).toContain('Refused')
 			})
 
-			it('drops an off-origin <img>, so opening the dialog issues no outbound request', () => {
+			it('drops an off-origin <img> and leaves no trace of its host in the rendered markup', () => {
+				// The claim is STRUCTURAL: no `<img>` element and no surviving reference to the host. Whether
+				// a real browser would have requested it is not decided here (see this block's header) -
+				// what is decided is that nothing is left in the document for it to request.
 				renderDialog(
 					makeServerMessagesError('Refused <img src="https://tracker.example/pixel.png"> here')
 				)
 
 				expect(getBanner().querySelector('img')).toBeNull()
 				expect(getBannerMarkup()).not.toContain('tracker.example')
+				expect(getBannerMessageText()).toContain('Refused')
 			})
 
 			/**
@@ -875,7 +936,10 @@ describe('BankRecErrorDialog', () => {
 			expect(store.get(selectionAtom)).toHaveLength(1)
 		})
 
-		it('issues no request and triggers no revalidation of its own', async () => {
+		it('makes no SDK call and triggers no revalidation of its own', async () => {
+			// A claim about this dialog's own behaviour, proven against the mocked SDK seams rather than
+			// against the network: revalidation belongs to the calling hook, and a dialog that re-posted or
+			// re-read on dismissal would be acting on state the reviewer has only acknowledged.
 			const user = userEvent.setup()
 			renderDialog(makeServerMessagesError('Nothing was posted'))
 

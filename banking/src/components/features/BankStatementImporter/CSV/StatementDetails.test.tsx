@@ -103,10 +103,17 @@ const IMPORT_PROGRESS_CHANNEL = 'bank-rec-statement-import-progress'
 
 const RUN_DOC_METHOD = 'run_doc_method'
 /**
- * The EXISTING whitelisted rule evaluator, dotted path spelt exactly as the server exposes it. It is
- * called after a confirmed import to close the pre-commit stamping race: `insert_transactions` calls
- * it itself, but only to `frappe.enqueue` and only BEFORE it sets `status = "Completed"` and saves, so
- * the enqueued job can run against an open transaction, see none of the new rows and stamp nothing.
+ * The whitelisted rule evaluator, spelt exactly as the server exposes it — and asserted here as an
+ * endpoint this surface MUST NOT CALL.
+ *
+ * `run_rule_evaluation` authorises an UNSCOPED background write across every company and every bank
+ * account on nothing more than `Bank Transaction` READ permission
+ * (`bank_transaction_rule.py:237-241`). Calling it from the import step would let any reviewer who can
+ * merely read transactions trigger a global re-stamp, which is not this surface's decision to make.
+ * Evaluation of the rows an import created is server-owned: `insert_transactions` calls it itself.
+ *
+ * A client-side call was present at one point and has been removed, so the constant is retained
+ * purely as the negative assertion's subject.
  */
 const RUN_RULE_EVALUATION = 'erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule.run_rule_evaluation'
 const INSERT_TRANSACTIONS = 'insert_transactions'
@@ -227,30 +234,35 @@ const makeImportLog = (overrides: Partial<BankStatementImportLog> = {}): BankSta
  * The statement currency is a field of the DOCUMENT (`doc.currency`), populated read-only from the
  * bank account's GL account currency; see {@link makeImportLog}.
  *
- * ⚠️ A TOP-LEVEL `currency` MEMBER IS STILL ATTACHED HERE, ON PURPOSE, AND IT IS A TRAP.
- * `GetStatementDetailsResponse` no longer declares one — that declaration was the type hole this
- * defect came through, and removing it makes the COMPILER the guarantee that no screen reads it. This
- * fixture keeps injecting one anyway, at runtime, because the two guarantees catch different
- * regressions: the compiler catches a static `data.currency` read, while the sentinel catches a
- * dynamic one (an index access, a spread into a currency argument, a `Record<string, unknown>` hop).
- * The value cannot be mistaken for a real currency, so a regressed screen formats with it and fails
- * loudly, rather than silently falling back to the system default the way an omitted key does — which
- * is exactly how the original defect stayed invisible.
+ * ⚠️ THE TOP-LEVEL `currency` MEMBER IS A TRAP, AND IT IS THE ONLY GUARANTEE LEFT.
+ * `GetStatementDetailsResponse` DECLARES a top-level `currency` that `get_statement_details` never
+ * returns, and that declaration is why `formatCurrency(…, data.currency)` once type-checked while
+ * resolving to `undefined` at runtime — silently formatting every statement figure in the system
+ * default currency instead of the statement's own. `import_utils.ts` is not a path this work may
+ * change (Agent Action Plan sections 0.8.1.6 and 0.9.1: it is not among the authorised files), so the
+ * declaration stays and the compiler CANNOT be the guarantee here.
+ *
+ * This sentinel is therefore load-bearing rather than belt-and-braces. It is a value no currency
+ * formatter can mistake for a real code, so any screen that reads the phantom field — statically, or
+ * dynamically through an index access, a spread into a currency argument or a `Record<string,
+ * unknown>` hop — renders it and fails loudly, instead of silently falling back to the system default
+ * the way an omitted key does. That silent fallback is exactly how the original defect stayed
+ * invisible. Every figure on the page must resolve through `data.doc.currency`.
  */
 const PHANTOM_RESPONSE_CURRENCY = 'NOT-A-CURRENCY'
 
 const makeStatementDetails = (
 	overrides: Partial<GetStatementDetailsResponse> = {}
 ): GetStatementDetailsResponse => ({
-	// Attached through a spread rather than as a literal member: the interface deliberately has no
-	// such property, so naming it inline would be an excess-property error rather than a trap.
-	...({ currency: PHANTOM_RESPONSE_CURRENCY } as Record<string, unknown>),
 	doc: makeImportLog(),
 	conflicting_transactions: CONFLICTING_TRANSACTIONS,
 	final_transactions: FINAL_TRANSACTIONS,
 	date_format: DETECTED_DATE_FORMAT,
 	raw_data: RAW_DATA,
-	...overrides
+	...overrides,
+	// Resolved AFTER the spread, so a `Partial` override cannot widen the declared `string` to
+	// `string | undefined`, while an explicit override still wins over the sentinel.
+	currency: overrides.currency ?? PHANTOM_RESPONSE_CURRENCY
 })
 
 const importCall = vi.fn<(params: Record<string, unknown>) => Promise<unknown>>()
@@ -576,12 +588,55 @@ describe('StatementDetails', () => {
 			})
 			expect(importCall).toHaveBeenCalledWith({ docs: data.doc, method: INSERT_TRANSACTIONS })
 
-			// The import itself is ONE server-side operation on the document-method bridge. The only
-			// other endpoint this surface uses is the EXISTING rule evaluator, dispatched afterwards to
-			// close the pre-commit stamping race (see the TC2 block below); no endpoint is added.
-			expect(postEndpointsUsed()).toEqual([RUN_DOC_METHOD, RUN_RULE_EVALUATION])
-			expect(otherPostCall).toHaveBeenCalledTimes(1)
-			expect(otherPostCall).toHaveBeenCalledWith({})
+			// The import is ONE server-side operation on the document-method bridge, and it is the ONLY
+			// endpoint this surface posts to. `toEqual` on a single-element list is the whole point: it
+			// fails if any further endpoint is ever instantiated here, which is what keeps the
+			// globally-scoped rule evaluator out (see RUN_RULE_EVALUATION and the negative assertion
+			// below). No endpoint is added anywhere.
+			expect(postEndpointsUsed()).toEqual([RUN_DOC_METHOD])
+			expect(postEndpointsUsed()).not.toContain(RUN_RULE_EVALUATION)
+			expect(otherPostCall).not.toHaveBeenCalled()
+		})
+
+		it('never posts to the globally-scoped rule evaluator, on either outcome', async () => {
+			/*
+			 * SEC-07. The endpoint authorises an unscoped background write across every company and every
+			 * bank account on `Bank Transaction` READ permission alone, so an importer that triggers it
+			 * escalates a read into a system-wide write. Both outcomes are checked because a call placed
+			 * on the success path only is still a call, and because the constant alone would be satisfied
+			 * by a suite that never drove an import at all.
+			 */
+			importCall.mockResolvedValue({
+				docs: [makeImportLog({
+					status: 'Completed',
+					start_date: SAVED_START_DATE,
+					end_date: SAVED_END_DATE
+				})]
+			})
+
+			renderStatementDetails(makeStatementDetails())
+			await clickImport()
+
+			await waitFor(() => {
+				expect(screen.getByText(RECONCILIATION_SENTINEL)).toBeInTheDocument()
+			})
+
+			expect(postEndpointsUsed()).not.toContain(RUN_RULE_EVALUATION)
+			expect(otherPostCall).not.toHaveBeenCalled()
+		})
+
+		it('never posts to the globally-scoped rule evaluator when the import is refused', async () => {
+			importCall.mockRejectedValue(makeServerMessagesError('Invalid Bank Account'))
+
+			const { store } = renderStatementDetails(makeStatementDetails())
+			await clickImport()
+
+			await waitFor(() => {
+				expect(store.get(bankRecErrorDialogAtom)).not.toBeNull()
+			})
+
+			expect(postEndpointsUsed()).not.toContain(RUN_RULE_EVALUATION)
+			expect(otherPostCall).not.toHaveBeenCalled()
 		})
 
 		it('moves the reconciliation range to the range the SERVER resolved, then navigates', async () => {
@@ -731,11 +786,14 @@ describe('StatementDetails', () => {
 		 *       the very common case of importing a statement covering the range already on screen, the
 		 *       import appeared to have done nothing at all.
 		 *
-		 *  TC2  `insert_transactions` calls `run_rule_evaluation()` itself, but that function only
-		 *       permission-checks and `frappe.enqueue`s, and it does so BEFORE the method sets
-		 *       `status = "Completed"` and saves. The job can therefore start against an open
-		 *       transaction, see none of the new rows, and stamp nothing — leaving the first review with
-		 *       no suggested matches and nothing to re-trigger evaluation until the nightly scheduler.
+		 *  TC2  is deliberately NOT this client's job. `insert_transactions` calls
+		 *       `run_rule_evaluation()` server-side, and the whitelisted endpoint authorises an unscoped
+		 *       global write on read permission alone — so this surface does not call it. The ordering
+		 *       weakness that follows is the server's and is recorded as a residual risk rather than
+		 *       worked around here: the enqueue happens BEFORE `status = "Completed"` is saved, so the
+		 *       job can start against an open transaction, see none of the new rows and stamp nothing,
+		 *       leaving the first review without suggested matches until the nightly scheduler runs. The
+		 *       negative assertions above are what keep the client out of it.
 		 * ══════════════════════════════════════════════════════════════════════════════════════════ */
 		describe('the handover to review', () => {
 
@@ -835,47 +893,12 @@ describe('StatementDetails', () => {
 				expect(frappeSWRMutate).not.toHaveBeenCalled()
 			})
 
-			it('triggers the EXISTING rule evaluator once the import is confirmed', async () => {
+			it('hands the reviewer over even when every cache refresh is refused', async () => {
+				// The refresh is an optimisation of the FIRST look at the list, not a precondition for it:
+				// the rows exist either way, and SWR fetches on mount as it normally would. Blocking the
+				// handover on it would trade a stale list for no list.
 				completedImport()
-
-				renderStatementDetails(makeStatementDetails())
-				await clickImport()
-
-				await waitFor(() => {
-					expect(screen.getByText(RECONCILIATION_SENTINEL)).toBeInTheDocument()
-				})
-
-				// The whitelisted endpoint that already exists, called with no arguments so the server
-				// keeps its own `force_evaluate=False` default — evaluation stays idempotent, filtering
-				// on `is_rule_evaluated = 0`.
-				expect(postEndpointsUsed()).toContain(RUN_RULE_EVALUATION)
-				expect(otherPostCall).toHaveBeenCalledTimes(1)
-				expect(otherPostCall).toHaveBeenCalledWith({})
-			})
-
-			it('evaluates BEFORE re-reading the list, so the stamps are on their way', async () => {
-				completedImport()
-				const order: string[] = []
-				otherPostCall.mockImplementation(async () => { order.push('evaluate'); return {} })
-				frappeSWRMutate.mockImplementation(async () => { order.push('revalidate'); return undefined })
-
-				renderStatementDetails(makeStatementDetails())
-				await clickImport()
-
-				await waitFor(() => {
-					expect(screen.getByText(RECONCILIATION_SENTINEL)).toBeInTheDocument()
-				})
-
-				expect(order[0]).toBe('evaluate')
-				expect(order).toContain('revalidate')
-			})
-
-			it('still hands over when the rule evaluator itself is refused', async () => {
-				// Evaluation is an optimisation of the FIRST review, not a precondition for it: the rows
-				// exist either way, and the nightly scheduler will stamp them. Blocking the handover on it
-				// would trade a missing badge for a missing list.
-				completedImport()
-				otherPostCall.mockRejectedValue(makeFrappeError({ message: 'Not permitted' }))
+				frappeSWRMutate.mockRejectedValue(new Error('offline'))
 
 				renderStatementDetails(makeStatementDetails())
 				await clickImport()

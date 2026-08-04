@@ -2115,21 +2115,31 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			expect(currencyAdvisoryChip(transactionRow(mismatched))).toBeNull()
 		})
 
-		it('shows no chip when the selected account is absent from the current list', async () => {
-			// An account the current response does not contain is another "not known": the row the
-			// selection names may have been renamed, disabled or moved to another company. Again the
-			// persisted snapshot would say "mismatch", and again it must not be consulted.
-			renderWorkbench({
+		it('withdraws the whole surface when the selected account is absent from the current list', async () => {
+			/*
+			 * SEC-12: an account a SUCCESSFUL, permission-filtered response does not contain is not merely
+			 * an account whose currency is unknown - it is an account this reviewer, in this company, is
+			 * no longer being shown at all: disabled, deleted, de-permissioned, or belonging to a company
+			 * the selector has moved away from. `useGetBankAccounts` therefore DISCARDS the persisted
+			 * selection rather than leaving a `localStorage` snapshot of a bank account and its account
+			 * number on screen.
+			 *
+			 * So the advisory is not merely absent here; the row it would have annotated is gone with the
+			 * selection, which is a stronger and more useful guarantee than "no chip". Asserting the row's
+			 * absence is what pins it: an implementation that kept the stale selection would render the
+			 * row again and fail here even if it also suppressed the chip.
+			 */
+			const { store } = renderWorkbench({
 				transactions: [mismatched],
 				bankListState: 'without-selected-account',
 				persistedAccountCurrency: TEST_CURRENCY
 			})
 
 			await waitFor(() => {
-				expect(transactionRow(mismatched)).toBeInTheDocument()
+				expect(store.get(selectedBankAccountAtom)).toBeNull()
 			})
 
-			expect(currencyAdvisoryChip(transactionRow(mismatched))).toBeNull()
+			expect(screen.queryByText(mismatched.description as string)).not.toBeInTheDocument()
 		})
 
 		/*

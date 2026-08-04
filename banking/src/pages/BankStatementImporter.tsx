@@ -2,6 +2,7 @@ import BankPicker from "@/components/features/BankReconciliation/BankPicker"
 import { bankRecErrorDialogAtom, bankRecImportFailuresAtom, bankRecPreLogImportFailuresAtom, preLogImportFailureKey, selectedBankAccountAtom } from "@/components/features/BankReconciliation/bankRecAtoms"
 import BankRecErrorDialog from "@/components/features/BankReconciliation/BankRecErrorDialog"
 import CompanySelector from "@/components/features/BankReconciliation/CompanySelector"
+import { readErrorText } from "@/components/features/BankReconciliation/utils"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
@@ -15,16 +16,16 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { H3, Paragraph } from "@/components/ui/typography"
 import { useCurrentCompany } from "@/hooks/useCurrentCompany"
 import { formatDate } from "@/lib/date"
-import { getErrorMessage } from "@/lib/frappe"
 import { flt, formatCurrency } from "@/lib/numbers"
 import _ from "@/lib/translate"
 import { cn } from "@/lib/utils"
 import { BankStatementImportLog } from "@/types/Accounts/BankStatementImportLog"
-import { useFrappeCreateDoc, useFrappeFileUpload, useFrappeGetDocList, useFrappeUpdateDoc, type FrappeError } from "frappe-react-sdk"
+import { useFrappeCreateDoc, useFrappeDeleteDoc, useFrappeFileUpload, useFrappeGetDocList, useFrappeUpdateDoc, type FrappeError } from "frappe-react-sdk"
 import { useAtom, useAtomValue, useSetAtom } from "jotai"
 import { ListIcon, Loader2Icon } from "lucide-react"
 import { useEffect, useMemo, useRef, useState } from "react"
 import { useNavigate } from "react-router"
+import { toast } from "sonner"
 
 
 const BankStatementImporter = () => {
@@ -47,9 +48,62 @@ const BankStatementImporter = () => {
      * phase of the chain, which is precisely the window a second click could exploit.
      */
     const { updateDoc, loading: updateLoading, error: updateError } = useFrappeUpdateDoc()
+    /*
+     * F-15/SEC-09: used for ONE purpose only - removing a private statement upload that no
+     * `Bank Statement Import Log` ended up owning. See the rejection branch of `createDoc` below.
+     * `loading` is deliberately not read into the button's disabled expression: the delete only ever
+     * runs on a chain that has already failed, and `uploadInFlight` covers that whole chain anyway.
+     */
+    const { deleteDoc } = useFrappeDeleteDoc()
 
     const setErrorDialog = useSetAtom(bankRecErrorDialogAtom)
     const setPreLogFailures = useSetAtom(bankRecPreLogImportFailuresAtom)
+
+    /**
+     * Points the uploaded private `File` at the import log the server minted, retrying ONCE, and
+     * resolves to whether the link now holds.
+     *
+     * The retry is here because the two plausible causes of a refusal have opposite prognoses: a
+     * transient one (a lost connection, a lock contended by the insert that has only just committed)
+     * succeeds on a second attempt, while a permanent one (no write permission on `File`) fails
+     * identically and is then reported to the reviewer. One retry distinguishes them at the cost of a
+     * single request, and there is nothing to be gained from a third.
+     *
+     * It NEVER rejects. The relink is housekeeping on a statement that is already stored and already
+     * importable, so a rejection escaping here would be routed to the chain's error handler and
+     * reported as an import failure that did not happen - and would write a per-file FAILED marker for
+     * a statement the server accepted. Returning a boolean instead keeps that distinction in the type.
+     */
+    const relinkStatementFile = async (fileName: string, importLogName: string): Promise<boolean> => {
+        const patch = {
+            attached_to_doctype: "Bank Statement Import Log",
+            attached_to_name: importLogName,
+            attached_to_field: "file"
+        }
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                await updateDoc("File", fileName, patch)
+                return true
+            } catch {
+                /*
+                 * A FIXED, redacted diagnostic (CWE-532/CWE-209), and development-only: the response body
+                 * of a `File` refusal can carry a server traceback, and a browser console is readable by
+                 * anything running in the page. The reviewer's account of this failure is the warning
+                 * toast raised by the caller, which names the log and nothing else.
+                 */
+                if (import.meta.env.DEV) {
+                    console.warn('[bank-rec] could not relink the statement file', {
+                        file: fileName,
+                        import_log: importLogName,
+                        attempt: attempt + 1
+                    })
+                }
+            }
+        }
+
+        return false
+    }
 
     /*
      * THE SINGLE-FLIGHT GUARD, in two halves, because one value cannot do both jobs.
@@ -136,32 +190,59 @@ const BankStatementImporter = () => {
                 // which is also why the file has to exist before the log can.
                 file: uploaded.file_url,
                 bank_account: bankAccountName
-            }).then((doc) => ({ uploaded, doc }))
+            }).then((doc) => ({ uploaded, doc }), (createError: FrappeError) => {
+                /*
+                 * F-15, LIFECYCLE: the upload is TRANSACTIONAL WITH THE LOG, or it is cleaned up.
+                 *
+                 * The private statement has to exist before the log can, because `file` is `reqd: 1` -
+                 * so there is an unavoidable window in which a `File` exists that no document owns. If
+                 * the insert is refused in that window (no permission on the System-Manager-only
+                 * DocType, an invalid or disabled bank account, a validation failure) the chain used to
+                 * simply report the error and leave the upload behind: a private copy of the
+                 * reviewer's bank statement, attached to nothing, outside any log's erasure lifecycle
+                 * and invisible in the UI that would let anyone find it again.
+                 *
+                 * Deleting it closes that window. The delete is BEST-EFFORT and its own refusal is
+                 * swallowed, because the reviewer must be told about the insert failure - the actionable
+                 * one - and not about the cleanup of something they never knew existed; a `File` that
+                 * cannot be deleted is a server-side matter, and the DEV diagnostic below is where it
+                 * is recorded. The ORIGINAL error is re-thrown either way, so the handler at the end of
+                 * the chain reports what the server actually refused.
+                 */
+                return deleteDoc("File", uploaded.name).catch(() => {
+                    if (import.meta.env.DEV) {
+                        console.warn('[bank-rec] could not remove the unattached statement file', {
+                            file: uploaded.name
+                        })
+                    }
+                }).then(() => {
+                    throw createError
+                })
+            })
         ).then(({ uploaded, doc }) =>
             /*
              * F-15, second half: point the private `File` at the name the SERVER chose.
              * `File.validate_attachment_references` permits exactly this update, and it is what makes
              * the statement appear among the log's attachments and share its lifecycle.
              *
-             * A refused relink does NOT withhold navigation and does NOT record a failure. Nothing was
-             * refused that matters to the reviewer: the log exists, its `file` field holds the URL, and
-             * the import reads that URL - so the statement is fully importable. Reporting this as an
-             * import failure would be false, and blocking on it would strand a reviewer whose upload in
-             * fact succeeded. It is surfaced as a development-only diagnostic instead, carrying no
-             * response body.
+             * RETRIED ONCE, then REPORTED. A refused relink is not an import failure - the log exists,
+             * its `file` field holds the URL, and the import reads that URL, so the statement is fully
+             * importable and blocking here would strand a reviewer whose upload in fact succeeded. But it
+             * is not nothing either, and it used to be swallowed into a development-only console line:
+             * the statement then sits outside the log's attachment list, so deleting the log does not
+             * take it with it, and nobody is in a position to know. So the failure is now surfaced as an
+             * actionable warning naming the log, which is the identity a reviewer or administrator needs
+             * to finish the job by hand. No per-file FAILED marker is written, because nothing the
+             * reviewer asked for was refused.
              */
-            updateDoc("File", uploaded.name, {
-                attached_to_doctype: "Bank Statement Import Log",
-                attached_to_name: doc.name,
-                attached_to_field: "file"
-            }).catch(() => {
-                if (import.meta.env.DEV) {
-                    console.warn('[bank-rec] could not relink the statement file', {
-                        file: uploaded.name,
-                        import_log: doc.name
+            relinkStatementFile(uploaded.name, doc.name).then((relinked) => {
+                if (!relinked) {
+                    toast.warning(_("The statement file could not be linked to its import log."), {
+                        duration: 8000,
+                        description: _("The import itself is unaffected and can proceed. Ask an administrator to attach the file to import log {0} so it is removed with it.", [doc.name])
                     })
                 }
-            }).then(() => {
+
                 navigate(`/statement-importer/${doc.name}`)
             })
         ).then(undefined, (error: FrappeError) => {
@@ -188,7 +269,7 @@ const BankStatementImporter = () => {
                 next.set(failureKey, {
                     bankAccount: bankAccountName,
                     fileName: file.name,
-                    message: getErrorMessage(error)
+                    message: readErrorText(error)
                 })
                 return next
             })

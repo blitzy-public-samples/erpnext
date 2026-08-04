@@ -1135,7 +1135,7 @@ export const makeImportFailures = (
  *
  * ─── Which symbols are stubbed, and which must NOT be ────────────────────────────────
  * Every `from 'frappe-react-sdk'` import in the APPLICATION code under `src/` was
- * enumerated: SEVENTEEN distinct symbols, of which THIRTEEN are used as VALUES and are
+ * enumerated: EIGHTEEN distinct symbols, of which FOURTEEN are used as VALUES and are
  * stubbed below, while four — `FrappeError`, `FrappeConfig`, `SWRConfiguration` and
  * `Filter` — appear only in type positions.
  *
@@ -1143,13 +1143,13 @@ export const makeImportFailures = (
  * esbuild drops an import specifier that survives only in a type annotation, so the name
  * never reaches Vite's import validation. Verified rather than assumed — `BankBalance.tsx`
  * (`FrappeConfig`), `LinkFieldCombobox.tsx` (`Filter`), `MatchAndReconcile.tsx` and
- * `pages/BankStatementImporter.tsx` all import cleanly against this thirteen-symbol mock.
+ * `pages/BankStatementImporter.tsx` all import cleanly against this fourteen-symbol mock.
  * Adding a runtime stub for a type would be inventing an export the library does not have.
  *
  * This module itself imports five FURTHER type-only names — `Key`, `GetDocListArgs`,
  * `FileArgs`, `FrappeFileUploadResponse` and `DocumentUpdateEventData` — to derive the
  * contracts in §8a. They are `import type` and therefore erased outright, so the runtime
- * surface a suite receives is still exactly thirteen symbols.
+ * surface a suite receives is still exactly fourteen symbols.
  *
  * ─── Return shapes are the library's, not a guess ────────────────────────────────────
  * Each shape below was read off `frappe-react-sdk/dist/lib/index.d.ts`, then cross-checked
@@ -1344,6 +1344,29 @@ interface MockedUpdateDocResult {
 }
 
 type MockedUpdateDocHook = () => MockedUpdateDocResult
+
+/**
+ * The `deleteDoc` returned by `useFrappeDeleteDoc` (`index.d.ts:238`). It resolves to
+ * `{ message: string }`, which the library documents as `"ok"` on success.
+ *
+ * `pages/BankStatementImporter.tsx` uses this seam for exactly one purpose - removing the private
+ * statement upload when the `Bank Statement Import Log` insert that would have owned it is refused -
+ * so the spy exists to make that CLEANUP assertable. `docname` is optional in the library signature
+ * and is mirrored as such here rather than narrowed, so a call that forgot it still type-checks and is
+ * caught by an assertion instead of by the compiler refusing to model the real API.
+ */
+type MockedDeleteDoc = (doctype: string, docname?: string | null) => Promise<{ message: string }>
+
+/** `index.d.ts:236-249`, which carries no `result` member and types `error` as `Error | null | undefined`. */
+interface MockedDeleteDocResult {
+	deleteDoc: MockedDeleteDoc
+	loading: boolean
+	error: FrappeError | null | undefined
+	isCompleted: boolean
+	reset: () => void
+}
+
+type MockedDeleteDocHook = () => MockedDeleteDocResult
 
 /**
  * The `upload` returned by `useFrappeFileUpload` (`index.d.ts:433`). It resolves to the File
@@ -1681,6 +1704,19 @@ export const frappeUpdateDoc = vi.fn<MockedUpdateDoc>(() =>
 )
 
 /**
+ * Stable spy for the `deleteDoc` returned by `useFrappeDeleteDoc`.
+ *
+ * RESOLVES by default, unlike every other imperative operation here, and the exception is deliberate.
+ * This seam is only ever reached on a chain that has ALREADY failed - it removes the private statement
+ * upload that the refused import-log insert would have owned - and the production code deliberately
+ * swallows its refusal so the reviewer is told about the insert failure rather than about the cleanup.
+ * A rejecting default would therefore exercise the swallow branch in every failure test rather than
+ * the cleanup itself, which is the behaviour the SEC-09 assertions are about. A suite that wants the
+ * refusal drives it explicitly with `frappeDeleteDoc.mockRejectedValue(...)`.
+ */
+export const frappeDeleteDoc = vi.fn<MockedDeleteDoc>(async () => ({ message: 'ok' }))
+
+/**
  * Stable spy for the `upload` returned by `useFrappeFileUpload`. Rejects unconfigured, because
  * `pages/BankStatementImporter.tsx:59-69` feeds `file.file_url` into the import log it creates
  * next — an unconfigured success would silently attach `undefined`.
@@ -1942,6 +1978,13 @@ export const frappeSDKMock = {
 		isCompleted: false,
 		reset: vi.fn<() => void>(() => undefined)
 	})),
+	useFrappeDeleteDoc: vi.fn<MockedDeleteDocHook>(() => ({
+		deleteDoc: frappeDeleteDoc,
+		loading: false,
+		error: null,
+		isCompleted: false,
+		reset: vi.fn<() => void>(() => undefined)
+	})),
 
 	// `progress` completes the library's shape and is read by the importer's upload UI.
 	useFrappeFileUpload: vi.fn<MockedFileUploadHook>(() => ({
@@ -2009,6 +2052,7 @@ export const resetFrappeSDKMock = (): void => {
 		frappePostCall,
 		frappeCreateDoc,
 		frappeUpdateDoc,
+		frappeDeleteDoc,
 		frappeFileUpload,
 		frappeEmitDocOpen,
 		frappeEmitDocClose
@@ -2024,8 +2068,8 @@ export const resetFrappeSDKMock = (): void => {
 
 /**
  * The exact surface {@link createFrappeSDKMock} hands back in place of `frappe-react-sdk`:
- * the eleven hook spies of {@link frappeSDKMock} plus {@link FrappeContextMock} and
- * {@link FrappeProviderMock} — the thirteen runtime symbols enumerated in this module's
+ * the twelve hook spies of {@link frappeSDKMock} plus {@link FrappeContextMock} and
+ * {@link FrappeProviderMock} — the fourteen runtime symbols enumerated in this module's
  * header, and nothing else.
  *
  * Naming that surface is what lets the helper's `overrides` parameter be a typed partial of
@@ -2044,12 +2088,12 @@ export type FrappeSDKMockExports = typeof frappeSDKMock & {
 
 /**
  * THE shared module mock — what a `vi.mock` factory hands back in place of `frappe-react-sdk`. It
- * exposes the eleven hook spies plus `FrappeContext` and `FrappeProvider`, and none of the four
+ * exposes the twelve hook spies plus `FrappeContext` and `FrappeProvider`, and none of the four
  * type-only symbols. The spies are the same identities exported above.
  *
  *     vi.mock('frappe-react-sdk', () => createFrappeSDKMock())
  *
- * It exposes the thirteen runtime symbols and none of the four type-only ones. The spies
+ * It exposes the fourteen runtime symbols and none of the four type-only ones. The spies
  * are the same identities exported above, so a suite mocks and asserts through
  * {@link frappeSDKMock}, {@link frappePostCall} and {@link frappeSWRMutate} without
  * re-deriving anything.

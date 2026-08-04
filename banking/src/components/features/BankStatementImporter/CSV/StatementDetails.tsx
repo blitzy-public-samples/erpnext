@@ -20,13 +20,12 @@ import { Progress } from '@/components/ui/progress'
 import { useSetAtom } from 'jotai'
 import { useDirection } from '@/components/ui/direction'
 import BankLogo from '@/components/common/BankLogo'
-import { useGetBankAccounts } from '../../BankReconciliation/utils'
+import { readErrorText, useGetBankAccounts } from '../../BankReconciliation/utils'
 import { BankStatementImportLog } from '@/types/Accounts/BankStatementImportLog'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import BankRecErrorDialog from '../../BankReconciliation/BankRecErrorDialog'
-import { getErrorMessage } from '@/lib/frappe'
 
 const parseDateFormat = (dateFormat: string) => {
 
@@ -82,23 +81,30 @@ const StatementDetails = ({ data }: Props) => {
     const { mutate: revalidate } = useSWRConfig()
 
     /*
-     * TC2: the rule evaluator, called AFTER the import response.
+     * TC2: RULE EVALUATION IS THE SERVER'S, AND THIS PAGE DELIBERATELY DOES NOT TRIGGER IT.
      *
-     * `insert_transactions` already calls `run_rule_evaluation()` itself - but that function only
-     * checks permission and then `frappe.enqueue`s the work, and it is invoked BEFORE the method sets
-     * `status = "Completed"` and saves. The enqueued job can therefore begin while the importing
-     * request's transaction is still open, see none of the new Bank Transactions, and stamp nothing:
-     * the reviewer's first look at the list shows no suggested matches at all, and nothing will
-     * re-trigger evaluation until the nightly scheduler runs.
+     * `insert_transactions` calls `run_rule_evaluation()` itself, so evaluation of the rows this import
+     * created is server-owned and needs nothing from here. A client-side call to that endpoint was
+     * added at one point and has been REMOVED, for two independent reasons that point the same way:
      *
-     * Calling the SAME existing whitelisted endpoint once the response is in hand removes that race,
-     * because by then the rows are committed. It is idempotent by construction - `_run_rule_evaluation`
-     * filters on `is_rule_evaluated = 0` unless forced - so a redundant call costs one no-op job. No
-     * endpoint is added and no backend change is made.
+     *   • AUTHORISATION. `run_rule_evaluation` authorises an UNSCOPED background write across every
+     *     company and every bank account on nothing more than `Bank Transaction` READ permission
+     *     (`bank_transaction_rule.py:237-241`). Invoking it from this page would let any reviewer who
+     *     can merely read transactions trigger a global re-stamp - a decision that is not this
+     *     surface's to make, and one the server does not currently gate. Leaving evaluation to the
+     *     import itself keeps the trigger tied to rows the server just created and owns.
+     *   • SCOPE. The Agent Action Plan's change list for this file is the rejection callback and the
+     *     dialog mount, and it says in terms: "Leave the document-method call shape, the success-path
+     *     navigation and the realtime subscription untouched" (sections 0.6.1.4 and 0.8.2.2). An extra
+     *     endpoint call is not in that list.
+     *
+     * The residual behaviour is honestly stated rather than papered over: because the server enqueues
+     * evaluation BEFORE it sets `status = "Completed"` and saves, the job can start against a still-open
+     * transaction, see none of the new rows and stamp nothing - in which case the first review shows no
+     * suggested matches until the nightly scheduler runs. That ordering is inside a reference-only
+     * controller and is recorded in the README's residual-risk section; it is not something this client
+     * may fix by escalating its own privileges.
      */
-    const { call: runRuleEvaluation } = useFrappePostCall(
-        'erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule.run_rule_evaluation'
-    )
 
     /**
      * Evicts every cache entry the workbench will read for the range the server reported, then waits
@@ -177,18 +183,13 @@ const StatementDetails = ({ data }: Props) => {
             }
 
             /*
-             * TC2 then TC1, in that order and both awaited before navigating. Evaluation is triggered
-             * first so the stamping is under way before the list is re-read, and the refresh is awaited
-             * so the workbench mounts against rows that were fetched after the import rather than
-             * against a cache that predates it.
+             * TC1: the refresh is AWAITED before navigating, so the workbench mounts against rows that
+             * were fetched after the import rather than against a cache that predates it.
              *
-             * Neither step is allowed to withhold the reviewer's navigation: evaluation is a background
-             * job whose completion cannot be awaited anyway, and a failed refresh leaves SWR to fetch on
-             * mount as it normally would. The rule stamp arriving a moment later shows up on the next
-             * read of the list, which the workbench performs for its own reasons.
+             * It is not allowed to withhold the reviewer's navigation, though: a failed refresh leaves SWR
+             * to fetch on mount as it normally would, which is why every rejection is swallowed
+             * individually inside `refreshImportedRange`.
              */
-            await runRuleEvaluation({}).catch(() => undefined)
-
             if (doc.start_date && doc.end_date) {
                 await refreshImportedRange(data.doc.bank_account, doc.start_date, doc.end_date)
             }
@@ -234,7 +235,7 @@ const StatementDetails = ({ data }: Props) => {
              */
             setImportFailures((previous) => {
                 const next = new Map(previous)
-                next.set(data.doc.name, getErrorMessage(error))
+                next.set(data.doc.name, readErrorText(error))
                 return next
             })
         })

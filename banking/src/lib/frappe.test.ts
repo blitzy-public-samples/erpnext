@@ -25,21 +25,25 @@
  *   QUIRK 5  `_error_message` is APPENDED to the parsed server messages, never substituted
  *            for them (`frappe.ts:137-145`).
  *
- * The numbering starts at 3 deliberately. Two further quirks were FIXED rather than pinned, because
- * each was a way for malformed server data to deny the reviewer the refusal they were owed - the
- * opposite of what this module exists to do. Both fixes are pinned by the
- * `the envelope guard` block below, which is the specification of the parser's TOTALITY:
+ * The numbering starts at 3 deliberately. QUIRKS 1 and 2 are not pinned as quirks but specified as
+ * LIMITS, in the `the envelope is parsed UNGUARDED` block below, because they are the reason the
+ * failure paths this work delivers do not call this module directly:
  *
- *   FIXED 1  The outer `JSON.parse` of `_server_messages` was unguarded, so a truncated or
- *            rewritten body THREW out of the parser. That expression sat in front of every safety
- *            action the failure paths perform - the dismissible dialog, the per-file import failure
- *            marker, the cleared selection and the cache revalidations - so a malformed envelope
- *            abandoned all of them at once. It is now caught, and a valid-JSON-but-not-an-array
- *            envelope is discarded for the same reason (`.map` would throw on it).
- *   FIXED 2  A SINGLY encoded element rendered as `undefined` (an empty banner body), and an entry
- *            carrying no `message` did the same while ALSO suppressing the fallback chain, because
- *            a non-empty array short-circuits it. The first is normalised into a message object,
- *            the second is dropped so the fallback can run.
+ *   LIMIT 1  The outer `JSON.parse` of `_server_messages` is UNGUARDED, and `.map` then runs on
+ *            whatever it produced - so a truncated body, a rewritten body, or valid JSON that is not
+ *            an array THROWS out of this parser.
+ *   LIMIT 2  A SINGLY encoded element survives as a bare string with no `message` property, and an
+ *            entry carrying no `message` is kept - which also SUPPRESSES the
+ *            `_error_message` -> `exception` -> `message` fallback chain, because that chain is gated
+ *            on the parsed array being empty.
+ *
+ * This module is FROZEN by the Agent Action Plan - section 0.6.4 records the error-transport envelope
+ * as "Unchanged - reused verbatim by the new dialog", and section 0.9.1 does not list it among the
+ * paths this work may touch - so neither limit is fixed here. Both are handled instead by
+ * `readServerMessages` / `readErrorText` in
+ * `components/features/BankReconciliation/utils.ts`, which every failure path in this feature reads
+ * through and whose TOTALITY is specified in `utils.test.ts`. The block below pins this module's real
+ * behaviour so that the wrapper's reason for existing cannot quietly stop being true.
  *
  * Every other behaviour below is asserted as the module BEHAVES, never as it ideally would: this
  * suite is a specification of the shipped parser, so a future change to it fails here rather than
@@ -206,98 +210,118 @@ describe('getErrorMessages', () => {
 
 	/*
 	 * ══════════════════════════════════════════════════════════════════════════════════════════════
-	 * THE ENVELOPE GUARD — the parser is TOTAL
+	 * THE ENVELOPE IS PARSED UNGUARDED — this shared parser is NOT total
 	 *
 	 * `_server_messages` is server-controlled and only CONVENTIONALLY well formed: a truncated
-	 * response, a proxy that rewrote the body, or a `frappe.msgprint` variant can deliver something
-	 * else entirely. Because `getErrorMessages` runs FIRST in every rejection handler in this feature
-	 * — ahead of raising the dismissible dialog, recording the per-file import-failure marker,
-	 * clearing the selection a refused reconcile attempt was made against and revalidating the
-	 * authoritative reads — a throw here does not garble a message, it abandons all of them.
+	 * response, a proxy that rewrote the body, or an intermediary's HTML error page can deliver
+	 * something else entirely. This module parses it with a bare `JSON.parse` and then `.map`s the
+	 * result, so all three of those inputs throw out of `getErrorMessages` — during RENDER, in the case
+	 * of `ErrorBanner` (`error-banner.tsx:34`).
 	 *
-	 * Each case therefore asserts BOTH halves: that the call does not throw, AND that resolution
-	 * falls through to text the reviewer can act on.
+	 * The module is frozen (see the file header), so the cases below are specified as LIMITS rather
+	 * than repaired. They exist to pin exactly what a caller must protect itself from: every failure
+	 * path in the Bank Reconciliation feature therefore reads through `readServerMessages` /
+	 * `readErrorText` in `components/features/BankReconciliation/utils.ts`, whose totality — and its
+	 * recovery of this module's own fallback chain — is specified in `utils.test.ts`.
 	 * ══════════════════════════════════════════════════════════════════════════════════════════════ */
-	describe('the envelope guard — malformed `_server_messages`', () => {
-		it('does not throw on an envelope that is not valid JSON at all', () => {
+	describe('the envelope is parsed UNGUARDED — specified LIMITS of the shared parser', () => {
+		it('LIMIT 1: THROWS on an envelope that is not valid JSON at all', () => {
 			const truncated = makeFrappeError({
 				_server_messages: '[{"message":"Reconciliation refu',
 				exception: 'frappe.exceptions.ValidationError: Bank Account is disabled'
 			})
 
-			expect(() => getErrorMessages(truncated)).not.toThrow()
+			expect(() => getErrorMessages(truncated)).toThrow()
 		})
 
-		it('treats an unparseable envelope as carrying no messages, so `exception` resolves', () => {
-			const result = getErrorMessages(
-				makeFrappeError({
-					_server_messages: '[{"message":"Reconciliation refu',
-					exception: 'frappe.exceptions.ValidationError: Bank Account is disabled'
-				})
-			)
-
-			expect(result).toHaveLength(1)
-			expect(result[0].message.trim()).toBe('Bank Account is disabled')
-		})
-
-		it('falls all the way through to `message` when the envelope is unparseable and there is no exception', () => {
-			const result = getErrorMessages(
-				makeFrappeError({ _server_messages: 'not json', exception: '', message: 'Internal Server Error' })
-			)
-
-			expect(result).toStrictEqual([
-				{ message: 'Internal Server Error', title: 'Error', indicator: 'red' }
-			])
-		})
-
-		it('discards a NON-ARRAY envelope rather than calling `.map` on it', () => {
-			// Valid JSON, wrong shape. Reaching `.map` on an object is its own TypeError, which is why
-			// the array test is part of the guard rather than a nicety.
+		it('LIMIT 1: THROWS on a NON-ARRAY envelope, because `.map` is reached on an object', () => {
+			// Valid JSON, wrong shape — a distinct failure from the parse above, and the reason the
+			// wrapper has to guard the `.map` as well as the `JSON.parse`.
 			const nonArray = makeFrappeError({
 				_server_messages: '{"message":"Reconciliation refused"}',
 				exception: '',
 				message: 'Internal Server Error'
 			})
 
-			expect(() => getErrorMessages(nonArray)).not.toThrow()
-			expect(getErrorMessages(nonArray)).toStrictEqual([
-				{ message: 'Internal Server Error', title: 'Error', indicator: 'red' }
-			])
+			expect(() => getErrorMessages(nonArray)).toThrow()
 		})
 
-		it('discards a JSON string envelope, which is valid JSON and also not an array', () => {
+		it('LIMIT 1: THROWS on a JSON string envelope, which is valid JSON and also not an array', () => {
 			const stringEnvelope = makeFrappeError({
 				_server_messages: '"Reconciliation refused"',
 				exception: '',
 				message: 'Internal Server Error'
 			})
 
-			expect(getErrorMessages(stringEnvelope)).toStrictEqual([
-				{ message: 'Internal Server Error', title: 'Error', indicator: 'red' }
-			])
+			expect(() => getErrorMessages(stringEnvelope)).toThrow()
 		})
 
-		it('NORMALISES a singly encoded element into a message object', () => {
-			// Frappe's convention is DOUBLE encoding, so the inner parse is what turns each element
-			// into an object. When an element is a bare string that parse throws and the string used to
-			// survive as-is — and a plain string has no `message`, so the banner rendered `undefined`:
-			// an empty body, for a refusal that did carry text.
+		it('LIMIT 1: the throw defeats `getErrorMessage` too, so a toast description is not safe either', () => {
+			const malformed = makeFrappeError({
+				_server_messages: '[{"message":"trunc',
+				exception: 'frappe.exceptions.ValidationError: Invalid Bank Account'
+			})
+
+			expect(() => getErrorMessage(malformed)).toThrow()
+		})
+
+		it('LIMIT 2: leaves a SINGLY encoded element as a bare string with no `message`', () => {
+			// Frappe's convention is DOUBLE encoding, so the inner parse is what turns each element into
+			// an object. When an element is a bare string that parse throws and the string survives — and
+			// a plain string has no `message`, so the banner renders `undefined`: an empty body, for a
+			// refusal that did carry text.
 			const result = getErrorMessages(
 				makeFrappeError({
 					_server_messages: JSON.stringify(['Bank Transaction is already fully reconciled'])
 				})
 			)
 
-			expect(result).toStrictEqual([
-				{
-					message: 'Bank Transaction is already fully reconciled',
-					title: 'Error',
-					indicator: 'red'
-				}
-			])
+			expect(result).toStrictEqual(['Bank Transaction is already fully reconciled'])
+			expect(result[0].message).toBeUndefined()
 		})
 
-		it('keeps every element of a MIXED envelope, normalising only the singly encoded one', () => {
+		it('LIMIT 2: KEEPS an entry carrying no `message`, which suppresses the `exception` fallback', () => {
+			// The array is non-empty, and the fallback chain is gated on it being empty — so an entry that
+			// says nothing actively denies the reviewer text that was available on a different field.
+			const result = getErrorMessages(
+				makeFrappeError({
+					_server_messages: JSON.stringify([JSON.stringify({ title: 'Message', indicator: 'red' })]),
+					exception: 'frappe.exceptions.ValidationError: The bank account is disabled'
+				})
+			)
+
+			expect(result).toStrictEqual([{ title: 'Message', indicator: 'red' }])
+			expect(getErrorMessage(makeFrappeError({
+				_server_messages: JSON.stringify([JSON.stringify({ title: 'Message', indicator: 'red' })]),
+				exception: 'frappe.exceptions.ValidationError: The bank account is disabled'
+			}))).not.toContain('disabled')
+		})
+
+		it('LIMIT 2: keeps an entry whose `message` is the empty string, for the same reason', () => {
+			const result = getErrorMessages(
+				makeFrappeError({
+					_server_messages: JSON.stringify([JSON.stringify({ message: '', title: 'Message' })]),
+					exception: '',
+					message: 'Internal Server Error'
+				})
+			)
+
+			expect(result).toStrictEqual([{ message: '', title: 'Message' }])
+		})
+
+		it('LIMIT 2: keeps an element that is neither a string nor an object', () => {
+			const result = getErrorMessages(
+				makeFrappeError({
+					_server_messages: JSON.stringify([JSON.stringify(42), JSON.stringify(null)]),
+					exception: '',
+					message: 'Internal Server Error'
+				})
+			)
+
+			expect(result).toStrictEqual([42, null])
+		})
+
+		it('parses a MIXED envelope element by element, so a well-formed sibling is unaffected', () => {
 			const result = getErrorMessages(
 				makeFrappeError({
 					_server_messages: JSON.stringify([
@@ -313,70 +337,14 @@ describe('getErrorMessages', () => {
 				title: 'Message',
 				indicator: 'yellow'
 			})
-			expect(result[1].message).toBe('Singly encoded')
-			// Order is the server's, and the FIRST entry is the one `error-banner.tsx:39` themes on —
-			// so normalising the second must not promote its red indicator over the server's amber.
+			expect(result[1]).toBe('Singly encoded')
+			// Order is the server's, and the FIRST entry is the one `error-banner.tsx:37` themes on.
 			expect(result[0].indicator).toBe('yellow')
 		})
 
-		it('DROPS an entry carrying no `message`, so the fallback chain is not suppressed', () => {
-			// The drop is what makes this work: an entry left in place both rendered an empty body and,
-			// because the array was non-empty, prevented `exception` from being consulted at all.
-			const result = getErrorMessages(
-				makeFrappeError({
-					_server_messages: JSON.stringify([JSON.stringify({ title: 'Message', indicator: 'red' })]),
-					exception: 'frappe.exceptions.ValidationError: The bank account is disabled'
-				})
-			)
-
-			expect(result).toHaveLength(1)
-			expect(result[0].message.trim()).toBe('The bank account is disabled')
-		})
-
-		it('drops an entry whose `message` is the empty string for the same reason', () => {
-			const result = getErrorMessages(
-				makeFrappeError({
-					_server_messages: JSON.stringify([JSON.stringify({ message: '', title: 'Message' })]),
-					exception: '',
-					message: 'Internal Server Error'
-				})
-			)
-
-			expect(result).toStrictEqual([
-				{ message: 'Internal Server Error', title: 'Error', indicator: 'red' }
-			])
-		})
-
-		it('drops a message-less entry but keeps its well-formed siblings', () => {
-			const result = getErrorMessages(
-				makeFrappeError({
-					_server_messages: JSON.stringify([
-						JSON.stringify({ title: 'Message', indicator: 'red' }),
-						JSON.stringify({ message: 'Voucher is over-allocated', title: 'Message', indicator: 'red' })
-					])
-				})
-			)
-
-			expect(result).toStrictEqual([
-				{ message: 'Voucher is over-allocated', title: 'Message', indicator: 'red' }
-			])
-		})
-
-		it('drops an entry that is neither a string nor an object', () => {
-			const result = getErrorMessages(
-				makeFrappeError({
-					_server_messages: JSON.stringify([JSON.stringify(42), JSON.stringify(null)]),
-					exception: '',
-					message: 'Internal Server Error'
-				})
-			)
-
-			expect(result).toStrictEqual([
-				{ message: 'Internal Server Error', title: 'Error', indicator: 'red' }
-			])
-		})
-
 		it('treats an EMPTY array envelope as no messages, exactly as an absent one', () => {
+			// The one malformed-ish shape this module handles on its own: an empty array leaves the
+			// parsed list empty, so the fallback chain runs as designed.
 			const result = getErrorMessages(
 				makeFrappeError({ _server_messages: '[]', exception: '', message: 'Internal Server Error' })
 			)
@@ -386,36 +354,23 @@ describe('getErrorMessages', () => {
 			])
 		})
 
-		it('still appends `_error_message` when the envelope itself was unparseable', () => {
-			// The append is independent of the envelope, so a malformed envelope must not cost the
-			// reviewer a message that arrived on a DIFFERENT field.
-			const result = getErrorMessages(
+		it('appends `_error_message` only when the envelope parsed, so an unreadable one costs it', () => {
+			// The append itself is independent of the envelope, but it is placed AFTER the parse — so a
+			// malformed envelope denies the reviewer a message that arrived on a different field.
+			expect(() => getErrorMessages(
 				makeFrappeError({
 					_server_messages: 'not json',
 					_error_message: APPENDED_ERROR_MESSAGE
 				})
-			)
+			)).toThrow()
 
-			expect(result).toStrictEqual([
+			expect(getErrorMessages(
+				makeFrappeError({ _server_messages: '[]', _error_message: APPENDED_ERROR_MESSAGE })
+			)).toStrictEqual([
 				{ message: APPENDED_ERROR_MESSAGE, title: 'Error', indicator: 'red' }
 			])
 		})
 	})
-
-	describe('getErrorMessage over a malformed envelope', () => {
-		it('returns usable text instead of throwing, so the toast and the marker still get one', () => {
-			// `StatementDetails` writes this exact string into the per-file import-failure marker, so a
-			// throw here would leave the importer list with no failed state for a file that DID fail.
-			const malformed = makeFrappeError({
-				_server_messages: '[{"message":"trunc',
-				exception: 'frappe.exceptions.ValidationError: Invalid Bank Account'
-			})
-
-			expect(() => getErrorMessage(malformed)).not.toThrow()
-			expect(getErrorMessage(malformed).trim()).toBe('Invalid Bank Account')
-		})
-	})
-
 
 	describe('path 2 — the appended _error_message', () => {
 		it('reports an _error_message on its own as a single red Error entry', () => {

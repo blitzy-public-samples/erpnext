@@ -12,7 +12,7 @@ import type { FrappeError } from "frappe-react-sdk"
 import { useAtom } from "jotai"
 import { useEffect, useMemo, useRef } from "react"
 import { bankRecErrorDialogAtom } from "./bankRecAtoms"
-import { getErrorMessages } from "@/lib/frappe"
+import { readServerMessages } from "./utils"
 import _ from "@/lib/translate"
 
 /* ================================================================================================
@@ -27,12 +27,20 @@ import _ from "@/lib/translate"
  * the shipped stylesheet is enough to paint an opaque full-viewport overlay over the very dialog
  * reporting the failure.
  *
- * The sanitiser lives HERE, at this dialog's own boundary, rather than in the shared renderer. That
- * renderer is one of the 43 design-system primitives the Agent Action Plan freezes as reference-only
- * (AAP section 0.8.1.6, "must not appear in the diff"), so this new consumer is where the guard can
- * legitimately be placed. The consequence worth stating plainly: this closes the vector for the
- * surface FM1 introduced, and the pre-existing inline `ErrorBanner` call sites keep the shared
- * renderer's baseline behaviour.
+ * WHY THE SANITISER LIVES HERE AND NOT IN THE SHARED RENDERER. One shared boundary inside
+ * `ui/markdown.tsx` would protect every consumer at once and would be the better design in a codebase
+ * where that file could be edited. It cannot: `ui/markdown.tsx` is one of the 43 design-system
+ * primitives the Agent Action Plan lists as reference-only files that "must not appear in the diff"
+ * (AAP section 0.8.1.6), section 0.7.6 requires zero new primitives and zero design-system changes,
+ * section 0.2.2 confines this work to the authorised paths, and Success Criterion 4 (section 0.10.1.4)
+ * is verified by exactly that diff. Adding a `rehype-sanitize` plugin is barred on the same grounds -
+ * section 0.10.4 permits no dependency beyond the seven test packages section 0.5 enumerates.
+ *
+ * So this dialog - a NEW consumer, and the only new untrusted-markup sink this work introduces -
+ * is where the guard can legitimately be placed. Stated plainly rather than left implicit: this closes
+ * the vector for the surface FM1 introduced, and the pre-existing inline `ErrorBanner` call sites keep
+ * the shared renderer's baseline behaviour, which is a known residual risk recorded in the README
+ * rather than a solved problem.
  *
  * The result is handed to `ErrorBanner` as a re-encoded `_server_messages` envelope, so the parser,
  * the severity rule, the heading rule and the markdown rendering all remain the single shared
@@ -224,13 +232,36 @@ const sanitizeChildNodes = (parent: Node) => {
  * Filters one server message down to markup this dialog is prepared to render, and returns it
  * wrapped in a single `<div>`.
  *
- * TWO mechanisms, and both are load-bearing:
+ * THREE mechanisms, and all three are load-bearing:
  *
- * 1. The ALLOW-LIST walk above, applied to the message parsed as an inert document. `DOMParser`
- *    documents execute nothing and fetch nothing, so parsing is safe even before filtering, and the
- *    walk is what guarantees only allow-listed elements and attributes are re-serialised.
+ * 1. The INERT PARSING PRIMITIVE. Untrusted markup is parsed by assigning it to a detached
+ *    `<template>`'s `innerHTML`, NOT with `DOMParser`. This is the only parsing step in the chain and
+ *    the choice of primitive is a security decision rather than a stylistic one, because the walk in
+ *    (2) necessarily runs AFTER parsing - so whatever the parse itself does has already happened by
+ *    the time the first hostile node is removed.
  *
- * 2. The `<div>` WRAPPER, which suppresses markdown interpretation entirely. Without it the walk
+ *    `<template>` is the platform's explicit answer to that ordering problem. Its parsed contents live
+ *    in a `DocumentFragment` owned by the "template contents owner" - a document with NO browsing
+ *    context - and HTML specifies that template contents are INERT: scripts do not run, IMAGES DO NOT
+ *    LOAD, styles do not apply, media does not play. The guarantee is about the parse, so it holds for
+ *    the window this sanitiser cannot otherwise cover.
+ *
+ *    `DOMParser` was used here previously and is deliberately no longer: its documents are described
+ *    as inert with respect to SCRIPT execution, but not with the same unqualified guarantee about
+ *    subresource fetching, and MDN warns that a document it returns can still download resources
+ *    referenced by elements such as images and frames. A sanitiser whose safety depends on a
+ *    qualified guarantee is a sanitiser with a window in it - so `<img src="https://elsewhere/x">` in
+ *    a server message could have initiated a request before the walk below removed it, and a
+ *    same-origin one could have initiated a state-changing GET. Nothing about the filtering changed;
+ *    only the primitive the filtering is applied to.
+ *
+ * 2. The ALLOW-LIST walk above, applied depth-first to those inert nodes. It is what guarantees only
+ *    allow-listed elements and attributes are re-serialised. Note that the change of primitive makes
+ *    it do MORE work, not less: `DOMParser` put a leading `<script>` or comment into `<head>`, out of
+ *    reach of a walk over `<body>`, whereas a `<template>` keeps every node in one fragment where the
+ *    walk sees and removes it explicitly.
+ *
+ * 3. The `<div>` WRAPPER, which suppresses markdown interpretation entirely. Without it the walk
  *    would still leave a hole, because the sanitiser necessarily runs BEFORE the markdown parser
  *    the shared renderer owns: `![x](http://elsewhere/x.png)` is not HTML, so no HTML filter can
  *    see it, yet remark turns it into an `<img>` with an off-origin `src`, and a GFM autolink
@@ -241,9 +272,17 @@ const sanitizeChildNodes = (parent: Node) => {
  *    identically whether they are `<div>` or `<p>`, so the wrapper is invisible.
  */
 const sanitizeServerMessage = (markup: string): { markup: string, text: string } => {
-	const parsed = new DOMParser().parseFromString(markup, 'text/html')
-	sanitizeChildNodes(parsed.body)
-	return { markup: `<div>${parsed.body.innerHTML}</div>`, text: parsed.body.textContent ?? '' }
+	// Detached and never appended to the document: the fragment below belongs to the template contents
+	// owner, not to this page, so nothing here is ever laid out, styled or loaded.
+	const template = document.createElement('template')
+	template.innerHTML = markup
+
+	sanitizeChildNodes(template.content)
+
+	// `template.innerHTML` serialises the CONTENT fragment, so this is the sanitised markup and not the
+	// element wrapping it. `textContent` is read from the same filtered fragment, which is why the
+	// source of a dropped `<script>` cannot leak into the text - see {@link sanitizeToText}.
+	return { markup: `<div>${template.innerHTML}</div>`, text: template.content.textContent ?? '' }
 }
 
 /**
@@ -271,14 +310,21 @@ const encodeServerMessages = (messages: { message: string, title?: string, indic
  * keeps the heading readable.
  *
  * `_error_message`, `exception` and `exc` are cleared on the object handed onward. They are not
- * discarded information: `getErrorMessages` has already folded them into the message list being
- * re-encoded here, and leaving them in place would make the shared parser append `_error_message` a
- * SECOND time. Clearing `exc` additionally keeps the server traceback out of the rendered tree.
+ * discarded information: the parser has already folded them into the message list being re-encoded
+ * here, and leaving them in place would make the shared parser append `_error_message` a SECOND
+ * time. Clearing `exc` additionally keeps the server traceback out of the rendered tree.
+ *
+ * Re-encoding also makes what `ErrorBanner` receives WELL FORMED BY CONSTRUCTION, which matters
+ * because the banner parses `_server_messages` again for itself during render (`error-banner.tsx:34`)
+ * through the shared parser, and that parser throws on a malformed envelope. Reading the raw error
+ * through {@link readServerMessages} - the total wrapper in `./utils` - and handing the banner an
+ * envelope this function encoded is what keeps a malformed rejection from taking the dialog down
+ * instead of being reported by it.
  */
 const useSanitizedError = (error: FrappeError | null): FrappeError | null => useMemo(() => {
 	if (!error) return null
 
-	const messages = getErrorMessages(error)
+	const messages = readServerMessages(error)
 		.map((message) => ({
 			sanitized: sanitizeServerMessage(message.message ?? ''),
 			title: message.title === undefined ? undefined : sanitizeToText(message.title),
@@ -297,9 +343,9 @@ const useSanitizedError = (error: FrappeError | null): FrappeError | null => use
 			indicator: message.indicator
 		}))
 
-	// `getErrorMessages` is total and always resolves at least one entry for a non-null error, but a
-	// transport failure or an envelope carrying no readable text anywhere leaves nothing after the
-	// filter above - and a dialog that opens saying nothing is worse than one that admits it has no
+	// `readServerMessages` is total, but it can legitimately resolve NOTHING: a transport failure
+	// carries no server response at all, and an envelope the shared parser could not read carries no
+	// messages either - and a dialog that opens saying nothing is worse than one that admits it has no
 	// detail. The reviewer still gets the chrome, the heading and the Dismiss control.
 	const resolved = messages.length > 0
 		? messages

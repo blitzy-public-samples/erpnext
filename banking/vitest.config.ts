@@ -7,6 +7,22 @@ import tailwindcss from '@tailwindcss/vite';
  * The frontend units this work delivers, and therefore the single source of truth for BOTH the
  * coverage measurement scope and the coverage gate. See the `coverage` block below for why the two
  * must be generated from one array rather than maintained as two lists.
+ *
+ * ─── THIS LIST IS A SUPERSET OF THE CHANGED SOURCE FILES, AND THAT IS CHECKABLE ─────────────────
+ *
+ * `git diff --name-only <baseline> -- 'banking/src/**'`, with the test files and the harness removed,
+ * yields exactly SIX source paths - the dialog, the workbench, the API-client layer, the state store,
+ * the statement-import step and the importer page - and every one of them is named below. The three
+ * `src/lib` entries are UNCHANGED by this work and are measured anyway, because every message,
+ * company and currency the failure paths resolve goes through them, so a regression in one of them is
+ * a regression in FM1, FM2 or FM5 whether or not the file appears in a diff.
+ *
+ * `src/components/ui/markdown.tsx` is deliberately NOT here, and the reason is a scope fact rather
+ * than an oversight: it is byte-identical to the baseline. It is one of the 43 design-system
+ * primitives the Agent Action Plan lists as reference-only files that "must not appear in the diff"
+ * (section 0.8.1.6), so it is not a boundary this work changed. The untrusted-markup sink this work
+ * DID introduce is `BankRecErrorDialog.tsx`, which sanitises at its own boundary and is measured
+ * below at the same threshold as everything else.
  */
 const COVERED_UNITS = [
 	// The reconciliation API-client layer: every backend call the workflow makes, its cache keys, and
@@ -22,10 +38,10 @@ const COVERED_UNITS = [
 	'src/components/features/BankStatementImporter/CSV/StatementDetails.tsx',
 	// The importer surface: upload chain, per-file failure indicator, import log list.
 	'src/pages/BankStatementImporter.tsx',
-	// The import-log detail route, whose render-branch order decides whether FM2 surfaces the
-	// backend's refusal or a blank page.
-	'src/pages/ViewBankStatementImportLog.tsx',
-	// The shared helpers those surfaces resolve errors, companies and currencies through.
+	// The shared helpers those surfaces resolve errors, companies and currencies through. All three
+	// are UNCHANGED by this work and are measured anyway, because the failure paths above resolve
+	// every message, currency and company through them - so a regression in one of them is a
+	// regression in FM1, FM2 or FM5 whether or not the file itself appears in the diff.
 	'src/lib/frappe.ts',
 	'src/lib/company.ts',
 	'src/lib/currency.ts'

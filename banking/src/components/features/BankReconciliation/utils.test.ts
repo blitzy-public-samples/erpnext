@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { FrappeError } from 'frappe-react-sdk'
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { Provider, createStore } from 'jotai'
 import { createElement, type PropsWithChildren } from 'react'
@@ -25,6 +26,8 @@ import {
 	frappeSWRMutate,
 	makeAlreadyReconciledError,
 	makeAlternateLinkedPayment,
+	makeFrappeError,
+	makeServerMessagesError,
 	makeBankAccountListRow,
 	makeBankTransaction,
 	makeBankTransactionPayment,
@@ -62,6 +65,8 @@ import {
 	useSelectedBankAccountCurrency,
 	useTransactionSearch,
 	useUpdateActionLog,
+	readErrorText,
+	readServerMessages,
 	type UnreconciledTransaction
 } from './utils'
 import {
@@ -80,6 +85,8 @@ import {
 	type SelectedBank
 } from './bankRecAtoms'
 import { selectedCompanyAtom } from '@/hooks/useCurrentCompany'
+import { installRoleProfile } from '@/test/setup'
+import { canCancelDocument, canReadDocument, canWriteDocument } from '@/lib/permissions'
 
 /**
  * The four reference columns `get_linked_payments` really projects, pinned on the FIXTURES the
@@ -102,6 +109,219 @@ import { selectedCompanyAtom } from '@/hooks/useCurrentCompany'
  * What is pinned here is the CONTRACT, so a fixture that drifts back to "invoices have no
  * reference" - or a type that narrows back to `string` - fails immediately.
  */
+/*
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════
+ * READING A REJECTION WITHOUT EVER THROWING  (FM1, FM2, FM3)
+ *
+ * `@/lib/frappe` is the shared error parser, and it is FROZEN by the Agent Action Plan (section 0.6.4:
+ * the error-transport envelope is "Unchanged - reused verbatim by the new dialog"; section 0.9.1 does
+ * not list it among the paths this work may touch). It is also NOT total - `frappe.test.ts` specifies
+ * its two limits - and it runs FIRST in every rejection handler in this feature, ahead of raising the
+ * dismissible dialog, clearing the selection a refused reconcile attempt was made against,
+ * revalidating the authoritative reads and recording the per-file import failure.
+ *
+ * So a throw there does not garble one message, it ABANDONS ALL OF THEM. `readServerMessages` and
+ * `readErrorText` are the boundary that closes that, and this block is their specification: every case
+ * asserts BOTH halves - that the call does not throw, AND that the reviewer is left with text they can
+ * act on whenever the server supplied any.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════ */
+describe('readServerMessages — total resolution of a rejection', () => {
+
+	describe('the empty-input guard', () => {
+		it('resolves nothing for an absent error', () => {
+			expect(readServerMessages(undefined)).toStrictEqual([])
+			expect(readServerMessages(null)).toStrictEqual([])
+			expect(readErrorText(undefined)).toBe('')
+			expect(readErrorText(null)).toBe('')
+		})
+	})
+
+	describe('the well-formed envelope is passed through unaltered', () => {
+		it('preserves every message, its order, its title and its severity', () => {
+			const error = makeFrappeError({
+				_server_messages: JSON.stringify([
+					JSON.stringify({ message: 'First refusal', title: 'Message', indicator: 'yellow' }),
+					JSON.stringify({ message: 'Second refusal', title: 'Message', indicator: 'red' })
+				])
+			})
+
+			expect(readServerMessages(error)).toStrictEqual([
+				{ message: 'First refusal', title: 'Message', indicator: 'yellow' },
+				{ message: 'Second refusal', title: 'Message', indicator: 'red' }
+			])
+			expect(readErrorText(error)).toBe('First refusal\nSecond refusal')
+		})
+
+		it('delivers the already-reconciled refusal verbatim', () => {
+			const message = formatAlreadyReconciledMessage('ACC-BTN-2024-00001')
+
+			expect(readErrorText(makeServerMessagesError(message))).toBe(message)
+		})
+	})
+
+	describe('LIMIT 1 — an envelope the shared parser THROWS on', () => {
+		it('does not throw, and recovers the text from `exception`', () => {
+			const truncated = makeFrappeError({
+				_server_messages: '[{"message":"Reconciliation refu',
+				exception: 'frappe.exceptions.ValidationError: Bank Account is disabled'
+			})
+
+			expect(() => readServerMessages(truncated)).not.toThrow()
+			expect(readServerMessages(truncated)).toHaveLength(1)
+			expect(readErrorText(truncated).trim()).toBe('Bank Account is disabled')
+		})
+
+		it('falls all the way through to `message` when there is no exception either', () => {
+			const malformed = makeFrappeError({
+				_server_messages: 'not json',
+				exception: '',
+				message: 'Internal Server Error'
+			})
+
+			expect(readServerMessages(malformed)).toStrictEqual([
+				{ message: 'Internal Server Error', title: 'Error', indicator: 'red' }
+			])
+		})
+
+		it('recovers a NON-ARRAY envelope, where the shared parser reaches `.map` on an object', () => {
+			const nonArray = makeFrappeError({
+				_server_messages: '{"message":"Reconciliation refused"}',
+				exception: '',
+				message: 'Internal Server Error'
+			})
+
+			expect(() => readServerMessages(nonArray)).not.toThrow()
+			expect(readServerMessages(nonArray)).toStrictEqual([
+				{ message: 'Internal Server Error', title: 'Error', indicator: 'red' }
+			])
+		})
+
+		it('recovers a JSON string envelope, valid JSON that is also not an array', () => {
+			expect(readServerMessages(makeFrappeError({
+				_server_messages: '"Reconciliation refused"',
+				exception: '',
+				message: 'Internal Server Error'
+			}))).toStrictEqual([
+				{ message: 'Internal Server Error', title: 'Error', indicator: 'red' }
+			])
+		})
+
+		it('still surfaces `_error_message`, which the shared parser appends AFTER the failing parse', () => {
+			const error = makeFrappeError({
+				_server_messages: 'not json',
+				_error_message: 'The bank account is disabled'
+			})
+
+			expect(readServerMessages(error)).toStrictEqual([
+				{ message: 'The bank account is disabled', title: 'Error', indicator: 'red' }
+			])
+		})
+
+		it('never mutates the caller\'s error object, which the dialog atom holds by identity', () => {
+			const envelope = '[{"message":"trunc'
+			const error = makeFrappeError({ _server_messages: envelope, message: 'Internal Server Error' })
+
+			readServerMessages(error)
+
+			expect(error._server_messages).toBe(envelope)
+		})
+	})
+
+	describe('LIMIT 2 — an envelope that parses but says nothing readable', () => {
+		it('NORMALISES a singly encoded element into a message object', () => {
+			// Frappe's convention is double encoding; a bare string survives the shared parser as-is and
+			// has no `message`, so the banner would render an empty body for a refusal that carried text.
+			expect(readServerMessages(makeFrappeError({
+				_server_messages: JSON.stringify(['Bank Transaction is already fully reconciled'])
+			}))).toStrictEqual([
+				{
+					message: 'Bank Transaction is already fully reconciled',
+					title: 'Error',
+					indicator: 'red'
+				}
+			])
+		})
+
+		it('normalises only the singly encoded element of a MIXED envelope', () => {
+			const result = readServerMessages(makeFrappeError({
+				_server_messages: JSON.stringify([
+					JSON.stringify({ message: 'Properly encoded', title: 'Message', indicator: 'yellow' }),
+					'Singly encoded'
+				])
+			}))
+
+			expect(result).toHaveLength(2)
+			expect(result[0]).toStrictEqual({
+				message: 'Properly encoded',
+				title: 'Message',
+				indicator: 'yellow'
+			})
+			expect(result[1].message).toBe('Singly encoded')
+			// The FIRST entry is the one `error-banner.tsx:37` themes on, so normalising the second must
+			// not promote its red indicator over the server's amber.
+			expect(result[0].indicator).toBe('yellow')
+		})
+
+		it('DROPS a message-less entry and un-suppresses the `exception` fallback', () => {
+			// The whole point: the shared parser keeps the entry, and a non-empty array short-circuits its
+			// own fallback chain - so text that WAS available on `exception` is denied to the reviewer.
+			const error = makeFrappeError({
+				_server_messages: JSON.stringify([JSON.stringify({ title: 'Message', indicator: 'red' })]),
+				exception: 'frappe.exceptions.ValidationError: The bank account is disabled'
+			})
+
+			expect(readServerMessages(error)).toHaveLength(1)
+			expect(readErrorText(error).trim()).toBe('The bank account is disabled')
+		})
+
+		it('drops an entry whose `message` is the empty string, for the same reason', () => {
+			expect(readServerMessages(makeFrappeError({
+				_server_messages: JSON.stringify([JSON.stringify({ message: '', title: 'Message' })]),
+				exception: '',
+				message: 'Internal Server Error'
+			}))).toStrictEqual([
+				{ message: 'Internal Server Error', title: 'Error', indicator: 'red' }
+			])
+		})
+
+		it('drops a message-less entry but KEEPS its well-formed siblings', () => {
+			expect(readServerMessages(makeFrappeError({
+				_server_messages: JSON.stringify([
+					JSON.stringify({ title: 'Message', indicator: 'red' }),
+					JSON.stringify({ message: 'Voucher is over-allocated', title: 'Message', indicator: 'red' })
+				])
+			}))).toStrictEqual([
+				{ message: 'Voucher is over-allocated', title: 'Message', indicator: 'red' }
+			])
+		})
+
+		it('drops an element that is neither a string nor an object', () => {
+			expect(readServerMessages(makeFrappeError({
+				_server_messages: JSON.stringify([JSON.stringify(42), JSON.stringify(null)]),
+				exception: '',
+				message: 'Internal Server Error'
+			}))).toStrictEqual([
+				{ message: 'Internal Server Error', title: 'Error', indicator: 'red' }
+			])
+		})
+
+		it('resolves an EMPTY LIST only when the server genuinely said nothing anywhere', () => {
+			// A transport failure carries no response at all. The callers treat this as "no detail" and
+			// still perform every safety action, which is what the dialog\'s own fallback copy is for.
+			expect(readServerMessages(makeFrappeError({
+				_server_messages: 'not json',
+				exception: '',
+				message: ''
+			}))).toStrictEqual([])
+			expect(readErrorText(makeFrappeError({
+				_server_messages: 'not json',
+				exception: '',
+				message: ''
+			}))).toBe('')
+		})
+	})
+})
+
 describe('the reference columns get_linked_payments projects', () => {
 
 	it('projects a real reference for a Payment Entry', () => {
@@ -281,10 +501,17 @@ const lastGetDocCall = () => {
  * `useFrappeGetCall` several times with different endpoints, and a blanket answer would feed one
  * endpoint's payload to all of them.
  */
-const answerGetCall = (method: string, data: unknown): void => {
+/**
+ * Answers ONE endpoint and leaves every other read empty.
+ *
+ * `error` is optional and defaults to "no error". Supplying it models a FAILED read, which the library
+ * reports with `data: undefined` alongside the error - the same `data` a PENDING read reports, which is
+ * exactly why any guard that clears state has to distinguish the two.
+ */
+const answerGetCall = (method: string, data: unknown, error?: FrappeError): void => {
 	frappeSDKMock.useFrappeGetCall.mockImplementation((calledMethod) =>
 		calledMethod === method
-			? { data, error: undefined, isLoading: false, isValidating: false, mutate: frappeHookMutate }
+			? { data, error, isLoading: false, isValidating: false, mutate: frappeHookMutate }
 			: { data: undefined, error: undefined, isLoading: false, isValidating: false, mutate: frappeHookMutate })
 }
 
@@ -851,21 +1078,61 @@ describe('useGetBankAccounts', () => {
 			unsubscribe()
 		})
 
-		it('leaves the snapshot alone when the selected account is absent from the response', async () => {
-			// Absence is not evidence about the selected account - the response may be for another
-			// company, or the account may be newly disabled. Overwriting or clearing the snapshot here
-			// would discard the reviewer's selection on a payload that says nothing about it; that
-			// decision belongs to the bank picker, which owns choosing an account.
+		it('CLEARS the snapshot when the selected account is absent from the response', async () => {
+			/*
+			 * SEC-12, and it fails CLOSED.
+			 *
+			 * `bank_account.get_list` is permission-filtered and company-scoped, so an account this
+			 * reviewer is entitled to see in this company IS in a successful response. Its absence means
+			 * the account was disabled or deleted, the permission was revoked, the reviewer's role
+			 * changed, or the company selector moved - and in every one of those cases the persisted row
+			 * is a `localStorage` snapshot of a bank account name, its GL account and its ACCOUNT NUMBER
+			 * that the server has stopped listing. Leaving it would keep that data on screen and in
+			 * durable storage, and would keep every downstream query pointed at an account the response
+			 * does not contain.
+			 *
+			 * Discarding it returns the workbench to its own "pick an account" state, from which
+			 * `BankPicker` chooses again out of authoritative data.
+			 */
 			const store = storeWithStaleSelection()
 			answerGetCall(BANK_ACCOUNT_GET_LIST, {
 				message: [makeBankAccountListRow({ name: 'Other Bank - Test Company', account_currency: TEST_CURRENCY })]
 			})
 
 			renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
-			await waitFor(() => {
-				expect(store.get(selectedBankAccountAtom)?.name).toBe(TEST_BANK_ACCOUNT)
-			})
 
+			await waitFor(() => {
+				expect(store.get(selectedBankAccountAtom)).toBeNull()
+			})
+		})
+
+		it('clears the snapshot even when the response lists NO accounts at all', async () => {
+			// An empty list is still an answer: it enumerates this reviewer's accounts in this company and
+			// contains none. Treating it as "says nothing" is exactly how a revoked permission would leave
+			// the previous holder's bank account on screen.
+			const store = storeWithStaleSelection()
+			answerGetCall(BANK_ACCOUNT_GET_LIST, { message: [] })
+
+			renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
+
+			await waitFor(() => {
+				expect(store.get(selectedBankAccountAtom)).toBeNull()
+			})
+		})
+
+		it('does NOT clear the snapshot when the read fails, only when it answers', async () => {
+			// The distinction the guard turns on: an unavailable server must never be read as "you may not
+			// see this account". `useFrappeGetCall` reports no data on a failed read just as it does on a
+			// pending one, so a clear gated on anything weaker than a successful response would blank the
+			// reviewer's selection every time the network hiccupped.
+			const store = storeWithStaleSelection()
+			answerGetCall(BANK_ACCOUNT_GET_LIST, undefined, makeFrappeError({ message: 'Internal Server Error' }))
+
+			renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
+
+			await act(async () => { await Promise.resolve() })
+
+			expect(store.get(selectedBankAccountAtom)?.name).toBe(TEST_BANK_ACCOUNT)
 			expect(store.get(selectedBankAccountAtom)?.account_currency).toBe(TEST_ALTERNATE_CURRENCY)
 		})
 
@@ -2249,5 +2516,113 @@ describe('useUpdateActionLog', () => {
 		expect(log[0].timestamp).toBe(101)
 		expect(log[99].timestamp).toBe(2)
 		expect(log.map((action) => action.timestamp)).not.toContain(1)
+	})
+})
+
+/*
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════
+ * NEGATIVE AUTHORISATION AT THE API-CLIENT SEAM
+ *
+ * ⚠️ WHAT THIS CAN AND CANNOT PROVE. This hook layer applies no client-side permission check, and
+ * that is correct: `reconcile_vouchers` and `get_linked_payments` are authorised by the SERVER, and a
+ * client that pre-judged a permission would be adding a convenience, not a control. The SDK is mocked
+ * here, so a refusal is something these tests INSTALL, never something they discover - proving that
+ * the server refuses is the Python suites' job.
+ *
+ * What is provable, and worth proving, is that a refusal under a NARROWED profile is handled exactly
+ * as any other refusal: fail-closed, with the server's own words, and with nothing mutated. A client
+ * that treated an authorisation refusal as a special case - retrying it, clearing it silently, or
+ * leaving the affordance live because "the user should have been allowed" - would be the defect.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════ */
+describe('a refusal under a narrowed role profile is handled exactly like any other refusal', () => {
+
+	const seedForReconcile = () => {
+		const store = createSeededStore()
+		const transaction = makeUnreconciledTransaction()
+		store.set(bankRecSelectedTransactionAtom(TEST_BANK_ACCOUNT), [transaction])
+		return { store, transaction, voucher: makeSuggestedLinkedPayment(transaction) }
+	}
+
+	it('models the real DocPerm rows, so an Accounts User cannot cancel a Bank Transaction', () => {
+		// The premise the rest of this block rests on: the harness derives its permission arrays from the
+		// real rows, so a narrowed profile genuinely differs. `Bank Transaction` grants cancel to System
+		// Manager and Accounts Manager but NOT to Accounts User.
+		installRoleProfile(['Accounts User'])
+
+		expect(canReadDocument('Bank Transaction')).toBe(true)
+		expect(canWriteDocument('Bank Transaction')).toBe(true)
+		expect(canCancelDocument('Bank Transaction')).toBe(false)
+	})
+
+	it('surfaces a PERMISSION refusal in the server\'s own words and clears the selection', async () => {
+		installRoleProfile(['Accounts User'])
+
+		const refusal = makeServerMessagesError('Insufficient Permission for Bank Transaction')
+		const { store, transaction, voucher } = seedForReconcile()
+		frappePostCall.mockRejectedValue(refusal)
+		const errorToast = vi.spyOn(toast, 'error').mockReturnValue('toast-id')
+
+		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+		await act(async () => {
+			await result.current.reconcileTransaction(transaction, voucher)
+		})
+
+		// The dialog carries the raw error by IDENTITY, so the banner parses the server's envelope
+		// itself and no wording is invented for an authorisation failure.
+		await waitFor(() => {
+			expect(store.get(bankRecErrorDialogAtom)).toBe(refusal)
+		})
+		expect(errorToast.mock.calls[0][1]?.description).toContain('Insufficient Permission')
+
+		// FAIL-CLOSED, exactly as for a validation refusal: the selection the refused attempt was made
+		// against is withdrawn, so the affordance cannot be re-fired against a contradicted snapshot.
+		expect(store.get(bankRecSelectedTransactionAtom(TEST_BANK_ACCOUNT))).toEqual([])
+		// Nothing was logged as an action, because nothing was posted.
+		expect(store.get(bankRecActionLog)).toEqual([])
+
+		errorToast.mockRestore()
+	})
+
+	it('does not retry a refused post, whatever the reason for the refusal', async () => {
+		// A permission refusal is not a transient fault. Retrying would be a second post made without
+		// knowing the outcome of the first, which is the one thing the single-flight guard exists to stop.
+		installRoleProfile(['Accounts User'])
+
+		const { store, transaction, voucher } = seedForReconcile()
+		frappePostCall.mockRejectedValue(makeServerMessagesError('Insufficient Permission for Bank Transaction'))
+		const errorToast = vi.spyOn(toast, 'error').mockReturnValue('toast-id')
+
+		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+		await act(async () => {
+			await result.current.reconcileTransaction(transaction, voucher)
+		})
+
+		expect(frappePostCall).toHaveBeenCalledTimes(1)
+		// ...and the guard is released, so a reviewer whose role is corrected is not locked out.
+		await waitFor(() => {
+			expect(store.get(bankRecReconcileInFlightAtom)).toBeNull()
+		})
+
+		errorToast.mockRestore()
+	})
+
+	it('holds no role at all and still reports a refusal rather than swallowing it', async () => {
+		installRoleProfile([])
+
+		const refusal = makeServerMessagesError('Not permitted')
+		const { store, transaction, voucher } = seedForReconcile()
+		frappePostCall.mockRejectedValue(refusal)
+		const errorToast = vi.spyOn(toast, 'error').mockReturnValue('toast-id')
+
+		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+		await act(async () => {
+			await result.current.reconcileTransaction(transaction, voucher)
+		})
+
+		await waitFor(() => {
+			expect(store.get(bankRecErrorDialogAtom)).toBe(refusal)
+		})
+
+		errorToast.mockRestore()
 	})
 })

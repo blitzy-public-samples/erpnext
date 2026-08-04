@@ -1,13 +1,13 @@
 import { ActionLog, bankRecActionLog, bankRecAmountFilter, bankRecDateAtom, bankRecErrorDialogAtom, bankRecMatchFilters, bankRecReconcileInFlightAtom, bankRecSearchText, bankRecSelectedTransactionAtom, bankRecTransactionTypeFilter, bankRecUnreconcileModalAtom, SelectedBank, selectedBankAccountAtom } from './bankRecAtoms'
 import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
 import { useEffect, useMemo } from 'react'
-import { SWRConfiguration, useFrappeGetCall, useFrappeGetDoc, useFrappePostCall, useSWRConfig } from 'frappe-react-sdk'
+import { FrappeError, SWRConfiguration, useFrappeGetCall, useFrappeGetDoc, useFrappePostCall, useSWRConfig } from 'frappe-react-sdk'
 import { BankTransaction } from '@/types/Accounts/BankTransaction'
 import { BankAccount } from '@/types/Accounts/BankAccount'
 import dayjs from 'dayjs'
 import { toast } from 'sonner'
 import { BANK_LOGOS } from './logos'
-import { getErrorMessage } from '@/lib/frappe'
+import { getErrorMessages } from '@/lib/frappe'
 import { useCurrentCompany } from '@/hooks/useCurrentCompany'
 import _ from '@/lib/translate'
 import { BankTransactionRule } from '@/types/Accounts/BankTransactionRule'
@@ -15,6 +15,127 @@ import { useRef } from 'react'
 import type { DebouncedState } from 'usehooks-ts'
 import { useDebounceCallback } from 'usehooks-ts'
 import Fuse from 'fuse.js'
+
+/* ================================================================================================
+ * READING A REJECTION WITHOUT EVER THROWING (FM1, FM2, FM3)
+ *
+ * `@/lib/frappe` is the SHARED error parser every `ErrorBanner` in the SPA reads through, and it is
+ * frozen by the Agent Action Plan: section 0.6.4 records the error-transport envelope as "Unchanged -
+ * reused verbatim by the new dialog", and section 0.9.1 does not list it among the paths this work may
+ * touch. So the totality the failure paths need is provided HERE, at the boundary this work owns,
+ * rather than by editing the shared module.
+ *
+ * WHY IT IS NEEDED AT ALL. `getErrorMessages` calls `JSON.parse` on `_server_messages` unguarded and
+ * then `.map`s the result. That envelope is server-controlled and only CONVENTIONALLY well formed -
+ * Frappe transmits a JSON array whose elements are themselves JSON strings, but a truncated response,
+ * a proxy that rewrote the body, or an HTML error page from an intermediary delivers something else -
+ * so both expressions can throw. That single throw sits in front of every safety action the failure
+ * paths perform: raising the dismissible dialog, clearing the selection a refused reconcile attempt
+ * was made against, revalidating the authoritative reads, and recording the per-file import failure.
+ * A malformed envelope would therefore not merely garble the message, it would ABANDON ALL OF THEM -
+ * the exact opposite of fail-closed.
+ * ============================================================================================== */
+
+/**
+ * One parsed server message, in the shape `@/lib/frappe` resolves and `ErrorBanner` consumes.
+ *
+ * Restated here because the shared module declares its equivalent interface privately and does not
+ * export it, and that module may not be edited (see the note above). The three members are the ones
+ * `ErrorBanner` reads: `indicator` picks amber over red, `title` becomes the heading, and `message` is
+ * rendered as the body.
+ */
+export interface ServerMessage {
+    message: string
+    title?: string
+    indicator?: string
+}
+
+/**
+ * Makes whatever the shared parser resolved RENDERABLE, by fixing the two ways its raw output is not.
+ *
+ * The parameter is `unknown[]` deliberately: the shared parser ANNOTATES its result as message objects
+ * but does not enforce it, so the annotation cannot be trusted and every element is tested rather than
+ * assumed.
+ *
+ * 1. A SINGLY encoded element is wrapped into a message object. Frappe's convention is double
+ *    encoding, so the shared parser's inner `JSON.parse` is what turns each element into an object;
+ *    when an element is a bare string that parse throws and the string survives as-is. A bare string
+ *    has no `message` property, so the banner would render `undefined` - an empty body with no heading
+ *    - and the reviewer would be told nothing at all about a refusal that did carry text.
+ * 2. An entry with no READABLE message is dropped. Left in place it both renders an empty body and,
+ *    because the array is then non-empty, suppresses the fallback chain - so a message-less entry
+ *    actively denies the reviewer text that was available elsewhere on the same envelope.
+ *
+ * Nothing is paraphrased, reordered or truncated: the server's own words and their order survive.
+ */
+const normalizeMessages = (parsed: unknown[]): ServerMessage[] =>
+    parsed
+        .map((message) => (typeof message === 'string' ? { message, title: 'Error', indicator: 'red' } : message))
+        .filter((message): message is ServerMessage =>
+            Boolean(message) && typeof message === 'object' &&
+            typeof (message as ServerMessage).message === 'string' &&
+            (message as ServerMessage).message.length > 0)
+
+/**
+ * Runs the shared parser and normalises its result, converting a THROW into an empty list.
+ *
+ * The catch is not a formality: `JSON.parse` on `_server_messages` and the `.map` over its result are
+ * both unguarded in the shared module, so a truncated response, a rewritten body or an intermediary's
+ * HTML error page reaches this call as an exception rather than as text.
+ */
+const tryResolveMessages = (error: FrappeError): ServerMessage[] => {
+    try {
+        return normalizeMessages(getErrorMessages(error))
+    } catch {
+        return []
+    }
+}
+
+/**
+ * Every readable message on a rejection, resolved TOTALLY: this function has no failure mode of its
+ * own and always returns an array.
+ *
+ * TWO ways an envelope can leave the reviewer with nothing, and ONE recovery that handles both:
+ *
+ *   • it defeats the parser outright (unparseable, or valid JSON that is not an array), or
+ *   • it parses into entries that are all UNREADABLE - a message-less object, an empty `message`, an
+ *     element that is neither string nor object. The shared parser's own
+ *     `_error_message` -> `exception` -> `message` chain only runs when its list is empty, and an
+ *     array of unreadable entries is not empty, so the chain is suppressed by content that says
+ *     nothing.
+ *
+ * Both are recovered by running the SAME parser again with only `_server_messages` removed: that
+ * disarms the one expression that can throw, empties the list the chain is gated on, and leaves the
+ * whole remaining resolution to the shared implementation rather than to a copy of it here, so the two
+ * can never drift apart. Returning nothing instead would be worse than the defect being guarded
+ * against - a failed response very often still carries usable text in `_error_message`, `exception` or
+ * `message`, and reporting "no further details" when the server did say something leaves the reviewer
+ * unable to act.
+ *
+ * The copy is shallow and local; the caller's error object is never mutated, because the dialog atom
+ * holds that object by identity and hands it onward unmodified.
+ */
+export const readServerMessages = (error?: FrappeError | null): ServerMessage[] => {
+    if (!error) return []
+
+    const fromEnvelope = tryResolveMessages(error)
+    if (fromEnvelope.length > 0) return fromEnvelope
+
+    const withoutEnvelope: FrappeError = { ...error }
+    delete withoutEnvelope._server_messages
+
+    return tryResolveMessages(withoutEnvelope)
+}
+
+/**
+ * The readable text of a rejection as a single string, for the toast descriptions and the per-file
+ * import-failure markers - the {@link readServerMessages} counterpart of `getErrorMessage`.
+ *
+ * Messages are joined with a newline in the order the server sent them, exactly as the shared helper
+ * does; the only difference is that this one cannot throw.
+ */
+export const readErrorText = (error?: FrappeError | null): string =>
+    readServerMessages(error).map((message) => message.message).join('\n')
 
 export const useGetAccountOpeningBalance = () => {
 
@@ -358,9 +479,19 @@ export const useReconcileTransaction = () => {
                 })
             }
 
+            /*
+             * `readErrorText` rather than the shared `getErrorMessage`, and the choice is load-bearing
+             * rather than stylistic: the shared helper parses `_server_messages` unguarded, so a
+             * malformed envelope throws OUT OF THIS HANDLER and abandons everything below - the dialog
+             * is never raised, the contradicted selection is never cleared, and the authoritative reads
+             * are never revalidated. A refusal nobody could read would silently become a refusal nobody
+             * was told about, with the Reconcile affordance still live. See `readErrorText` for the
+             * full account, and the Agent Action Plan section 0.6.4 for why the fix belongs here rather
+             * than in the shared module.
+             */
             toast.error(_("Error"), {
                 duration: 5000,
-                description: getErrorMessage(error)
+                description: readErrorText(error)
             })
 
             /*
@@ -506,6 +637,22 @@ export const useGetBankAccounts = (onSuccess?: (data?: Omit<SelectedBank, 'logo'
      * consumer and re-render all of them; with it, the write happens once per genuine change and then
      * converges. The client-side logo members are preserved rather than recomputed, since they are not
      * part of the endpoint's projection.
+     *
+     * AND IT FAILS CLOSED WHEN THE ROW IS GONE. `bank_account.get_list` is PERMISSION-FILTERED and
+     * company-scoped, so a selection that is absent from a successful response is a selection this
+     * reviewer, in this company, is not entitled to or that no longer exists - the account was
+     * disabled or deleted, its permissions were revoked, the reviewer's own role changed, or the
+     * company selector moved. The stored row is a snapshot in `localStorage`, so leaving it in place
+     * would keep a bank account name, its GL account and its account number on screen and in
+     * `localStorage` after the server had stopped listing them, and would keep every downstream
+     * query pointed at an account the response no longer contains. The selection is therefore
+     * DISCARDED, which returns the workbench to its own "pick an account" state and lets `BankPicker`
+     * choose again from authoritative data.
+     *
+     * It is gated on a SUCCESSFUL response and nothing weaker. `authoritativeRows` is `undefined`
+     * while the read is pending and after a failed one, and both are handled by the first guard: an
+     * unavailable server must not be read as "you may not see this account". Only an answer that
+     * genuinely enumerates the reviewer's accounts and omits this one clears anything.
      */
     const setSelectedBank = useSetAtom(selectedBankAccountAtom)
     const authoritativeRows = data?.message
@@ -518,7 +665,11 @@ export const useGetBankAccounts = (onSuccess?: (data?: Omit<SelectedBank, 'logo'
         if (!persisted) return
 
         const authoritative = authoritativeRows.find((bank) => bank.name === persisted.name)
-        if (!authoritative) return
+
+        if (!authoritative) {
+            setSelectedBank(null)
+            return
+        }
 
         const refreshed: SelectedBank = { ...persisted, ...authoritative }
 
