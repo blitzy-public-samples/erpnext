@@ -24,6 +24,10 @@
   },
   "include": [
     "vite.config.ts",
+    // The test runner's configuration is TYPE-CHECKED here, and that is the point: `tsc -b` only
+    // ever sees a file some project includes, so without this line a type error in
+    // `vitest.config.ts` is silently undetected - which is the exact class of defect the honest
+    // `typecheck` script exists to catch.
     "vitest.config.ts"
   ]
 }

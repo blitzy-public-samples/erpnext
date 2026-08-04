@@ -135,6 +135,9 @@ export default defineConfig({
 				'src/components/features/BankStatementImporter/CSV/StatementDetails.tsx': { lines: 80 },
 				// The importer surface: upload chain, per-file failure indicator, import log list.
 				'src/pages/BankStatementImporter.tsx': { lines: 80 },
+				// The import-log detail route: the only surface that exists when the statement-details
+				// endpoint refuses, and therefore the FM2 producer for a genuinely unreadable file.
+				'src/pages/ViewBankStatementImportLog.tsx': { lines: 80 },
 				// The shared helpers those surfaces resolve errors, companies and currencies through.
 				'src/lib/frappe.ts': { lines: 80 },
 				'src/lib/company.ts': { lines: 80 },

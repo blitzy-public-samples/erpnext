@@ -63,6 +63,7 @@ import { createContext, createElement, Fragment, type ReactNode } from 'react'
 import type { BankAccountWithCurrency, LinkedPayment, UnreconciledTransaction } from '@/components/features/BankReconciliation/utils'
 import type { ImportAttemptStatus, SelectedBank } from '@/components/features/BankReconciliation/bankRecAtoms'
 import type { BankTransaction } from '@/types/Accounts/BankTransaction'
+import type { BankTransactionPayments } from '@/types/Accounts/BankTransactionPayments'
 import type { BankStatementImportLog } from '@/types/Accounts/BankStatementImportLog'
 import type { BankTransactionRule } from '@/types/Accounts/BankTransactionRule'
 // Type-only imports, so nothing here loads the SDK module — which matters, because a suite
@@ -273,39 +274,222 @@ export const makeCurrencyMismatchTransaction = (
 	})
 
 /**
- * Builds a COMPLETE `Bank Transaction` document, as distinct from the fifteen-field client
- * projection above. This is the builder that carries `allocated_amount` — the one column
- * `get_bank_transactions` returns that `UnreconciledTransaction` does not pick — so a suite
- * needing the allocated figure belongs here rather than on the row builder.
+ * The `Bank Transaction Payments` child row a reconciliation writes — the ONLY place an allocation
+ * physically lives. `allocated_amount` on the parent is not stored independently of these rows:
+ * `update_allocated_amount` (`bank_transaction.py:109-116`) recomputes it as their SUM on every
+ * save, so a parent claiming an allocation with no child row underneath it is a document the
+ * controller cannot emit.
  *
- * Defaults model the response to a SUCCESSFUL FULL reconciliation, so `unallocated_amount: 0` drives
- * the "advance to the next transaction" branch; override it for the partial-allocation branch.
+ * `payment_document`, `payment_entry` and `allocated_amount` are REQUIRED by the child DocType;
+ * `reconciliation_type` defaults to `Matched`, which is what `add_payment_entries` writes when the
+ * voucher was matched rather than created (`bank_transaction.py:163-170`).
  */
-export const makeBankTransaction = (overrides: Partial<BankTransaction> = {}): BankTransaction => ({
-	name: 'ACC-BTN-2024-00001',
+export const makeBankTransactionPayment = (
+	overrides: Partial<BankTransactionPayments> = {}
+): BankTransactionPayments => ({
+	name: 'btp-a1b2c3d4e5',
 	creation: TEST_CREATION_TIMESTAMP,
 	modified: TEST_MODIFIED_TIMESTAMP,
 	owner: TEST_USER,
 	modified_by: TEST_USER,
 	docstatus: 1,
-	naming_series: 'ACC-BTN-.YYYY.-',
-	date: TEST_TRANSACTION_DATE,
-	status: 'Reconciled',
-	bank_account: TEST_BANK_ACCOUNT,
-	company: TEST_COMPANY,
-	deposit: TEST_TRANSACTION_AMOUNT,
-	withdrawal: 0,
-	currency: TEST_CURRENCY,
-	description: TEST_TRANSACTION_DESCRIPTION,
-	reference_number: TEST_REFERENCE_NUMBER,
-	transaction_type: 'NEFT',
-	party_type: 'Customer',
-	party: 'ACME Traders',
+	parent: 'ACC-BTN-2024-00001',
+	parentfield: 'payment_entries',
+	parenttype: 'Bank Transaction',
+	idx: 1,
+	payment_document: 'Payment Entry',
+	payment_entry: 'ACC-PAY-2024-00001',
 	allocated_amount: TEST_TRANSACTION_AMOUNT,
-	unallocated_amount: 0,
-	is_rule_evaluated: 1,
+	clearance_date: TEST_TRANSACTION_DATE,
+	reconciliation_type: 'Matched',
 	...overrides
 })
+
+/**
+ * The three relations `Bank Transaction` maintains between its amount columns, its child rows and
+ * its status. Asserted here, at construction, so a suite cannot build a document the server could
+ * never produce — and so the failure names the violated relation instead of surfacing later as an
+ * assertion about the wrong thing.
+ *
+ *   1. `allocated_amount === sum(payment_entries[].allocated_amount)`
+ *   2. `allocated_amount + unallocated_amount === abs(withdrawal - deposit)`
+ *   3. for a SUBMITTED document, `status` is `Reconciled` when `unallocated_amount <= 0` and
+ *      `Unreconciled` when it is positive
+ *
+ * All three are read straight off the controller: (1) and (2) from `update_allocated_amount`
+ * (`bank_transaction.py:109-116`), (3) from `set_status` (`bank_transaction.py:143-149`). A draft
+ * or cancelled document is exempt from (3) only, because `set_status` derives those from
+ * `docstatus` alone.
+ *
+ * Throwing rather than silently correcting is deliberate: a caller that asked for an impossible
+ * combination has a wrong mental model of the contract, and quietly reshaping the fixture would
+ * leave that intact while making the test pass.
+ */
+const assertBankTransactionInvariants = (transaction: BankTransaction): void => {
+	const allocated = transaction.allocated_amount ?? 0
+	const unallocated = transaction.unallocated_amount ?? 0
+	const childTotal = (transaction.payment_entries ?? []).reduce(
+		(total, row) => total + (row.allocated_amount ?? 0),
+		0
+	)
+	const transactionAmount = Math.abs((transaction.withdrawal ?? 0) - (transaction.deposit ?? 0))
+
+	if (allocated !== childTotal) {
+		throw new Error(
+			`makeBankTransaction: allocated_amount (${allocated}) must equal the sum of ` +
+				`payment_entries allocations (${childTotal}) — update_allocated_amount recomputes it ` +
+				'from the child rows on every save, so pass matching `payment_entries`.'
+		)
+	}
+
+	if (allocated + unallocated !== transactionAmount) {
+		throw new Error(
+			`makeBankTransaction: allocated_amount + unallocated_amount (${allocated + unallocated}) ` +
+				`must equal abs(withdrawal - deposit) (${transactionAmount}). Override ONE of the two ` +
+				'allocation figures and let the builder derive the other.'
+		)
+	}
+
+	if (transaction.docstatus === 1) {
+		const derivedStatus = unallocated > 0 ? 'Unreconciled' : 'Reconciled'
+		if (transaction.status !== derivedStatus) {
+			throw new Error(
+				`makeBankTransaction: a submitted transaction with unallocated_amount ${unallocated} ` +
+					`has status "${derivedStatus}", not "${transaction.status}" — set_status derives the ` +
+					'status from the unallocated amount, so the two cannot be set independently.'
+			)
+		}
+	}
+}
+
+/**
+ * Builds a COMPLETE `Bank Transaction` document, as distinct from the fifteen-field client
+ * projection above. This is the builder that carries `allocated_amount` — the one column
+ * `get_bank_transactions` returns that `UnreconciledTransaction` does not pick — so a suite
+ * needing the allocated figure belongs here rather than on the row builder.
+ *
+ * Defaults model the response to a SUCCESSFUL FULL reconciliation: the whole amount allocated to one
+ * matched voucher, nothing left unallocated, status `Reconciled`, which drives the "advance to the
+ * next transaction" branch.
+ *
+ * ─── The allocation figures are DERIVED, not defaulted independently ─────────────────
+ * `allocated_amount`, `unallocated_amount`, `status` and the `payment_entries` child rows are four
+ * views of ONE fact, and the server keeps them consistent on every save. So a caller overrides ONE
+ * of them and the rest follow:
+ *
+ *     makeBankTransaction({ unallocated_amount: 2500 })   // partial: allocated 10000, Unreconciled,
+ *                                                        // one child row of 10000
+ *     makeBankTransaction({ allocated_amount: 0 })        // untouched: unallocated 12500, Unreconciled,
+ *                                                        // no child rows
+ *     makeBankTransaction({ deposit: 0, withdrawal: 500 })// a fully reconciled withdrawal of 500
+ *
+ * Supplying `payment_entries` explicitly opts out of the derivation and takes ownership of the
+ * figures — `allocated_amount` is then the sum of the rows given. Whatever route is taken, the
+ * result is checked against {@link assertBankTransactionInvariants} before it is returned, so an
+ * impossible document (an allocation with no child row, figures that do not add up to the
+ * transaction amount, or a `Reconciled` status with a positive unallocated amount) throws here
+ * rather than being asserted against downstream.
+ */
+export const makeBankTransaction = (overrides: Partial<BankTransaction> = {}): BankTransaction => {
+
+	const deposit = overrides.deposit ?? TEST_TRANSACTION_AMOUNT
+	const withdrawal = overrides.withdrawal ?? 0
+	const transactionAmount = Math.abs(withdrawal - deposit)
+
+	// One of the two figures decides the other, and an explicit `payment_entries` decides both.
+	// Precedence runs from the most specific statement of intent to the least: the child rows ARE
+	// the allocation, an explicit `allocated_amount` states it directly, and `unallocated_amount`
+	// states its complement.
+	const allocatedFromChildren = overrides.payment_entries
+		? overrides.payment_entries.reduce((total, row) => total + (row.allocated_amount ?? 0), 0)
+		: undefined
+
+	const allocated = allocatedFromChildren
+		?? overrides.allocated_amount
+		?? (overrides.unallocated_amount === undefined
+			? transactionAmount
+			: transactionAmount - overrides.unallocated_amount)
+
+	const unallocated = transactionAmount - allocated
+
+	// A figure supplied ALONGSIDE a more specific one is CHECKED against it, never silently
+	// superseded. Precedence decides which input derives the document; these two checks make a
+	// caller who supplied two inputs that disagree hear about it, because otherwise the fixture
+	// would quietly be a different document than the one the test says it is - which is exactly how
+	// `{ allocated_amount: 12500, unallocated_amount: 2500 }` on a 12500 transaction survived.
+	if (
+		allocatedFromChildren !== undefined
+		&& overrides.allocated_amount !== undefined
+		&& overrides.allocated_amount !== allocatedFromChildren
+	) {
+		throw new Error(
+			`makeBankTransaction: allocated_amount (${overrides.allocated_amount}) must equal the sum of ` +
+				`payment_entries allocations (${allocatedFromChildren}) — update_allocated_amount recomputes ` +
+				'it from the child rows on every save, so supply one or the other, not both.'
+		)
+	}
+
+	if (overrides.unallocated_amount !== undefined && overrides.unallocated_amount !== unallocated) {
+		throw new Error(
+			'makeBankTransaction: allocated_amount + unallocated_amount ' +
+				`(${allocated + overrides.unallocated_amount}) must equal abs(withdrawal - deposit) ` +
+				`(${transactionAmount}). Override ONE of the two allocation figures and let the builder ` +
+				'derive the other.'
+		)
+	}
+
+	// A zero allocation has no child row, because there is nothing for one to record.
+	const paymentEntries = overrides.payment_entries
+		?? (allocated > 0
+			? [makeBankTransactionPayment({
+				parent: overrides.name ?? 'ACC-BTN-2024-00001',
+				allocated_amount: allocated
+			})]
+			: [])
+
+	const docstatus = overrides.docstatus ?? 1
+
+	const transaction: BankTransaction = {
+		name: 'ACC-BTN-2024-00001',
+		creation: TEST_CREATION_TIMESTAMP,
+		modified: TEST_MODIFIED_TIMESTAMP,
+		owner: TEST_USER,
+		modified_by: TEST_USER,
+		naming_series: 'ACC-BTN-.YYYY.-',
+		date: TEST_TRANSACTION_DATE,
+		bank_account: TEST_BANK_ACCOUNT,
+		company: TEST_COMPANY,
+		currency: TEST_CURRENCY,
+		description: TEST_TRANSACTION_DESCRIPTION,
+		reference_number: TEST_REFERENCE_NUMBER,
+		transaction_type: 'NEFT',
+		party_type: 'Customer',
+		party: 'ACME Traders',
+		is_rule_evaluated: 1,
+		...overrides,
+		// The derived figures come AFTER the spread, because they are what the server would have
+		// written for the amounts the caller asked for.
+		docstatus,
+		deposit,
+		withdrawal,
+		allocated_amount: allocated,
+		unallocated_amount: unallocated,
+		payment_entries: paymentEntries,
+		// An explicit `status` is HONOURED rather than overwritten, so that a caller who states one
+		// that the allocation contradicts is told so by the invariant check below instead of being
+		// quietly given a different document than the one they asked for. Absent an override it is
+		// derived exactly as `set_status` derives it: from the unallocated amount when submitted,
+		// from `docstatus` alone otherwise.
+		status: overrides.status
+			?? (docstatus === 1
+				? (unallocated > 0 ? 'Unreconciled' : 'Reconciled')
+				: docstatus === 2 ? 'Cancelled' : 'Pending')
+	}
+
+	assertBankTransactionInvariants(transaction)
+
+	return transaction
+}
 
 /**
  * The bank account held in `selectedBankAccountAtom`.
@@ -455,9 +639,15 @@ export const makeAlternateLinkedPayment = (overrides: Partial<LinkedPayment> = {
 	})
 
 /**
- * An INVOICE row exactly as `get_linked_payments` returns one: both reference columns are the
- * literal empty string, because the Purchase Invoice and Sales Invoice branches select
- * `ConstantColumn("")` for each.
+ * A PURCHASE INVOICE row exactly as `get_linked_payments` returns one: both reference columns are
+ * the literal empty string, because `get_pi_matching_query` selects `ConstantColumn("")` for
+ * `reference_no` AND for `reference_date` (`bank_reconciliation_tool.py:1512-1513`).
+ *
+ * It is the Purchase Invoice branch specifically, and NOT "the invoice branches" generally: Sales
+ * Invoice blanks only its reference DATE and projects a real, nullable
+ * `Sales Invoice Payment.reference_no` (`bank_reconciliation_tool.py:1474-1475`). That case has its
+ * own builder — {@link makeSalesInvoiceLinkedPayment} — because a row carrying a usable reference
+ * grades differently from one that cannot.
  *
  * The amount deliberately AGREES with {@link makeUnreconciledTransaction}, which is what makes this
  * fixture worth having. Amount agreement alone must NOT promote a voucher to "suggested": the
@@ -476,6 +666,37 @@ export const makeBlankReferenceLinkedPayment = (overrides: Partial<LinkedPayment
 		posting_date: TEST_ALTERNATE_DATE,
 		party_type: 'Supplier',
 		party: 'Globex Supplies',
+		...overrides
+	})
+
+/**
+ * A SALES INVOICE row, whose reference projection is asymmetric and is the one shape easiest to get
+ * wrong: `get_si_matching_query` selects the real `sip.reference_no` off
+ * `Sales Invoice Payment` — which is NULLABLE, not constant — while blanking `reference_date` with
+ * `ConstantColumn("")` (`bank_reconciliation_tool.py:1471-1478`). Its `party_type` is
+ * `ConstantColumn("Customer")`.
+ *
+ * So this builder defaults to a row that DOES carry a reference number and does NOT carry a
+ * reference date. Pass `reference_no: null` for the other half of the projection — a sales invoice
+ * whose payment row has no reference recorded — which is the case a fixture modelled on the Purchase
+ * Invoice branch could never produce:
+ *
+ *     makeSalesInvoiceLinkedPayment({ reference_no: null })
+ *
+ * The reference deliberately AGREES with {@link makeUnreconciledTransaction}, so the reference
+ * grader has something real to match; the blank DATE must still contribute nothing on its own.
+ */
+export const makeSalesInvoiceLinkedPayment = (overrides: Partial<LinkedPayment> = {}): LinkedPayment =>
+	makeLinkedPayment({
+		rank: 1,
+		doctype: 'Sales Invoice',
+		name: 'ACC-SINV-2024-00001',
+		paid_amount: TEST_TRANSACTION_AMOUNT,
+		reference_no: TEST_REFERENCE_NUMBER,
+		reference_date: '',
+		posting_date: TEST_TRANSACTION_DATE,
+		party_type: 'Customer',
+		party: 'ACME Traders',
 		...overrides
 	})
 
@@ -1180,8 +1401,15 @@ const rejectUnconfigured = (operation: string, how: string): Promise<never> =>
  *
  *     frappePostCall.mockResolvedValue(makeReconcileSuccessResponse())
  *
- * Overrides forward to {@link makeBankTransaction}, so the partial-allocation branch is
- * `makeReconcileSuccessResponse({ unallocated_amount: 2500, status: 'Unreconciled' })`.
+ * Overrides forward to {@link makeBankTransaction}, which DERIVES the rest of the allocation from
+ * whichever figure is given — so the partial-allocation branch is stated with the one figure that
+ * distinguishes it:
+ *
+ *     makeReconcileSuccessResponse({ unallocated_amount: 2500 })
+ *
+ * That yields `allocated_amount: 10000` on a 12500 transaction, `status: 'Unreconciled'` and a
+ * matching child row. Restating `status` alongside it is unnecessary, and restating an
+ * `allocated_amount` that does not complement the unallocated figure throws.
  */
 export const makeReconcileSuccessResponse = (
 	overrides: Partial<BankTransaction> = {}
@@ -1230,8 +1458,18 @@ export const makeFileUploadResponse = (
 	file_url: '/private/files/statement.csv',
 	folder: 'Home/Attachments',
 	is_folder: 0,
-	attached_to_doctype: 'Bank Statement Import Log',
-	attached_to_name: 'a1b2c3d4e5',
+	/*
+	 * ⚠️ NO ATTACHMENT TARGET, because the statement is uploaded WITHOUT one.
+	 *
+	 * `Bank Statement Import Log` is hash-autonamed, so no client can know the document's name at
+	 * upload time; the SPA therefore uploads unattached and lets Frappe's `attach_files_to_document`
+	 * hook link the File to the FINAL identity when the log is inserted. A server answering such an
+	 * upload reports these two as `null`, and the interface types both as a required `string`, so the
+	 * empty string is the closest this fixture can come. Naming a document here would restate the very
+	 * contract the page was corrected for — that a client-chosen name is the file's home.
+	 */
+	attached_to_doctype: '',
+	attached_to_name: '',
 	content_hash: 'd41d8cd98f00b204e9800998ecf8427e',
 	uploaded_to_dropbox: 0,
 	uploaded_to_google_drive: 0,
@@ -1260,9 +1498,24 @@ export const makeFileUploadResponse = (
  * It RESOLVES by default, unlike the imperative operations below, for two reasons: production
  * chains `.then(...)` straight onto it (`utils.ts:254-255,372-373`), and revalidation is a
  * consequence of a scenario rather than a scenario a suite would forget to configure.
- * Resolving to `undefined` is safe because every continuation guards with `res?.message`.
+ *
+ * ⚠️ THE DEFAULT MIRRORS SWR'S OWN RESOLUTION CONTRACT, WHICH IS ARGUMENT-COUNT DEPENDENT.
+ * `internalMutate` branches on `args.length < 3`:
+ *
+ *   • FEWER than three arguments is the "revalidate this key" form. It resolves with
+ *     `cache.get(key)?.data` — so with a mounted subscriber it yields the refetched value, and with
+ *     NONE it yields THE ENTRY'S EXISTING DATA. This mock holds no cache, so it resolves
+ *     `undefined`: the honest stand-in for an entry nothing has seeded. A suite that needs to model
+ *     a populated entry with no revalidator behind it must say so explicitly, and
+ *     `utils.test.ts` does exactly that in its stale-cache regression case.
+ *   • THREE or more arguments is a cache WRITE. It applies with or without a subscriber and
+ *     resolves with the data it wrote, awaiting it first when a promise was supplied — and
+ *     REJECTS when that promise rejects, because `throwOnError` defaults to true.
+ *
+ * `await data` reproduces both halves in one line, and reproducing them is what stops a suite
+ * passing while production reads a stale entry back as though it were a server response.
  */
-export const frappeSWRMutate = vi.fn<MockedKeyedMutate>(() => Promise.resolve(undefined))
+export const frappeSWRMutate = vi.fn<MockedKeyedMutate>(async (_key, data) => await data)
 
 /**
  * Stable spy for the `mutate` returned by the individual query hooks. Kept distinct from
@@ -1387,8 +1640,9 @@ export const emitFrappeEvent = (eventName: string, eventData: unknown): void => 
  *
  *     grep -rn 'useContext(FrappeContext)' src/ | grep -v src/test/
  *
- * The MEMBERS those modules reach for are `call.get`, `db.getDoc`, `db.getCount`, `db.setValue`,
- * `db.deleteDoc` and `file.uploadFile` (the last reached through a `file: frappeFile` alias), and
+ * The MEMBERS those modules reach for are `call.get`, `db.getDoc`, `db.getDocList`, `db.getCount`,
+ * `db.setValue`, `db.deleteDoc` and `file.uploadFile` (the last reached through a `file: frappeFile`
+ * alias), and
  * that list is the part worth writing down, because it is what this mock has to satisfy. Naming the modules themselves is left to the command above
  * on purpose: the set changed during this very piece of work - the reconciliation hook layer
  * joined it once the rule-evaluation watcher began counting unevaluated transactions - which is

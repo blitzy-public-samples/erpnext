@@ -464,6 +464,102 @@ class TestBankStatementImportLog(ERPNextTestSuite, AccountsTestMixin):
 		restored = {c.maps_to: c.index for c in doc.column_mapping if c.maps_to != "Do not import"}
 		self.assertEqual(restored.get("Description"), 1)
 
+	def test_client_supplied_name_is_discarded_by_the_autoname_rule(self):
+		"""A name sent with the insert is thrown away: this DocType is hash-autonamed.
+
+		The banking SPA cannot know an import log's name before it exists, so it must never
+		recover one by an identifier it chose itself. This pins the server behaviour that
+		makes that true: `set_new_name` clears the supplied `name` for every autoname rule
+		except `prompt` and `UUID`, so the value sent here is neither kept nor resolvable
+		afterwards, and only the identity the server minted can be read back.
+		"""
+		self.assertEqual(frappe.get_meta("Bank Statement Import Log").autoname, "hash")
+
+		supplied_name = "new-bank-statement-import-log-1712345678901"
+		csv_text = "Date,Narration,Amount\n01/04/2024,UPI PAYMENT,500.00\n"
+		file_doc = self._create_unattached_statement_file(csv_text, "csv")
+
+		doc = frappe.get_doc(
+			{
+				"doctype": "Bank Statement Import Log",
+				"name": supplied_name,
+				"bank_account": self.bank_account,
+				"file": file_doc.file_url,
+			}
+		).insert()
+
+		# The server named it, and it is nothing like what the client asked for.
+		self.assertNotEqual(doc.name, supplied_name)
+		self.assertFalse(frappe.db.exists("Bank Statement Import Log", supplied_name))
+		self.assertTrue(frappe.db.exists("Bank Statement Import Log", doc.name))
+
+		# Which is why the SPA recovers an uncertain create through the `file` it sent - the one
+		# key both sides agree on - rather than through the name it sent.
+		recovered = frappe.get_all(
+			"Bank Statement Import Log",
+			filters={"file": file_doc.file_url},
+			fields=["name"],
+			order_by="creation desc",
+			limit_page_length=1,
+		)
+		self.assertEqual([row.name for row in recovered], [doc.name])
+
+	def test_unattached_statement_file_is_linked_to_the_final_document(self):
+		"""An unattached private File is attached to the FINAL log, once, by the framework.
+
+		The SPA uploads the statement with no attachment target precisely because the final
+		name does not exist yet. Frappe's `attach_files_to_document` hook then claims that
+		File on insert and points it at the real document, field and privacy. Asserting it
+		here is what keeps the client's decision honest: were the hook to stop matching, the
+		statement would silently belong to nothing.
+		"""
+		csv_text = "Date,Narration,Amount\n01/04/2024,UPI PAYMENT,500.00\n"
+		file_doc = self._create_unattached_statement_file(csv_text, "csv")
+
+		# Before the log exists the File is deliberately unowned.
+		self.assertIsNone(file_doc.attached_to_doctype)
+		self.assertIsNone(file_doc.attached_to_name)
+		self.assertIsNone(file_doc.attached_to_field)
+
+		doc = frappe.get_doc(
+			{
+				"doctype": "Bank Statement Import Log",
+				"bank_account": self.bank_account,
+				"file": file_doc.file_url,
+			}
+		).insert()
+
+		attachment = frappe.db.get_value(
+			"File",
+			file_doc.name,
+			["attached_to_doctype", "attached_to_name", "attached_to_field", "is_private"],
+			as_dict=True,
+		)
+		self.assertEqual(attachment.attached_to_doctype, "Bank Statement Import Log")
+		self.assertEqual(attachment.attached_to_name, doc.name)
+		self.assertEqual(attachment.attached_to_field, "file")
+		# A statement is customer data: it must stay private through the relink.
+		self.assertEqual(attachment.is_private, 1)
+
+		# Exactly ONE stored copy. Attaching the upload to a client-minted name instead left the
+		# original attached to a document that never existed AND had the hook insert a second row
+		# for the real one - two copies of a customer's bank statement per import.
+		self.assertEqual(frappe.db.count("File", {"file_url": file_doc.file_url}), 1)
+
+		# And the import still reads that same File back off the document.
+		self.assertEqual(doc.get_file_doc().name, file_doc.name)
+
+	def _create_unattached_statement_file(self, content: str, extension: str):
+		"""A private statement File with no attachment target, as an upload with no docname makes."""
+		return frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": f"test-statement-{frappe.generate_hash(length=8)}.{extension}",
+				"is_private": 1,
+				"content": content,
+			}
+		).insert(ignore_permissions=True)
+
 
 test_hdfc_sample_statement_data = [
 	["HDFC BANK Ltd.  Page No .: 1  Statement of accounts", "", "", "", "", "", ""],

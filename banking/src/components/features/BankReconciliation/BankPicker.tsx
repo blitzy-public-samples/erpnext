@@ -1,6 +1,6 @@
 import { useAtom } from "jotai"
 import { SelectedBank, selectedBankAccountAtom } from "./bankRecAtoms"
-import { useCallback, useEffect } from "react"
+import { useCallback } from "react"
 import { useGetBankAccounts, useGetUnreconciledTransactions } from "./utils"
 import { cn } from "@/lib/utils"
 import { getTimeago } from "@/lib/date"
@@ -43,48 +43,6 @@ const BankPicker = ({ className }: { className?: string }) => {
     const selectedCompany = useCurrentCompany()
 
     const { banks, isLoading, error } = useGetBankAccounts(onLoadingSuccess)
-
-    /**
-     * Keeps the STORED selection in step with the server's current row for that account.
-     *
-     * `selectedBankAccountAtom` is an `atomWithStorage` over `localStorage` with `getOnInit`, so the
-     * selected bank is a snapshot of a row as it looked whenever it was last chosen - possibly in a
-     * much earlier session. `onLoadingSuccess` above deliberately leaves that snapshot alone once the
-     * account still exists in the list, which is correct for its own job (it must not fight the
-     * reviewer's choice) but means the snapshot's FIELDS are never refreshed. Six feature surfaces
-     * read `selectedBank.account_currency` from it, and that field is not even stored on
-     * `Bank Account` - `bank_account.get_list` derives it per row from the linked
-     * `Account.account_currency` - so it can move without anything updating the stored copy.
-     *
-     * This runs as an effect on the fetched rows rather than inside `onLoadingSuccess` on purpose:
-     * `onSuccess` fires only for the hook that actually performed a request, so a revalidation
-     * triggered by any other consumer of this shared cache entry would not reach it. `banks` is
-     * derived from that entry, so watching it catches every refresh regardless of who caused it.
-     *
-     * The merge is a spread so any field the endpoint does NOT project (`integration_id`) is
-     * preserved rather than dropped.
-     *
-     * Loop-safe by construction, and the equality test is the reason. It compares the SERIALISED
-     * forms, which is precisely the equivalence that matters here: this atom persists through
-     * `localStorage` as JSON, so two values with the same JSON are the same stored value, and there
-     * is nothing to write. Serialising also settles the fiddly details a field-by-field walk gets
-     * wrong - `undefined` members are dropped identically on both sides, and the endpoint projecting
-     * a field this type does not declare (`account_subtype`) is handled rather than crashing an index
-     * expression. Convergence is one step: the merge keeps the stored key order and can only append,
-     * so after at most one write the two forms are identical and the effect settles. Writing the
-     * selection does not change `banks`, so nothing re-triggers this.
-     */
-    useEffect(() => {
-        if (!selectedBank) return
-
-        const currentRow = banks.find((bank) => bank.name === selectedBank.name)
-        if (!currentRow) return
-
-        const rehydrated: SelectedBank = { ...selectedBank, ...currentRow }
-        if (JSON.stringify(rehydrated) === JSON.stringify(selectedBank)) return
-
-        setSelectedBank(rehydrated)
-    }, [banks, selectedBank, setSelectedBank])
 
     const { themeValue } = useTheme()
 

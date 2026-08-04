@@ -2,7 +2,7 @@ import _ from '@/lib/translate'
 import { GetStatementDetailsResponse } from '../import_utils'
 import { flt, formatCurrency } from '@/lib/numbers'
 import { formatDate } from '@/lib/date'
-import { bankRecDateAtom, bankRecErrorDialogAtom, bankRecImportFailuresAtom, classifyImportAttempt, withImportAttempt, withoutImportAttempt, type ImportAttemptStatus } from '../../BankReconciliation/bankRecAtoms'
+import { bankRecDateAtom, bankRecErrorDialogAtom, bankRecImportFailuresAtom, classifyImportAttempt, classifyParsedStatement, withImportAttempt, withoutImportAttempt, type ImportAttemptStatus } from '../../BankReconciliation/bankRecAtoms'
 import { AlertCircleIcon, ChevronLeftIcon, ChevronRightIcon, ExternalLinkIcon, InfoIcon, Loader2Icon } from 'lucide-react'
 import { H2, H3, Paragraph } from '@/components/ui/typography'
 import { FileTypeIcon } from '@/components/ui/file-dropzone'
@@ -15,12 +15,12 @@ import { FrappeContext, useFrappeEventListener, useFrappePostCall, type FrappeCo
 import { toast } from 'sonner'
 import ErrorBanner from '@/components/ui/error-banner'
 import { Link, useNavigate } from 'react-router'
-import { useContext, useMemo, useState } from 'react'
+import { useContext, useEffect, useMemo, useState } from 'react'
 import { Progress } from '@/components/ui/progress'
 import { useSetAtom } from 'jotai'
 import { useDirection } from '@/components/ui/direction'
 import BankLogo from '@/components/common/BankLogo'
-import { isFrappeErrorEnvelope, toDisplayError, useGetBankAccounts, useRefreshImportedTransactions, useWaitForRuleEvaluation } from '../../BankReconciliation/utils'
+import { isFrappeErrorEnvelope, toDisplayError, useGetBankAccounts, useRefreshImportedTransactions, withDeadline } from '../../BankReconciliation/utils'
 import { BankStatementImportLog } from '@/types/Accounts/BankStatementImportLog'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -85,6 +85,40 @@ const isConfirmedCompletedImport = (doc?: BankStatementImportLog): doc is BankSt
  * A function rather than a constant, so the wording is resolved through the translation layer at
  * the moment it is needed rather than at module load.
  */
+/**
+ * The realtime payload `insert_transactions` publishes on `bank-rec-statement-import-progress`.
+ *
+ * Both members are optional because the server sends two DIFFERENT shapes on the same channel: one
+ * per inserted row carrying only `progress`, and a final one carrying `progress` and `total`
+ * (`bank_statement_import_log.py`, `publish_realtime` calls). Typing it is what stops the two being
+ * confused: the SDK's listener is generic over the payload and defaults to `any`, which is how a
+ * percentage came to be rendered as a transaction count.
+ */
+interface ImportProgressEvent {
+    /** A percentage, 0-100. `round(rows_inserted / total_rows * 100)`. */
+    progress?: number
+    /** The transaction COUNT, sent only on the final event. */
+    total?: number
+}
+
+/**
+ * Narrows a realtime `progress` value to the server's own 0-100 contract, or `undefined` when the
+ * payload carries no usable figure.
+ *
+ * Clamped rather than trusted, because a percentage is a claim about a ratio and a value outside
+ * 0-100 cannot be one: the bar is `max={100}` and the label is read as a percentage, so an
+ * out-of-range figure would render as an impossible "120%" - and a NaN would render as "NaN%".
+ * Neither is something the client should be willing to display, and neither can be corrected by
+ * guessing, so the range is enforced here at the single point the value enters the component.
+ */
+const toProgressPercentage = (value: unknown): number | undefined => {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+        return undefined
+    }
+
+    return Math.min(100, Math.max(0, Math.round(value)))
+}
+
 const unconfirmedImportError = (): FrappeError => ({
     httpStatus: 0,
     httpStatusText: 'Unconfirmed',
@@ -112,7 +146,6 @@ const StatementDetails = ({ data }: Props) => {
 
     // F2: awaited cache invalidation for the imported range. F3: bounded wait for rule evaluation.
     const refreshImportedTransactions = useRefreshImportedTransactions()
-    const waitForRuleEvaluation = useWaitForRuleEvaluation()
 
     const direction = useDirection()
 
@@ -159,6 +192,42 @@ const StatementDetails = ({ data }: Props) => {
     const clearImportAttempt = () => {
         setImportFailures((previousAttempts) => withoutImportAttempt(previousAttempts, data.doc.bank_account, data.doc.name))
     }
+
+    /**
+     * FM2, zero-row case: whether the SERVER's own parse of this file recognised no transactions at
+     * all. Derived from the response - the log's status and the count of transactions the server
+     * built from the mapping it detected - so nothing here is a client judgement about the file.
+     */
+    const invalidStatement = classifyParsedStatement({
+        status: data.doc.status,
+        finalTransactionCount: data.final_transactions?.length ?? 0
+    })
+
+    /**
+     * Records that observation against this bank account and log, so the importer list can show a
+     * PER-FILE indicator for it.
+     *
+     * Without this, an unusable file was reported only on THIS screen: the Import control was
+     * disabled and an inline alert explained why, but `Bank Statement Import Log` has two status
+     * values and no error field, so the log sat at `Not Started` forever and Previous Imports
+     * presented it exactly like a statement merely waiting to be imported. FM2 requires the failure
+     * to be visible per file, and the marker is the only place it can live.
+     *
+     * It is also RETIRED when the file later parses to rows - a PDF whose tables the reviewer
+     * re-mapped, say - and the retirement is narrowed to the `invalid` status so it cannot erase a
+     * `failed` or `unknown` marker, which describe an import ATTEMPT rather than the file. The
+     * helpers return the same map when nothing needs changing, so this effect cannot loop.
+     *
+     * The marker the OTHER producer writes - the detail route, when the server refuses to produce
+     * the details at all - is retired by that route itself on the visit where the details do load,
+     * for the same reason and with the mirror-image narrowing. Splitting retirement the same way
+     * production is split is what keeps the two producers from erasing each other's work.
+     */
+    useEffect(() => {
+        setImportFailures((previousAttempts) => invalidStatement
+            ? withImportAttempt(previousAttempts, data.doc.bank_account, data.doc.name, invalidStatement)
+            : withoutImportAttempt(previousAttempts, data.doc.bank_account, data.doc.name, 'invalid'))
+    }, [invalidStatement, data.doc.bank_account, data.doc.name, setImportFailures])
 
     /**
      * Applies the outcome of an import the server has CONFIRMED as completed. Extracted so the
@@ -210,7 +279,18 @@ const StatementDetails = ({ data }: Props) => {
         clearImportAttempt()
 
         if (fromDate && toDate) {
-            await waitForRuleEvaluation(data.doc.bank_account, fromDate, toDate)
+            /*
+             * The imported range is re-read, and that is ALL that happens here.
+             *
+             * The client does NOT re-enqueue rule evaluation and does not poll for it to converge.
+             * Doing so meant re-invoking a whitelisted background-job endpoint from the browser and
+             * then issuing up to eight `Bank Transaction` count queries per import, on every import,
+             * on a screen that had already finished its own work - a client-side orchestration of a
+             * server-side schedule that this work is not authorised to add. Rule evaluation is the
+             * scheduler's job (`hooks.py`), the stamped `matched_transaction_rule` shows up on the
+             * next read of the list either way, and nothing about the reconciliation workflow depends
+             * on the suggestion having arrived by the time the reviewer gets there.
+             */
             await refreshImportedTransactions(data.doc.bank_account, fromDate, toDate)
         }
 
@@ -257,10 +337,19 @@ const StatementDetails = ({ data }: Props) => {
     ): Promise<void> => {
         let confirmedLog: BankStatementImportLog | undefined
         try {
-            confirmedLog = await db.getDoc<BankStatementImportLog>('Bank Statement Import Log', data.doc.name)
-        } catch (confirmationError) {
+            // BOUNDED. The Import control stays closed for the whole of this confirming read, and
+            // neither `db.getDoc` nor the Axios instance under it accepts a timeout - so without a
+            // deadline a request that never answers leaves the reviewer unable to retry an import
+            // whose outcome they were never told. An expiry yields `undefined`, which the
+            // classification below already treats as "no status could be obtained" - i.e. `unknown`,
+            // never `failed`, because a lost answer is not evidence that nothing happened.
+            confirmedLog = await withDeadline(db.getDoc<BankStatementImportLog>('Bank Statement Import Log', data.doc.name))
+        } catch {
             // The confirmation itself failed, so the outcome stays unknown rather than being guessed.
-            console.error(confirmationError)
+            // Reported as a FIXED diagnostic rather than as the caught object: a Frappe rejection
+            // carries the whole response envelope, and a bank statement's transport detail does not
+            // belong in a browser console.
+            console.error('Bank statement import: the import log could not be re-read, so the outcome stays indeterminate.')
         }
 
         const outcome = classifyImportAttempt({
@@ -348,7 +437,7 @@ const StatementDetails = ({ data }: Props) => {
                 // Terminated HERE rather than in the catch below, which would otherwise re-run the
                 // whole settlement and judge this handler's own failure as though the SERVER had
                 // refused the import.
-            }).catch((handlerError) => console.error(handlerError))
+            }).catch(() => console.error('Bank statement import: the unconfirmed-import settlement did not complete.'))
         }).catch((importError: unknown) => {
             // Handled asynchronously because the server must be consulted before any outcome is
             // recorded; the terminal catch keeps that handler from ever escaping as an unhandled
@@ -360,15 +449,32 @@ const StatementDetails = ({ data }: Props) => {
                 serverRejected: isFrappeErrorEnvelope(importError),
                 displayError: toDisplayError(importError),
                 transientMessage: _("There was an error while importing the bank statement.")
-            }).catch((handlerError) => console.error(handlerError))
+                // Fixed diagnostic only; see the note on the confirming read above.
+            }).catch(() => console.error('Bank statement import: the refused-import settlement did not complete.'))
         })
 
     }
 
+    /**
+     * The import's realtime progress, as the SERVER's own unit: a PERCENTAGE, 0-100.
+     *
+     * `insert_transactions` publishes `round(rows_inserted / total_rows * 100)` per row, so reading
+     * the figure as a transaction count made a three-row statement announce "33 transactions" at its
+     * first row and a 300-row one never report more than 100. The progress BAR was always right - it
+     * is fed `max={100}` - so the label and the bar disagreed with each other on the same screen.
+     */
     const [progress, setProgress] = useState(0)
 
-    useFrappeEventListener("bank-rec-statement-import-progress", (event) => {
-        setProgress(event.progress)
+    useFrappeEventListener<ImportProgressEvent>("bank-rec-statement-import-progress", (event) => {
+        const percentage = toProgressPercentage(event?.progress)
+
+        // An unusable payload leaves the last known figure alone rather than resetting the bar to
+        // zero: a malformed push is not evidence that the import has gone backwards.
+        if (percentage === undefined) {
+            return
+        }
+
+        setProgress(percentage)
     })
 
     const file_name = data.doc.file.split("/").pop() ?? ""
@@ -417,8 +523,13 @@ const StatementDetails = ({ data }: Props) => {
                     </div>
                 </div>
 
+                {/*
+                  * The label states the server's own unit. `progress` is a PERCENTAGE (see
+                  * `toProgressPercentage`), so it is rendered as one - which also makes it agree
+                  * with the bar beside it, which has always been `max={100}`.
+                  */}
                 {progress > 0 && <div className='flex flex-col gap-2'><Progress value={progress} max={100} size="lg" />
-                    <span className='text-sm'>{_("Importing {0} transactions", [progress.toString()])}
+                    <span className='text-sm'>{_("Importing transactions - {0}% complete", [progress.toString()])}
                     </span>
                 </div>}
 
@@ -490,15 +601,15 @@ const StatementDetails = ({ data }: Props) => {
                         </TableRow>
                         <TableRow>
                             <TableHead>{_("Total Debits")}</TableHead>
-                            <TableCell><span className='font-numeric'>{formatCurrency(flt(data.doc.total_debits, 2), data.currency)}</span> <span className='text-ink-gray-5 font-sans'>({data.doc.total_debit_transactions} {data.doc.total_debit_transactions === 1 ? _("transaction") : _("transactions")})</span></TableCell>
+                            <TableCell><span className='font-numeric'>{formatCurrency(flt(data.doc.total_debits, 2), data.doc.currency)}</span> <span className='text-ink-gray-5 font-sans'>({data.doc.total_debit_transactions} {data.doc.total_debit_transactions === 1 ? _("transaction") : _("transactions")})</span></TableCell>
                         </TableRow>
                         <TableRow>
                             <TableHead>{_("Total Credits")}</TableHead>
-                            <TableCell><span className='font-numeric'>{formatCurrency(flt(data.doc.total_credits, 2), data.currency)}</span> <span className='text-ink-gray-5 font-sans'>({data.doc.total_credit_transactions} {data.doc.total_credit_transactions === 1 ? _("transaction") : _("transactions")})</span></TableCell>
+                            <TableCell><span className='font-numeric'>{formatCurrency(flt(data.doc.total_credits, 2), data.doc.currency)}</span> <span className='text-ink-gray-5 font-sans'>({data.doc.total_credit_transactions} {data.doc.total_credit_transactions === 1 ? _("transaction") : _("transactions")})</span></TableCell>
                         </TableRow>
                         <TableRow>
                             <TableHead>{_("Closing Balance as of {}", [formatDate(data.doc.end_date, "Do MMMM YYYY")])}</TableHead>
-                            <TableCell className='font-numeric'>{formatCurrency(flt(data.doc.closing_balance, 2), data.currency)}</TableCell>
+                            <TableCell className='font-numeric'>{formatCurrency(flt(data.doc.closing_balance, 2), data.doc.currency)}</TableCell>
                         </TableRow>
                         <TableRow>
                             <TableHead>
@@ -569,8 +680,8 @@ const StatementDetails = ({ data }: Props) => {
                                         <TableCell>{formatDate(transaction.date)}</TableCell>
                                         <TableCell className='max-w-[200px] w-fit overflow-hidden text-ellipsis'>{transaction.description}</TableCell>
                                         <TableCell className='max-w-[100px] w-fit overflow-hidden text-ellipsis'>{transaction.reference}</TableCell>
-                                        <TableCell className='text-end font-numeric'>{formatCurrency(transaction.withdrawal, data.currency)}</TableCell>
-                                        <TableCell className='text-end font-numeric'>{formatCurrency(transaction.deposit, data.currency)}</TableCell>
+                                        <TableCell className='text-end font-numeric'>{formatCurrency(transaction.withdrawal, data.doc.currency)}</TableCell>
+                                        <TableCell className='text-end font-numeric'>{formatCurrency(transaction.deposit, data.doc.currency)}</TableCell>
                                     </TableRow>
                                 ))}
                             </TableBody>

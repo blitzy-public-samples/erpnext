@@ -33,6 +33,8 @@ and TypeScript, and it is served by the host ERPNext app at `/banking`.
 - [Linting](#linting)
 - [Source layout](#source-layout)
 - [Conventions](#conventions)
+- [Workflow behaviour and the five failure modes](#workflow-behaviour-and-the-five-failure-modes)
+- [Scope boundaries](#scope-boundaries)
 - [Intentionally unchanged files](#intentionally-unchanged-files)
 
 ## Stack
@@ -125,11 +127,13 @@ yarn build                       # requires ../../../sites/common_site_config.js
 | `dev` | `vite` | Dev server on host `0.0.0.0`, port `8080`, proxying `^/(app\|api\|assets\|files\|private)` to the local Frappe webserver. **Requires the bench config file** — see [below](#the-bench-config-prerequisite--and-why-test-does-not-share-it). |
 | `build` | `vite build --base=/assets/erpnext/banking/ && yarn copy-html-entry` | **Does not type-check** — run `typecheck` for that. **Requires the bench config file.** |
 | `lint` | `eslint .` | Flat config; lints every `**/*.{ts,tsx}`; ignores `dist` and `coverage`. |
-| `preview` | `vite preview` | Serves a previously produced build. |
+| `preview` | `vite preview` | Serves a previously produced build. **Requires the bench config file** (it loads `vite.config.ts` too) **and a prior `build`** — without one it starts and answers 404. |
 | `copy-html-entry` | `cp ../erpnext/public/banking/index.html ../erpnext/www/banking.html` | Internal helper, invoked by `build`. |
 | `test` | `vitest run` | **Non-watch by construction** — a bare `vitest` enters watch mode, which is unusable in CI or any non-interactive context. **Does not require the bench config file.** |
 | `test:coverage` | `vitest run --coverage` | V8 provider; emits `text` + `json-summary` + `lcov`; **fails the process** below the configured line thresholds. |
 | `typecheck` | `tsc -b` | Builds the TypeScript solution. It exists because **`build` never invokes the compiler**, so without this script a type error would not be observable from this package's scripts at all. |
+| `verify` | `yarn typecheck && yarn lint && yarn test:coverage` | The acceptance gate, in one non-watch, bench-independent command. Run this before proposing a change. |
+| `ci` | `yarn verify && yarn build` | `verify` plus the production bundle. **Requires the bench config file**, because of the `build` step. |
 
 ## The bench-config prerequisite — and why `test` does not share it
 
@@ -146,7 +150,7 @@ const common_site_config = JSON.parse(
 
 `vite.config.ts` imports that module at the top level. Therefore:
 
-- **`dev` and `build` require** a Frappe Bench-style `sites/common_site_config.json` to exist
+- **`dev`, `build` and `preview` require** a Frappe Bench-style `sites/common_site_config.json` to exist
   three levels above this directory — that is, **outside the repository checkout**, at the
   usual bench root. Without it, `vite build` aborts before bundling anything with
   `failed to load config from …/vite.config.ts` followed by
@@ -386,16 +390,65 @@ configuration has been deliberately removed rather than carried over.
 - **Styling uses design tokens, never hardcoded values,** and UI is built from the primitives in
   `src/components/ui/` rather than raw HTML elements.
 
+## Workflow behaviour and the five failure modes
+
+The workflow is: **import a statement → review the rule-suggested match → confirm it or override
+it → post the reconciliation**. Everything below describes how that behaves when something goes
+wrong, because those behaviours are requirements rather than implementation details.
+
+The server is the authority throughout. One dismissible error dialog serves every surface: it is
+driven by a single in-memory atom, mounted at three sites (the workbench, the statement-import step
+and the importer list, which live in different route trees), and it passes the Frappe error
+envelope through **unmodified** so the backend's own wording, title and severity reach the reviewer
+verbatim. It closes on `Escape` and on **Dismiss**, and dismissing it changes nothing else.
+
+| # | Situation | Behaviour |
+| --- | --- | --- |
+| **FM1** | The confirm/post request fails — refused by the server, or no response at all | The dialog shows the server's own message. Confirm/post is **one** server-side call and **nothing is mutated optimistically**, so the transaction stays unreconciled with its state unchanged and no partial or duplicate posting is possible. A rejection carrying no envelope is reported as *indeterminate* — never as "nothing was posted" — and the reviewer is sent to check the record rather than invited to retry blindly. The two transaction-list cache keys are then re-read from the server, so the affordance re-evaluates against the server's current figures. |
+| **FM2** | A malformed or empty statement file | The importer list carries a **per-file** indicator, and no transaction is ever created client-side. Three distinct states: **Failed** (the server refused the import, or refused to produce the statement's details), **No Transactions** (the server parsed the file and recognised nothing importable in it — its own words, and the reason the log sits at `Not Started` forever), and **Unknown** (no server envelope came back, so the outcome could not be established). A server `Completed` status always outranks every marker, and a marker is retired as soon as the condition that produced it has passed. The markers exist because `Bank Statement Import Log` has exactly two status values and **no error field**, so the failure has nowhere else to live. |
+| **FM3** | The transaction has already been reconciled | Confirm is **disabled**, on the backend's own predicate — `status === 'Reconciled'` or `unallocated_amount <= 0`, which the server derives from each other — and a tooltip says why. This is an affordance, not the control: the authoritative guard is the first statement of the first method `reconcile_vouchers` invokes. A stale client that gets through is refused by the server, and that refusal surfaces in the same dialog before the affected caches are re-read. |
+| **FM4** | A re-import produces duplicate transactions | Rendered exactly as the backend produces them. **There is no client-side deduplication, and none may be added.** |
+| **FM5** | The transaction's currency differs from the bank account's | A **non-blocking** amber advisory badge beside the rule badge. It does **not** disable confirm; whatever the backend enforces is what happens, and a rejection surfaces through the FM1 path. Both sides resolve the currency through the same lookup (`Bank Account.account` → `Account.account_currency`), so the indicator cannot disagree with the server. |
+
+## Scope boundaries
+
+What this package does **not** do, stated so a reader does not go looking:
+
+| Boundary | Status |
+| --- | --- |
+| Backend endpoints | **None added.** Every call the workflow makes already existed and was already whitelisted. |
+| DocType schema | **No** field, status option, JSON edit, migration or patch entry. |
+| REST/RPC contract | Unchanged, including the call style: module functions by dotted path, the one document method through the generic `run_doc_method` bridge. |
+| Routes and providers | Unchanged. The dialog is mounted inside existing trees; no route or provider was added. |
+| Design system | **No** new token and **no** new primitive. New affordances compose the primitives in `src/components/ui/`. |
+| CI workflows | Unchanged. The Python suites are already discovered on both database engines; the frontend gate is `yarn verify`, which is **not** yet wired into a workflow — doing so is a workflow change and belongs to whoever owns those files. |
+| `frappe/` submodule | Untouched, pointer and contents. `frappe/cypress/` is referenced for **conventions only**; no Cypress spec is added here. |
+| Backend diff | One **additive** test module per bank DocType directory that needed coverage. No backend source file changes. |
+
+Out of scope as features: no Plaid interface, no MT-940/XML ingestion in this SPA (the dropzone
+accepts CSV, XLSX, XLS and PDF, and the server-side reader rejects anything else), no currency
+conversion or revaluation, no multi-entity reconciliation, no client-side deduplication, and no
+change to general-ledger posting or to the legacy Desk reconciliation tool.
+
 ## Intentionally unchanged files
 
 These are load-bearing and are deliberately left as they are. Read them for context; do not edit
 them as a side effect of feature work:
 
-`vite.config.ts` · `tsconfig.json` · `tsconfig.app.json` · `tsconfig.node.json` ·
-`eslint.config.js` · `.gitignore` · `.env.production` · `index.html` · `src/index.css` ·
-everything under `src/components/ui/` · everything under `src/types/` · and the
-`"version": "0.0.0"` field in `package.json`.
+`vite.config.ts` · `tsconfig.json` · `tsconfig.app.json` · `.env.production` · `index.html` ·
+`src/index.css` · everything under `src/types/` · and the `"version": "0.0.0"` field in
+`package.json` — a Vite-scaffold artefact, not a statement about how complete this application is.
 
-The same applies to `vitest.config.ts`'s independence from `vite.config.ts` and to the
+Four files in that neighbourhood **did** change, each for one narrow reason, and each is worth
+knowing about before you assume it is untouched:
+
+| File | The one change, and why |
+| --- | --- |
+| `tsconfig.node.json` | `vitest.config.ts` added to `include`, so the runner's own configuration is type-checked. `tsc -b` only ever sees a file some project includes, so without that line a type error there is silently undetected. |
+| `eslint.config.js` | `coverage` added to `globalIgnores`. The V8 HTML report ships its own vendored scripts, so linting it made the result of `eslint .` depend on whether a coverage run had happened first. |
+| `.gitignore` | `coverage` added, for the same output. Running the required gate must not leave the working tree dirty. |
+| `src/components/ui/markdown.tsx` | Its same-origin link filter. This renderer is the sink for server-authored `_server_messages`, and the error dialog put that sink on a financial posting screen — so an off-origin `href` written by the server is refused, including every backslash spelling of the scheme-relative form, and a backslash is refused outright rather than folded into `/`. |
+
+The same care applies to `vitest.config.ts`'s independence from `vite.config.ts` and to the
 `resolutions` field: both look like tidy-up candidates and both are load-bearing, which is why
 each has its own section above.

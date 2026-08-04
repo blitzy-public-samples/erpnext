@@ -7,12 +7,14 @@
  *     non-zero value; without it NO row renders. The spy is restored per test, because the shared
  *     teardown resets mock functions and not property getters.
  *
- *  2. A `TooltipProvider` and a router are required, not decorative: Radix's tooltip root throws
- *     without a provider ancestor, and the "no transactions" empty state renders a `<Link>`. Jotai
- *     is per-provider and the harness performs no global store reset, so each test builds its own
- *     store and seeds `selectedBankAccountAtom` (the component early-returns without it) and
- *     `bankRecDateAtom` (interpolated into the cache keys, so seeding it keeps key assertions
- *     independent of the calendar month).
+ *  2. A router is required, not decorative: the "no transactions" empty state renders a `<Link>`.
+ *     A `TooltipProvider` is deliberately NOT supplied by default - the subject wraps every tooltip
+ *     it renders in its own provider, and a harness-supplied one would hide a missing local provider
+ *     (see `withAncestorTooltipProvider` for the single scoped opt-in, which exists only for the
+ *     out-of-scope modal bodies). Jotai is per-provider and the harness performs no global store
+ *     reset, so each test builds its own store and seeds `selectedBankAccountAtom` (the component
+ *     early-returns without it) and `bankRecDateAtom` (interpolated into the cache keys, so seeding
+ *     it keeps key assertions independent of the calendar month).
  *
  *  3. The currency advisory chip is a `Badge` inside a `TooltipTrigger asChild`, and Radix's `Slot`
  *     spreads the trigger's props AFTER the Badge's - so `data-slot="badge"` is OVERWRITTEN with
@@ -21,10 +23,11 @@
  *     row so it cannot collide with the voucher panel's own orange "Partial Match" badge.
  */
 
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Provider, createStore } from 'jotai'
 import { MemoryRouter } from 'react-router'
+import { TooltipProvider } from '@/components/ui/tooltip'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
 	TEST_ALTERNATE_CURRENCY,
@@ -36,6 +39,7 @@ import {
 	createFrappeSDKMock,
 	formatAlreadyReconciledMessage,
 	frappeHookMutate,
+	frappeContextValue,
 	frappePostCall,
 	frappeSDKMock,
 	frappeSWRMutate,
@@ -83,7 +87,6 @@ const { toastSuccess, toastError } = vi.hoisted(() => ({
 
 vi.mock('sonner', () => ({ toast: { success: toastSuccess, error: toastError } }))
 
-import { TooltipProvider } from '@/components/ui/tooltip'
 import MatchAndReconcile from './MatchAndReconcile'
 import {
 	bankRecAmountFilter,
@@ -243,13 +246,15 @@ interface WorkbenchOptions {
 	vouchers?: LinkedPayment[]
 	selected?: UnreconciledTransaction[]
 	/**
-	 * The account currency the SERVER'S CURRENT bank-account list reports.
+	 * The account currency carried by the selected bank account.
 	 *
-	 * This - not the stored selection - is what the mismatch advisory compares against, because
-	 * `account_currency` is derived by the endpoint from the linked GL account and a stored
-	 * snapshot can name a currency the account no longer uses. Pass `null` to model an account
-	 * whose currency the endpoint could not derive; `null` rather than `undefined`, because an
-	 * omitted option has to remain distinguishable from one deliberately left unresolved.
+	 * `account_currency` is not a `Bank Account` field: `bank_account.get_list` derives it per row
+	 * from the linked `Account.account_currency`, and the bank picker stores the row it was given -
+	 * which is why the currency reaches this component through the selection atom, and why it can be
+	 * absent. Pass `null` to model an account whose currency the endpoint could not derive; `null`
+	 * rather than `undefined`, because an omitted option has to remain distinguishable from one
+	 * deliberately left unresolved. Applied to BOTH the stored selection and the list response, so
+	 * the two can never disagree inside a test.
 	 */
 	accountCurrency?: string | null
 	withoutBank?: boolean
@@ -261,6 +266,20 @@ interface WorkbenchOptions {
 	settling?: boolean
 	dialogError?: QueryError
 	amountFilter?: number
+	/*
+	 * Supplies an ANCESTOR `TooltipProvider`, for the two tests that open a create-a-voucher modal.
+	 *
+	 * It is off by default and must stay that way. The subject wraps every tooltip IT renders in its
+	 * own provider, so the default (absent) case is the real production contract for this file and
+	 * is what proves that composition - a harness-supplied provider would hide a missing local one.
+	 *
+	 * The exception is the lazily-loaded modal BODIES (`TransferModalContent`,
+	 * `RecordPaymentModalContent`, `BankEntryModalContent`). Those are separate, out-of-scope
+	 * components that legitimately consume the application-level provider `App.tsx` wraps the whole
+	 * router in, and they throw without an ancestor. Opting in for exactly those two tests keeps the
+	 * compensation visible and scoped, instead of blanketing the whole file with it.
+	 */
+	withAncestorTooltipProvider?: boolean
 }
 
 /*
@@ -282,13 +301,14 @@ const renderWorkbench = (options: WorkbenchOptions = {}) => {
 		olderCount = 0,
 		settling = false,
 		dialogError,
-		amountFilter
+		amountFilter,
+		withAncestorTooltipProvider = false
 	} = options
 
 	const store = createStore()
 
 	if (!withoutBank) {
-		store.set(selectedBankAccountAtom, BANK)
+		store.set(selectedBankAccountAtom, makeSelectedBank({ account_currency: accountCurrency ?? undefined }))
 	}
 	store.set(bankRecDateAtom, { fromDate: FROM_DATE, toDate: TO_DATE })
 	store.set(SELECTED_TRANSACTION_ATOM, selected)
@@ -339,13 +359,21 @@ const renderWorkbench = (options: WorkbenchOptions = {}) => {
 
 	frappeSDKMock.useFrappeGetDoc.mockImplementation(() => answered(rule))
 
+	/*
+	 * By DEFAULT there is no outer `TooltipProvider`. The subject composes its own provider around
+	 * every tooltip it renders, and supplying one here unconditionally would MASK a missing local
+	 * provider - the component would look mountable in the suite while throwing wherever it is not
+	 * wrapped at this level. See `withAncestorTooltipProvider` for the one scoped exception.
+	 */
+	const subject = (
+		<MemoryRouter>
+			<MatchAndReconcile contentHeight={CONTENT_HEIGHT} />
+		</MemoryRouter>
+	)
+
 	const utils = render(
 		<Provider store={store}>
-			<TooltipProvider>
-				<MemoryRouter>
-					<MatchAndReconcile contentHeight={CONTENT_HEIGHT} />
-				</MemoryRouter>
-			</TooltipProvider>
+			{withAncestorTooltipProvider ? <TooltipProvider>{subject}</TooltipProvider> : subject}
 		</Provider>
 	)
 
@@ -795,7 +823,9 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 	describe('creating a voucher instead of matching one', () => {
 		it('opens each create-a-voucher route for the transaction under review', async () => {
 			const user = userEvent.setup()
-			renderWorkbench({ transactions: [DEPOSIT_ROW], selected: [DEPOSIT_ROW] })
+			// The only two tests that need an ancestor provider: the lazily-loaded modal BODIES are
+			// separate, out-of-scope components that consume the application-level provider.
+			renderWorkbench({ transactions: [DEPOSIT_ROW], selected: [DEPOSIT_ROW], withAncestorTooltipProvider: true })
 
 			await waitFor(() => {
 				expect(transactionRow(DEPOSIT_ROW)).toBeInTheDocument()
@@ -815,7 +845,9 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			const user = userEvent.setup()
 			renderWorkbench({
 				transactions: [DEPOSIT_ROW, WITHDRAWAL_ROW],
-				selected: [DEPOSIT_ROW, WITHDRAWAL_ROW]
+				selected: [DEPOSIT_ROW, WITHDRAWAL_ROW],
+				// Same reason: this path opens the out-of-scope modal bodies too.
+				withAncestorTooltipProvider: true
 			})
 
 			await waitFor(() => {
@@ -834,7 +866,8 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 
 		it('honours the shortcuts its own tooltips advertise', async () => {
 			const user = userEvent.setup()
-			renderWorkbench({ transactions: [DEPOSIT_ROW], selected: [DEPOSIT_ROW] })
+			// Opens the same modal bodies as the test above, hence the same scoped opt-in.
+			renderWorkbench({ transactions: [DEPOSIT_ROW], selected: [DEPOSIT_ROW], withAncestorTooltipProvider: true })
 
 			await waitFor(() => {
 				expect(transactionRow(DEPOSIT_ROW)).toBeInTheDocument()
@@ -918,7 +951,8 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			const suggested = makeSuggestedLinkedPayment(DEPOSIT_ROW)
 			const unrelated = makeAlternateLinkedPayment()
 			// An invoice row as `get_linked_payments` really returns one: the amount agrees but both
-			// reference columns are the empty string, which is evidence of nothing.
+			// reference columns are the empty string. It is included so the badge grid is asserted
+			// against the shapes the endpoint actually produces, not only against tidy ones.
 			const blankReference = makeBlankReferenceLinkedPayment()
 
 			renderWorkbench({
@@ -931,8 +965,9 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 				expect(screen.getByRole('link', { name: suggested.name })).toBeInTheDocument()
 			})
 
-			// Only the first candidate, which agrees on amount AND on a date or reference, is
-			// presented as the suggestion.
+			// The suggestion is the FIRST candidate that agrees on amount AND on a date or reference —
+			// the scoring is `index === 0` gated, which is why position matters here and why the two
+			// later rows carry no Suggested badge whatever they agree on.
 			const suggestedBadge = within(voucherCard(suggested)).getByText('Suggested')
 			expect(suggestedBadge).toHaveAttribute('data-theme', 'green')
 			expect(within(voucherCard(unrelated)).queryByText('Suggested')).not.toBeInTheDocument()
@@ -941,6 +976,7 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			expect(within(voucherCard(suggested)).getByText('Complete Match')).toBeInTheDocument()
 			expect(within(voucherCard(unrelated)).getByText('No Match')).toBeInTheDocument()
 
+			// An empty `reference_no` renders no reference row at all, so no grade badge accompanies it.
 			expect(within(voucherCard(blankReference)).queryByText('No Match')).not.toBeInTheDocument()
 			expect(within(voucherCard(blankReference)).queryByText('Complete Match')).not.toBeInTheDocument()
 		})
@@ -1149,8 +1185,10 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 		it('revalidates the candidate list too when the server reports a partial allocation', async () => {
 			// A partial allocation keeps the reviewer on the same transaction, so its remaining
 			// candidates have to be re-read as well - the voucher just consumed is no longer one.
+			// The unallocated figure alone states the branch: the builder derives the allocated
+			// amount, the status and the child allocation row that must accompany it.
 			frappePostCall.mockResolvedValue(
-				makeReconcileSuccessResponse({ unallocated_amount: 2500, status: 'Unreconciled' })
+				makeReconcileSuccessResponse({ unallocated_amount: 2500 })
 			)
 
 			const { store } = await confirmSuggested()
@@ -1202,6 +1240,55 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 
 			await user.click(control)
 			expect(frappePostCall).not.toHaveBeenCalled()
+		})
+
+		/*
+		 * ⚠️ The ACCEPTED path has the same window, driven from the real flow rather than from a seeded
+		 * flag: the post has succeeded, but the list and balance are still being re-read and the
+		 * selection has not yet been rebuilt from them. Holding the invalidation open is what makes
+		 * that window observable at all - it previously collapsed into a microtask because the refresh
+		 * was started and never awaited, so the control reopened over a superseded snapshot and the
+		 * voucher just consumed was offered a second time.
+		 */
+		it('keeps the affordance closed until the accepted post\'s refresh converges', async () => {
+			const user = userEvent.setup()
+			frappePostCall.mockResolvedValue(makeReconcileSuccessResponse())
+
+			let releaseRefresh!: () => void
+			const heldRefresh = new Promise<undefined>((resolve) => {
+				releaseRefresh = () => resolve(undefined)
+			})
+			frappeSWRMutate.mockImplementation(() => heldRefresh)
+
+			renderWorkbench({ transactions: [DEPOSIT_ROW], selected: [DEPOSIT_ROW], vouchers: [suggested] })
+
+			await waitFor(() => {
+				expect(screen.getByRole('button', { name: 'Reconcile' })).toBeInTheDocument()
+			})
+			await user.click(confirmControlFor(suggested))
+
+			// The reviewer has already been told it worked, and the control is closed - labelled for
+			// the state it is actually in, which is "resolving against the server", not "posting".
+			await waitFor(() => {
+				expect(toastSuccess).toHaveBeenCalledTimes(1)
+			})
+			const settling = await screen.findByRole('button', { name: /Checking/ })
+			expect(settling).toBeDisabled()
+
+			await user.click(settling)
+			expect(frappePostCall).toHaveBeenCalledTimes(1)
+
+			await act(async () => {
+				releaseRefresh()
+				await heldRefresh
+			})
+
+			// Convergence reached: the refreshed list no longer contains the transaction, so the
+			// selection is cleared and there is nothing left to confirm at all.
+			await waitFor(() => {
+				expect(screen.queryByRole('button', { name: /Checking/ })).not.toBeInTheDocument()
+			})
+			expect(screen.queryByRole('button', { name: 'Reconcile' })).not.toBeInTheDocument()
 		})
 	})
 
@@ -1346,9 +1433,11 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 		})
 
 		/*
-		 * After a rejection the selection is rebuilt from refreshed server rows; no status is written
-		 * locally. A reconciled row can only arrive on the all-transactions key, because the
-		 * unreconciled endpoint filters on `unallocated_amount > 0`.
+		 * After a rejection the selection is rebuilt from the server's own answer to an imperative
+		 * read; no status is written locally. The read carries `all_transactions`, so a row the server
+		 * now considers reconciled comes back present with its true status rather than being filtered
+		 * out - and, critically, it cannot be served from the cache, so an unmounted tab's stale entry
+		 * cannot put the pre-attempt row back and re-enable this control.
 		 */
 		it('closes after a refusal, from the server\'s refreshed row', async () => {
 			const user = userEvent.setup()
@@ -1361,12 +1450,15 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 
 			frappePostCall.mockRejectedValue(makeAlreadyReconciledError(stale.name))
 
+			// The cached all-transactions entry still holds the PRE-ATTEMPT row, exactly as an
+			// unsubscribed key's mutate would hand it back. It must contribute nothing.
 			frappeSWRMutate.mockImplementation((key: unknown) =>
-				Promise.resolve(key === BANK_TRANSACTIONS_KEY
-					? {
-						message: [{ ...stale, status: 'Reconciled', unallocated_amount: 0 }]
-					}
-					: undefined))
+				Promise.resolve(key === BANK_TRANSACTIONS_KEY ? { message: [stale] } : undefined))
+
+			// What the server actually holds, read imperatively.
+			frappeContextValue.call.get.mockResolvedValue({
+				message: [{ ...stale, status: 'Reconciled', unallocated_amount: 0 }]
+			})
 
 			const { store } = renderWorkbench({
 				transactions: [stale],

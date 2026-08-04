@@ -213,6 +213,16 @@ const makeImportLog = (overrides: Partial<BankStatementImportLog> = {}): BankSta
 		...overrides
 	})
 
+/*
+ * The response, shaped exactly as `get_statement_details` returns it: `doc`, `date_format`,
+ * `conflicting_transactions`, `final_transactions` and `raw_data`, and NOTHING else.
+ *
+ * ⚠️ There is deliberately NO top-level `currency` member. One was declared on the interface and
+ * supplied here, but the endpoint never sends it, so every amount on this screen was formatted with
+ * `undefined` and fell back to the SYSTEM currency - which an INR-only fixture cannot detect,
+ * because the fallback and the truth agree. The statement's currency is `doc.currency`, and the
+ * non-default-currency case below is what proves the screen now reads it from there.
+ */
 const makeStatementDetails = (
 	overrides: Partial<GetStatementDetailsResponse> = {}
 ): GetStatementDetailsResponse => ({
@@ -221,7 +231,6 @@ const makeStatementDetails = (
 	final_transactions: FINAL_TRANSACTIONS,
 	date_format: DETECTED_DATE_FORMAT,
 	raw_data: RAW_DATA,
-	currency: TEST_CURRENCY,
 	...overrides
 })
 
@@ -396,6 +405,49 @@ describe('StatementDetails', () => {
 			expect(rowLabelled('Closing Balance as of 31st January 2024')).toHaveTextContent('₹ 152,300.75')
 		})
 
+		/*
+		 * ⚠️ THE F2 REGRESSION, and the reason it needs a NON-DEFAULT currency to be visible at all.
+		 *
+		 * Every figure on this screen used to be formatted with a response-level `currency` member
+		 * that `get_statement_details` does not send (it returns `doc`, `date_format`,
+		 * `conflicting_transactions`, `final_transactions` and `raw_data`). The value was therefore
+		 * always `undefined`, and `formatCurrency` fell back to the system default - which an
+		 * INR-only fixture cannot detect, because the fallback happened to be right. A statement on a
+		 * USD bank account reported every one of its amounts with the wrong symbol.
+		 *
+		 * The document's own `currency` is the authority: a native read-only field populated from the
+		 * bank account's GL account currency. Nothing here supplies a top-level key - the interface no
+		 * longer has one - so a screen that regressed to reading it would fall back to `₹` and fail.
+		 */
+		it('formats every amount in the DOCUMENT\u2019s currency, not the system default', () => {
+			renderStatementDetails(
+				makeStatementDetails({
+					doc: makeImportLog({ currency: TEST_ALTERNATE_CURRENCY })
+				})
+			)
+
+			expect(rowLabelled('Total Debits')).toHaveTextContent('$ 15,900.25')
+			expect(rowLabelled('Total Credits')).toHaveTextContent('$ 48,250.50')
+			expect(rowLabelled('Closing Balance as of 31st January 2024')).toHaveTextContent('$ 152,300.75')
+
+			// The preview rows are the same figures the import will create, so they carry the same
+			// currency - and the system default must appear nowhere on the screen.
+			const preview = tableWithCaption('Transactions to be imported into the system')
+			const firstRow = within(preview).getByText('NEFT credit from ACME Traders').closest('tr')
+			expect(within(firstRow as HTMLElement).getAllByRole('cell').map((cell) => cell.textContent))
+				.toEqual([
+					'1',
+					'05-01-2024',
+					'NEFT credit from ACME Traders',
+					'NEFT/2024/000145',
+					'$ 0.00',
+					'$ 48,250.50'
+				])
+
+			expect(rowLabelled('Total Debits')).not.toHaveTextContent('₹')
+			expect(rowLabelled('Closing Balance as of 31st January 2024')).not.toHaveTextContent('₹')
+		})
+
 		it('lists every parsed transaction, in the order the server returned them', () => {
 			renderStatementDetails(makeStatementDetails())
 
@@ -555,8 +607,16 @@ describe('StatementDetails', () => {
 				undefined,
 				{ revalidate: true, populateCache: true }
 			)
-			// Rule evaluation is re-triggered post-commit so suggested matches are present.
-			expect(ruleEvaluationCall).toHaveBeenCalledTimes(1)
+			/*
+			 * ...and NOTHING ELSE is posted. The continuation used to re-invoke the whitelisted
+			 * `run_rule_evaluation` endpoint from the browser and then poll `Bank Transaction` counts
+			 * until the evaluator caught up. Rule evaluation is the scheduler's job; the stamped
+			 * `matched_transaction_rule` arrives on the next read of the list either way, and no part
+			 * of the reconciliation workflow depends on the suggestion having landed by the time the
+			 * reviewer gets there. Asserted as an absence so it cannot come back unnoticed.
+			 */
+			expect(ruleEvaluationCall).not.toHaveBeenCalled()
+			expect(frappeContextValue.db.getCount).not.toHaveBeenCalled()
 		})
 
 		it('retires this log\'s attempt marker and leaves every other account\'s alone', async () => {
@@ -794,9 +854,9 @@ describe('StatementDetails', () => {
 		 * Neither signal the control can read describes the window between the server's answer and
 		 * the hand-off: `data.doc.status` still reads `Not Started` because the parent response is
 		 * never revalidated here, and the post hook's `loading` flips back the instant the response
-		 * lands - before the continuation (the bounded rule-evaluation wait, then the cache
-		 * invalidation) has finished. The assertions below land inside that window by holding the
-		 * continuation open on its first await, the rule count.
+		 * lands - before the continuation (the imported range's cache invalidation) has finished. The
+		 * assertions below land inside that window by holding the invalidation itself open, which is
+		 * now the continuation's only await.
 		 */
 		it('never re-offers the action between the server\'s answer and the hand-off', async () => {
 			importCall.mockResolvedValue(
@@ -809,9 +869,11 @@ describe('StatementDetails', () => {
 				])
 			)
 
-			let releaseRuleCount: (value: number) => void = () => undefined
-			frappeContextValue.db.getCount.mockImplementation(
-				() => new Promise<number>((resolve) => { releaseRuleCount = resolve }))
+			let releaseInvalidation: () => void = () => undefined
+			const invalidationHeld = new Promise<undefined>((resolve) => {
+				releaseInvalidation = () => resolve(undefined)
+			})
+			frappeSWRMutate.mockImplementation(() => invalidationHeld)
 
 			renderStatementDetails(makeStatementDetails())
 			await clickImport()
@@ -822,7 +884,7 @@ describe('StatementDetails', () => {
 			expect(screen.queryByText(RECONCILIATION_SENTINEL)).not.toBeInTheDocument()
 
 			await act(async () => {
-				releaseRuleCount(0)
+				releaseInvalidation()
 			})
 
 			expect(await screen.findByText(RECONCILIATION_SENTINEL)).toBeInTheDocument()
@@ -839,9 +901,13 @@ describe('StatementDetails', () => {
 				])
 			)
 
-			let releaseRuleCount: (value: number) => void = () => undefined
-			frappeContextValue.db.getCount.mockImplementation(
-				() => new Promise<number>((resolve) => { releaseRuleCount = resolve }))
+			// The hand-off is held open on the imported range's invalidation, so the assertions below
+			// land while this screen is still mounted.
+			let releaseInvalidation: () => void = () => undefined
+			const invalidationHeld = new Promise<undefined>((resolve) => {
+				releaseInvalidation = () => resolve(undefined)
+			})
+			frappeSWRMutate.mockImplementation(() => invalidationHeld)
 
 			renderStatementDetails(makeStatementDetails())
 			await clickImport()
@@ -853,7 +919,7 @@ describe('StatementDetails', () => {
 			expect(screen.queryByRole('button', { name: 'Importing...' })).not.toBeInTheDocument()
 
 			await act(async () => {
-				releaseRuleCount(0)
+				releaseInvalidation()
 			})
 			expect(await screen.findByText(RECONCILIATION_SENTINEL)).toBeInTheDocument()
 		})
@@ -1106,9 +1172,19 @@ describe('StatementDetails', () => {
 			const { store } = renderStatementDetails(data)
 			await clickImport()
 
+			/*
+			 * ANNOUNCED, but not with the caught object. A Frappe rejection carries the whole response
+			 * envelope, and a bank statement's transport detail does not belong in a browser console,
+			 * so every containment site logs a FIXED diagnostic instead. What matters for containment
+			 * is unchanged and asserted here: the handler's own failure does not escape, it is
+			 * reported, and the control is reopened for a legitimate retry.
+			 */
 			await waitFor(() => {
-				expect(consoleError).toHaveBeenCalledWith(handlerFailure)
+				expect(consoleError).toHaveBeenCalledWith(
+					'Bank statement import: the refused-import settlement did not complete.'
+				)
 			})
+			expect(consoleError).not.toHaveBeenCalledWith(handlerFailure)
 			expect(store.get(bankRecImportFailuresAtom)).toEqual({})
 			expect(screen.getByRole('button', { name: 'Import 3 transactions' })).toBeEnabled()
 			consoleError.mockRestore()
@@ -1116,13 +1192,31 @@ describe('StatementDetails', () => {
 
 		/**
 		 * FM2's zero-row case: a file the server parsed without raising, but from which it
-		 * recognised no transactions. The status is accurate and no marker is involved, so the
-		 * reason has to be stated in the page itself.
+		 * recognised no transactions. The log's status is accurate, so the reason has to be stated
+		 * on this page AND recorded for the importer list - see the marker test below.
+		 *
+		 * The summary figures are derived from the SAME zero rows, because a log reporting three
+		 * transactions and a parse yielding none is a document the server cannot produce, and a
+		 * fixture that mixes them proves nothing about either.
 		 */
+		const emptyStatement = () =>
+			makeStatementDetails({
+				doc: makeImportLog({
+					number_of_transactions: 0,
+					total_debits: 0,
+					total_credits: 0,
+					total_debit_transactions: 0,
+					total_credit_transactions: 0,
+					closing_balance: 0,
+					start_date: undefined,
+					end_date: undefined
+				}),
+				final_transactions: [],
+				conflicting_transactions: []
+			})
+
 		it('states why an unreadable file cannot be imported, and disables the control', () => {
-			renderStatementDetails(
-				makeStatementDetails({ final_transactions: [], conflicting_transactions: [] })
-			)
+			renderStatementDetails(emptyStatement())
 
 			expect(screen.getByRole('button', { name: 'Import 0 transactions' })).toBeDisabled()
 
@@ -1130,6 +1224,65 @@ describe('StatementDetails', () => {
 			expect(alert).toHaveTextContent('No transactions found in this statement')
 			expect(alert).toHaveTextContent('It may be empty, or its columns may not have been recognised.')
 			expect(alert).toHaveClass('text-ink-red-3')
+
+			// Derived from the parse result, so the screen cannot claim transactions it also says it
+			// found none of.
+			expect(within(rowLabelled('Number of Transactions')).getByRole('cell')).toHaveTextContent('0')
+		})
+
+		/*
+		 * ⚠️ THE F4 REGRESSION. Disabling the control and explaining it HERE was the whole of the
+		 * previous behaviour, and this screen is not where the reviewer looks: `Bank Statement Import
+		 * Log` has two status values and no error field, so the log stays at `Not Started` forever and
+		 * Previous Imports presented an unusable file exactly like one merely waiting to be imported.
+		 * FM2 requires a per-file indicator, so the server's own parse result is recorded against this
+		 * bank account and log - the only place it can live, since no schema change is permitted.
+		 */
+		it('records a per-file marker for the importer list when the server recognised no transactions', () => {
+			const data = emptyStatement()
+
+			const { store } = renderStatementDetails(data)
+
+			expect(store.get(bankRecImportFailuresAtom)).toEqual({
+				[data.doc.bank_account]: { [data.doc.name]: 'invalid' }
+			})
+		})
+
+		it('records nothing for a file the server DID recognise transactions in', () => {
+			const { store } = renderStatementDetails(makeStatementDetails())
+
+			expect(store.get(bankRecImportFailuresAtom)).toEqual({})
+		})
+
+		it('records nothing for a log the server has already completed', () => {
+			// A completed import is history, not a problem: whatever the file contains has been
+			// recorded, so no marker belongs even if the parse now yields nothing.
+			const { store } = renderStatementDetails(
+				makeStatementDetails({
+					doc: makeImportLog({ status: 'Completed', number_of_transactions: 0 }),
+					final_transactions: [],
+					conflicting_transactions: []
+				})
+			)
+
+			expect(store.get(bankRecImportFailuresAtom)).toEqual({})
+		})
+
+		it('retires an invalid marker without disturbing an attempt marker for the same log', () => {
+			// A PDF whose tables the reviewer re-mapped now parses to rows, so the `invalid` marker
+			// must go - but a `failed` marker describes an import ATTEMPT, which this says nothing
+			// about, so that one must survive.
+			const data = makeStatementDetails()
+
+			const { store } = renderStatementDetails(data, (seeded) => {
+				seeded.set(bankRecImportFailuresAtom, {
+					[data.doc.bank_account]: { [data.doc.name]: 'failed' }
+				})
+			})
+
+			expect(store.get(bankRecImportFailuresAtom)).toEqual({
+				[data.doc.bank_account]: { [data.doc.name]: 'failed' }
+			})
 		})
 
 		/**
@@ -1164,10 +1317,17 @@ describe('StatementDetails', () => {
 			renderStatementDetails(makeStatementDetails())
 
 			expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
-			expect(screen.queryByText('Importing 0 transactions')).not.toBeInTheDocument()
+			expect(screen.queryByText('Importing transactions - 0% complete')).not.toBeInTheDocument()
 		})
 
-		it('reports the count the server pushed', () => {
+		/**
+		 * The channel carries a PERCENTAGE, not a transaction count. `insert_transactions` publishes
+		 * `round(rows_inserted / total_rows * 100)` for every row it writes, and only the final push
+		 * carries the row `total`. Reading `progress` as a count made a three-row statement announce
+		 * "33 transactions" at its first row while the bar beside it - always `max={100}` - showed
+		 * 33%. The two now state the same thing in the same unit.
+		 */
+		it('reports the percentage the server pushed, in the percentage the server means', () => {
 			renderStatementDetails(makeStatementDetails())
 
 			// `act` is the caller's responsibility: the captured handler sets React state.
@@ -1175,7 +1335,7 @@ describe('StatementDetails', () => {
 				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 50 })
 			})
 
-			expect(screen.getByText('Importing 50 transactions')).toBeInTheDocument()
+			expect(screen.getByText('Importing transactions - 50% complete')).toBeInTheDocument()
 			expect(screen.getByRole('progressbar')).toBeInTheDocument()
 		})
 
@@ -1183,14 +1343,66 @@ describe('StatementDetails', () => {
 			renderStatementDetails(makeStatementDetails())
 
 			act(() => {
-				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 50 })
+				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 33 })
 			})
+			act(() => {
+				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 67 })
+			})
+
+			expect(screen.getByText('Importing transactions - 67% complete')).toBeInTheDocument()
+			expect(screen.queryByText('Importing transactions - 33% complete')).not.toBeInTheDocument()
+		})
+
+		/**
+		 * The server's final push carries both members (`{ progress: 100, total: N }`), which is the
+		 * shape that made the count/percentage confusion easy to miss: `total` is the count, and it
+		 * is the only count on the channel.
+		 */
+		it("accepts the server's final push, which carries the row total alongside the percentage", () => {
+			renderStatementDetails(makeStatementDetails())
+
+			act(() => {
+				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 100, total: 300 })
+			})
+
+			expect(screen.getByText('Importing transactions - 100% complete')).toBeInTheDocument()
+			// 300 is the ROW COUNT and must never be rendered as the progress figure.
+			expect(screen.queryByText('Importing transactions - 300% complete')).not.toBeInTheDocument()
+		})
+
+		it('clamps a figure the server could not have meant', () => {
+			renderStatementDetails(makeStatementDetails())
+
 			act(() => {
 				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 120 })
 			})
 
-			expect(screen.getByText('Importing 120 transactions')).toBeInTheDocument()
-			expect(screen.queryByText('Importing 50 transactions')).not.toBeInTheDocument()
+			expect(screen.getByText('Importing transactions - 100% complete')).toBeInTheDocument()
+			expect(screen.queryByText('Importing transactions - 120% complete')).not.toBeInTheDocument()
+		})
+
+		/**
+		 * A malformed push is not evidence that the import has gone backwards, so the last known
+		 * figure is left alone rather than reset - and nothing unrenderable ever reaches the label.
+		 */
+		it.each([
+			['no progress member', { total: 300 }],
+			['a non-numeric progress', { progress: '75' }],
+			['NaN', { progress: Number.NaN }],
+			['Infinity', { progress: Number.POSITIVE_INFINITY }]
+		])('ignores a malformed payload (%s) and keeps the last figure', (_label, payload) => {
+			renderStatementDetails(makeStatementDetails())
+
+			act(() => {
+				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 40 })
+			})
+			act(() => {
+				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, payload)
+			})
+
+			expect(screen.getByText('Importing transactions - 40% complete')).toBeInTheDocument()
+			expect(screen.queryByText(/NaN/)).not.toBeInTheDocument()
+			expect(screen.queryByText(/Infinity/)).not.toBeInTheDocument()
 		})
 	})
 

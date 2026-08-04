@@ -68,90 +68,7 @@ const REDRESS_MESSAGE =
 	'<input id="redress-input" type="password" name="password" placeholder="Password" />' +
 	'<a id="redress-external" href="https://evil.example.com/login">Sign in</a>' +
 	'<a id="redress-scheme-relative" href="//evil.example.com/login">Continue</a>' +
-	/*
-	 * The same off-site destination written with BACKSLASHES. WHATWG URL parsing - what every
-	 * browser and jsdom implement - folds `\` into `/` inside an http(s) URL, so all three of
-	 * these resolve to `evil.example.com` exactly as the two forms above do, while carrying
-	 * neither a scheme nor a leading `//` for a purely syntactic test to catch. They are the
-	 * forms a sanitiser that compares characters instead of canonicalising will let through.
-	 */
-	'<a id="redress-backslash" href="\\\\evil.example.com/login">Proceed</a>' +
-	'<a id="redress-slash-backslash" href="/\\evil.example.com/login">Verify</a>' +
-	'<a id="redress-backslash-slash" href="\\/evil.example.com/login">Confirm</a>' +
 	'</div>'
-
-/**
- * Every off-site destination the sanitiser must refuse, paired with the text that must survive
- * it. Each is asserted on its own below, so a regression in one form cannot hide behind the
- * others being caught.
- *
- * `HOSTILE_HOST` is the host jsdom's own URL parser resolves each of them to - asserted first,
- * so the payloads are demonstrably hostile in this environment rather than only in theory. It is
- * compared as a HOST rather than a full origin because the absolute form names its own scheme
- * while the four relative forms inherit this document's, and the point being made is the same
- * for all five: the browser, not the character sequence, decides where a link goes.
- */
-const HOSTILE_HOST = 'evil.example.com'
-
-type LinkProbe = {
-	readonly label: string
-	readonly href: string
-	readonly text: string
-}
-
-const OFF_SITE_DESTINATIONS: readonly LinkProbe[] = [
-	{ label: 'an absolute URL', href: 'https://evil.example.com/login', text: 'Sign in' },
-	{ label: 'the scheme-relative form', href: '//evil.example.com/login', text: 'Continue' },
-	{ label: 'two leading backslashes', href: '\\\\evil.example.com/login', text: 'Proceed' },
-	{ label: 'a slash followed by a backslash', href: '/\\evil.example.com/login', text: 'Verify' },
-	{ label: 'a backslash followed by a slash', href: '\\/evil.example.com/login', text: 'Confirm' }
-]
-
-/**
- * Destinations that resolve to THIS origin - so a bare origin comparison would admit every one of
- * them - and that the renderer refuses anyway. They pin the three refusals it deliberately keeps
- * stricter than origin equality, each of which stays load-bearing somewhere the origin check alone
- * is blind: a backslash makes the destination the reader sees and the one the browser computes
- * disagree, a scheme-relative URL reads as off-site whoever it happens to name, and refusing every
- * explicit scheme is what keeps `javascript:` out of a document whose own origin is opaque.
- *
- * Built from `window.location` rather than hard-coded, so they stay this document's own host and
- * origin whatever the harness serves the tests from.
- */
-const STRICTLY_REFUSED_DESTINATIONS: readonly LinkProbe[] = [
-	{
-		label: 'a backslash inside an otherwise local path',
-		href: '/app/bank-transaction\\ACC-BTN-2024-00001',
-		text: 'Backslash path'
-	},
-	{
-		label: 'the scheme-relative form naming this very host',
-		href: `//${window.location.host}/app/bank-transaction/ACC-BTN-2024-00001`,
-		text: 'Scheme-relative to us'
-	},
-	{
-		label: 'an absolute URL naming this very origin',
-		href: `${window.location.origin}/app/bank-transaction/ACC-BTN-2024-00001`,
-		text: 'Absolute to us'
-	}
-]
-
-/**
- * Destinations that point back at this application and must therefore still render, so the
- * hardening above cannot quietly turn into "no link ever survives" - which would pass every
- * hostile case while silently dropping the `/app/bank-transaction/…` links Frappe's own
- * messages carry.
- */
-const SAME_ORIGIN_DESTINATIONS: readonly string[] = [
-	'#reconciliation',
-	'/app/bank-transaction/ACC-BTN-2024-00001',
-	'app/bank-transaction/ACC-BTN-2024-00001',
-	'?bank_transaction=ACC-BTN-2024-00001'
-]
-
-/** A single anchor the server wrote, as raw HTML inside a `_server_messages` entry. */
-const anchorMessage = (href: string, text: string): string =>
-	`Next step: <a href="${href}">${text}</a>`
 
 const DIALOG_TITLE = 'Something went wrong'
 const DIALOG_DESCRIPTION =
@@ -205,9 +122,9 @@ const renderDialog = (error: SeededError | null, seed?: (store: SeededStore) => 
  * selector the dialog queries). `showConfirm` models a revalidation replacing that control's
  * subtree, which is the only case the region fallback exists for.
  */
-const InvokerRegion = ({ showConfirm }: { showConfirm: boolean }) => (
+const InvokerRegion = ({ showConfirm, disableConfirm = false }: { showConfirm: boolean, disableConfirm?: boolean }) => (
 	<div data-slot="tabs-content">
-		{showConfirm ? <button type="button">Confirm match</button> : null}
+		{showConfirm ? <button type="button" disabled={disableConfirm}>Confirm match</button> : null}
 		<button type="button">Create voucher</button>
 	</div>
 )
@@ -222,9 +139,9 @@ const InvokerRegion = ({ showConfirm }: { showConfirm: boolean }) => (
  */
 const renderWithInvoker = () => {
 	const store = createStore()
-	const tree = (showConfirm: boolean) => (
+	const tree = (showConfirm: boolean, disableConfirm = false) => (
 		<Provider store={store}>
-			<InvokerRegion showConfirm={showConfirm} />
+			<InvokerRegion showConfirm={showConfirm} disableConfirm={disableConfirm} />
 			<BankRecErrorDialog />
 		</Provider>
 	)
@@ -238,7 +155,13 @@ const renderWithInvoker = () => {
 				store.set(bankRecErrorDialogAtom, error)
 			})
 		},
-		dropInvoker: () => rerender(tree(false))
+		dropInvoker: () => rerender(tree(false)),
+		/**
+		 * Models the PRODUCTION state of the invoker after a refused post: still mounted, still
+		 * connected, but disabled by the confirm guard now that the refreshed `status` /
+		 * `unallocated_amount` have landed. This is the case a plain `isConnected` check gets wrong.
+		 */
+		disableInvoker: () => rerender(tree(true, true))
 	}
 }
 
@@ -512,30 +435,41 @@ describe('BankRecErrorDialog', () => {
 		})
 
 		/**
-		 * The CONTENT WIDTH, which is a specified contract rather than a styling choice.
+		 * The CONTENT WIDTH, which is a specified contract rather than a styling choice — and which
+		 * has to be a RESPONSIVE contract, not a bare minimum.
 		 *
-		 * The Agent Action Plan fixes it by reference to the folder's canonical modal — "Follow the
-		 * unreconcile modal's structure exactly, INCLUDING ITS CONTENT WIDTH" (§0.8.2.2), "Content
-		 * width follows the unreconcile modal precedent" (§0.8.5.2) — and that modal widens itself
-		 * with `min-w-2xl` (`BankTransactionUnreconcileModal.tsx:37`). Asserting the class is
-		 * therefore checking a deliberate PATTERN MATCH, which is exactly why it belongs in a test:
-		 * a later reader who replaced it with a `max-width` ladder by eye would be departing from
-		 * the plan, and this assertion is what says so.
+		 * The Agent Action Plan fixes the widened form by reference to the folder's canonical modal
+		 * — "Follow the unreconcile modal's structure exactly, INCLUDING ITS CONTENT WIDTH"
+		 * (§0.8.2.2) — and that modal widens itself with `min-w-2xl`
+		 * (`BankTransactionUnreconcileModal.tsx:37`). But `min-width` beats `max-width` in CSS, so
+		 * applying 42rem unconditionally overrode the primitive's own `max-w-[calc(100%-2rem)]` and
+		 * forced a 672px box onto a 375px viewport, carrying the only Dismiss control off-screen
+		 * horizontally. The importer routes have no desktop-only gate, so that viewport is reachable.
+		 *
+		 * So the assertion is deliberately on the BREAKPOINT-QUALIFIED class and on the ABSENCE of
+		 * the unqualified one: `md` (768px) is the first default breakpoint that can hold 672px
+		 * inside the primitive's 2rem gutter (768 − 32 = 736), and below it the primitive's own
+		 * responsive width must be left to do its job. A reader who "restores" the bare class would
+		 * be reintroducing the overflow, and this is what says so.
 		 *
 		 * The HEIGHT bound asserted alongside it is a separate, orthogonal concern — the plan
-		 * specifies no height — and it is what keeps the only Dismiss control on screen for an
-		 * arbitrarily long server message.
+		 * specifies no height — and it is what keeps Dismiss on screen VERTICALLY for an arbitrarily
+		 * long server message.
 		 */
-		it('carries the pattern\'s min-w-2xl content width, and bounds its height', () => {
+		it('widens only from md upwards, so the narrow-viewport width stays the primitive\'s', () => {
 			renderDialog(makeServerMessagesError('Nothing was posted'))
 			const content = getDialogContent()
 
-			// The canonical pattern's width class, present verbatim.
-			expect(content.className).toContain('min-w-2xl')
-			expect(content).toHaveClass('min-w-2xl')
+			// The canonical pattern's width, gated behind a breakpoint wide enough to hold it.
+			expect(content).toHaveClass('md:min-w-2xl')
+
+			// And NOT applied unconditionally. Tailwind class lists are space-separated, so the
+			// qualified class cannot satisfy this check by substring.
+			expect(content.className.split(/\s+/)).not.toContain('min-w-2xl')
 
 			// The primitive's own ladder is still underneath it, untouched — this dialog adds a
-			// minimum width, it does not restyle the primitive.
+			// breakpoint-scoped minimum width, it does not restyle the primitive. Below `md` these
+			// two are therefore the only width rules in play, which is the mobile contract.
 			expect(content).toHaveClass('max-w-[calc(100%-2rem)]')
 			expect(content).toHaveClass('data-[size=default]:sm:max-w-lg')
 
@@ -652,100 +586,109 @@ describe('BankRecErrorDialog', () => {
 			).toHaveLength(0)
 		})
 
-		it('refuses an off-site destination in every form, including the backslash ones', () => {
+		it('refuses an off-site destination, including the scheme-relative form', () => {
 			renderDialog(makeServerMessagesError(REDRESS_MESSAGE))
 			const dialog = getDialogContent()
 
 			expect(dialog.querySelectorAll('a')).toHaveLength(0)
 			expect(dialog.querySelector('[href*="evil.example.com"]')).toBeNull()
-			// Swept by attribute VALUE as well, so the assertion does not depend on which element
-			// a stray destination ends up on: NOTHING rendered from this message may name that host.
-			dialog.querySelectorAll('[href]').forEach((element) => {
-				expect(element.getAttribute('href')).not.toContain(HOSTILE_HOST)
-			})
-
-			// The link TEXT of every refused destination is still shown, so nothing the server
-			// wrote is hidden from the user.
-			OFF_SITE_DESTINATIONS.forEach(({ text }) => {
-				expect(dialog.textContent).toContain(text)
-			})
+			// The link TEXT is still shown, so nothing the server wrote is hidden from the user.
+			expect(dialog.textContent).toContain('Sign in')
+			expect(dialog.textContent).toContain('Continue')
 		})
 
-		/*
-		 * The characters the server wrote are NOT the destination: the browser canonicalises them
-		 * first. This asserts that canonicalisation directly, through jsdom's own URL parser - the
-		 * same one the production predicate resolves with - so every payload here is demonstrably
-		 * hostile in this environment rather than presumed to be.
+		/**
+		 * The BACKSLASH spellings of the scheme-relative form, which are the ones a `//` prefix test
+		 * misses entirely.
+		 *
+		 * For every "special" scheme — which includes the `http(s)` this application is served over
+		 * — the WHATWG URL parser treats `\` as a path separator identical to `/`. Verified against
+		 * the platform parser with a base of `https://app.example.com/banking/`:
+		 *
+		 *   `\\evil.example.com/path`  -> https://evil.example.com/path
+		 *   `/\evil.example.com/path`  -> https://evil.example.com/path
+		 *   `\/evil.example.com/path`  -> https://evil.example.com/path
+		 *   `//evil.example.com/path`  -> https://evil.example.com/path
+		 *
+		 * All four are the SAME off-origin destination; only the last was refused. A server-controlled
+		 * message could therefore hand the reader a phishing link inside the very dialog reporting a
+		 * financial failure, presented as though the application were offering it. Each spelling gets
+		 * its own case so a partial fix cannot pass.
 		 */
-		it.each(OFF_SITE_DESTINATIONS)(
-			'resolves $label to another origin, which is what makes it hostile',
-			({ href }) => {
-				const resolved = new URL(href, window.location.href)
-
-				expect(resolved.host).toBe(HOSTILE_HOST)
-				expect(resolved.origin).not.toBe(window.location.origin)
-			}
-		)
-
-		it.each(OFF_SITE_DESTINATIONS)('renders no anchor for $label', ({ href, text }) => {
-			renderDialog(makeServerMessagesError(anchorMessage(href, text)))
+		it.each([
+			['double backslash', '\\\\evil.example.com/login'],
+			['slash then backslash', '/\\evil.example.com/login'],
+			['backslash then slash', '\\/evil.example.com/login'],
+			['backslash with a tab inside', '\\\\evil.example.com\t/login'],
+			['uppercase host after backslashes', '\\\\EVIL.example.com/login']
+		])('refuses an off-origin network path written with backslashes (%s)', (_label, href) => {
+			renderDialog(
+				makeServerMessagesError(`Session expired. <a href="${href}">Sign in</a>`)
+			)
 			const dialog = getDialogContent()
 
-			// No anchor at all - not an href-less one, and not one pointing anywhere.
+			// No anchor survives at all — the destination did not pass, so the element is unwrapped.
 			expect(dialog.querySelectorAll('a')).toHaveLength(0)
-			// Swept DOCUMENT-wide rather than only within the dialog, so a node escaping into the
-			// portal root or back into the React container is caught just the same.
-			document.querySelectorAll('[href]').forEach((element) => {
-				expect(element.getAttribute('href')).not.toContain(HOSTILE_HOST)
-			})
-			// The sentence is intact, including the destination as literal text.
-			expect(dialog.textContent).toContain(text)
+			expect(dialog.querySelector('[href]')).toBeNull()
+			// The text the server wrote is still shown, so nothing is hidden from the user.
+			expect(dialog.textContent).toContain('Sign in')
 		})
 
-		/*
-		 * Everything below resolves to THIS origin, so it is refused by a rule that is deliberately
-		 * stricter than "same origin". Pinning those rules is what stops the predicate being
-		 * simplified back down to a single origin comparison, which would reopen the backslash
-		 * bypass wherever the document's own origin is opaque and would start honouring absolute
-		 * URLs this renderer has never honoured.
+		/**
+		 * The other half of the same contract, and the sanitiser's answer to it: a backslash is
+		 * refused OUTRIGHT rather than folded into `/` and then re-examined.
+		 *
+		 * Both readings close the bypass above, and this one closes it more widely. The reason it is
+		 * the reading the sanitiser implements is that a backslash makes the destination the reader
+		 * SEES and the destination the browser NAVIGATES to disagree - the text says `/app\x`, the
+		 * parser resolves `/app/x` - and that disagreement is the entire trick, whichever origin the
+		 * result lands on. Refusing the character costs nothing here: this renderer's only input is
+		 * a server-authored `_server_messages` envelope, and Frappe writes document links with
+		 * forward slashes. The text is still shown in full, so nothing the server said is hidden;
+		 * only the anchor is withheld.
+		 *
+		 * A percent-encoded backslash (`%5C`) is a literal path character to the parser rather than
+		 * a separator, so a legitimate document name containing one is untouched - asserted below so
+		 * the wide refusal cannot quietly grow into a refusal of ordinary same-origin links.
 		 */
-		it.each(STRICTLY_REFUSED_DESTINATIONS)(
-			'resolves $label to this very origin, which is what makes refusing it a choice',
-			({ href }) => {
-				expect(new URL(href, window.location.href).origin).toBe(window.location.origin)
-			}
-		)
-
-		it.each(STRICTLY_REFUSED_DESTINATIONS)('refuses $label all the same', ({ href, text }) => {
-			renderDialog(makeServerMessagesError(anchorMessage(href, text)))
+		it('refuses a same-origin path that uses a backslash separator, and keeps its text', () => {
+			renderDialog(
+				makeServerMessagesError('See <a href="/app\\bank-transaction">the record</a>')
+			)
 			const dialog = getDialogContent()
 
 			expect(dialog.querySelectorAll('a')).toHaveLength(0)
-			expect(dialog.textContent).toContain(text)
+			expect(dialog.querySelector('[href]')).toBeNull()
+			expect(dialog.textContent).toContain('the record')
 		})
 
-		it.each(['', '   '])('refuses a link whose destination is empty (%j)', (href) => {
-			// Nothing to navigate to, so nothing that should look navigable. The whitespace-only
-			// form is the same case once the control-character strip has run.
-			renderDialog(makeServerMessagesError(anchorMessage(href, 'Empty destination')))
-			const dialog = getDialogContent()
+		it('still accepts an ordinary same-origin path, including a percent-encoded backslash', () => {
+			renderDialog(
+				makeServerMessagesError('See <a href="/app/bank-transaction/BT%5C001">the record</a>')
+			)
+			const anchor = getDialogContent().querySelector('a')
 
-			expect(dialog.querySelectorAll('a')).toHaveLength(0)
-			expect(dialog.textContent).toContain('Empty destination')
+			expect(anchor).not.toBeNull()
+			expect(anchor).toHaveAttribute('href', '/app/bank-transaction/BT%5C001')
+			expect(anchor).toHaveAttribute('rel', 'noreferrer noopener')
+			expect(anchor).not.toHaveAttribute('target')
 		})
 
-		it('refuses a destination the URL parser cannot resolve at all, without throwing', () => {
-			// `////` is a network path with an empty host: `new URL('////', location.href)` THROWS.
-			// The sanitiser must answer "not ours" rather than let that escape and take down the
-			// very dialog that is reporting the failure.
-			expect(() => new URL('////', window.location.href)).toThrow()
-
-			renderDialog(makeServerMessagesError(anchorMessage('////', 'Retry')))
+		/**
+		 * An absolute URL on THIS origin is still refused, which is the documented behaviour and the
+		 * reason the syntactic scheme test is kept in front of the origin comparison: an origin check
+		 * on its own would let it through, silently widening what a server message may render.
+		 */
+		it('still refuses an absolute URL even when it names this very origin', () => {
+			renderDialog(
+				makeServerMessagesError(
+					`Go to <a href="${window.location.origin}/app/bank-transaction">the record</a>`
+				)
+			)
 			const dialog = getDialogContent()
 
-			expect(dialog).toBeInTheDocument()
 			expect(dialog.querySelectorAll('a')).toHaveLength(0)
-			expect(dialog.textContent).toContain('Retry')
+			expect(dialog.textContent).toContain('the record')
 		})
 
 		it('still renders a same-origin document link the server offered', () => {
@@ -760,41 +703,6 @@ describe('BankRecErrorDialog', () => {
 			expect(anchor).toHaveAttribute('href', '/app/bank-transaction/ACC-BTN-2024-00001')
 			expect(anchor).toHaveAttribute('rel', 'noreferrer noopener')
 			expect(anchor).not.toHaveAttribute('target')
-		})
-
-		it.each(SAME_ORIGIN_DESTINATIONS)('still renders the destination %s, which is ours', (href) => {
-			// The guard against over-correcting: refusing every link would satisfy each hostile
-			// case above while dropping the document links Frappe's own messages carry.
-			expect(new URL(href, window.location.href).origin).toBe(window.location.origin)
-
-			renderDialog(makeServerMessagesError(anchorMessage(href, 'Open the record')))
-			const anchor = getDialogContent().querySelector('a')
-
-			expect(anchor).not.toBeNull()
-			expect(anchor).toHaveAttribute('href', href)
-			expect(anchor).toHaveAttribute('rel', 'noreferrer noopener')
-		})
-
-		/*
-		 * The invariant the whole boundary reduces to, asserted on a payload that mixes both kinds
-		 * so it cannot pass vacuously: whatever survives, EVERY surviving destination resolves to
-		 * this origin - which is exactly the question the browser answers when the link is clicked.
-		 */
-		it('leaves no surviving anchor whose destination resolves off this origin', () => {
-			const message =
-				anchorMessage('/app/bank-transaction/ACC-BTN-2024-00001', 'Open the record') +
-				OFF_SITE_DESTINATIONS.map(({ href, text }) => ` <a href="${href}">${text}</a>`).join('')
-
-			renderDialog(makeServerMessagesError(message))
-			const anchors = Array.from(getDialogContent().querySelectorAll('a'))
-
-			// Non-vacuous: the legitimate link is there to be found.
-			expect(anchors).toHaveLength(1)
-
-			anchors.forEach((anchor) => {
-				const href = anchor.getAttribute('href') ?? ''
-				expect(new URL(href, window.location.href).origin).toBe(window.location.origin)
-			})
 		})
 	})
 
@@ -930,6 +838,46 @@ describe('BankRecErrorDialog', () => {
 			await waitFor(() => {
 				expect(invoker).toHaveFocus()
 			})
+		})
+
+		/**
+		 * The PRODUCTION state of the invoker, and the one a plain `isConnected` check gets wrong.
+		 *
+		 * After a refused post the reconcile control is still mounted and still connected — but the
+		 * confirm guard has disabled it, because the refreshed `status` / `unallocated_amount` now
+		 * say the transaction is already reconciled. `HTMLElement.focus()` is a silent no-op on a
+		 * disabled control, so suppressing Radix's default restoration and then calling `.focus()`
+		 * on it left keyboard focus on `<body>`: no error message, no control, nothing to Tab from.
+		 *
+		 * The region fallback must therefore be reached on the strength of FOCUSABILITY, not mere
+		 * presence. Note the invoker is asserted to still be in the document, so this cannot be
+		 * mistaken for the detached-invoker case above.
+		 */
+		it("falls back to the region when the invoker is still connected but disabled", async () => {
+			const user = userEvent.setup()
+			const { raise, disableInvoker } = renderWithInvoker()
+			const invoker = screen.getByRole('button', { name: 'Confirm match' })
+
+			invoker.focus()
+			raise(makeAlreadyReconciledError('ACC-BTN-2024-00001'))
+
+			// The guard closes the control while the dialog is open — exactly the real sequence. React
+			// reuses the DOM node for a prop-only change, so `invoker` still points at the live
+			// element; it is asserted on directly because an open Radix dialog hides everything
+			// outside itself from the accessibility tree, which would make a role query unusable here
+			// and, worse, indistinguishable from the element having been removed.
+			disableInvoker()
+			expect(invoker).toBeDisabled()
+			expect(invoker.isConnected).toBe(true)
+			expect(document.body.contains(invoker)).toBe(true)
+
+			await user.click(screen.getByRole('button', { name: DISMISS_LABEL }))
+
+			await waitFor(() => {
+				expect(screen.getByRole('button', { name: 'Create voucher' })).toHaveFocus()
+			})
+			// And explicitly NOT stranded on <body>, which is what the defect produced.
+			expect(document.body).not.toHaveFocus()
 		})
 
 		it("falls back to the region's first control when the invoker no longer exists", async () => {

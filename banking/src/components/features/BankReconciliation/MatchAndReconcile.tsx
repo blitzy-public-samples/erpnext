@@ -6,7 +6,7 @@ import { getCompanyCurrency } from "@/lib/company"
 import ErrorBanner from "@/components/ui/error-banner"
 import { Separator } from "@/components/ui/separator"
 import Fuse from 'fuse.js'
-import { getSearchResults, LinkedPayment, matchVoucherDate, matchVoucherReference, UnreconciledTransaction, useGetRuleForTransaction, useGetUnreconciledTransactions, useGetVouchersForTransaction, useIsTransactionWithdrawal, useReconcileTransaction, useSelectedBankAccountCurrency, useTransactionSearch } from "./utils"
+import { getSearchResults, LinkedPayment, UnreconciledTransaction, useGetRuleForTransaction, useGetUnreconciledTransactions, useGetVouchersForTransaction, useIsTransactionWithdrawal, useReconcileTransaction, useTransactionSearch } from "./utils"
 import { Input } from "@/components/ui/input"
 import { AlertCircleIcon, ArrowDownRight, ArrowRightIcon, ArrowRightLeft, ArrowUpRight, BadgeCheck, ChevronDown, DollarSign, Landmark, LandmarkIcon, ListIcon, Loader2, Receipt, ReceiptIcon, Search, User, XCircle, ZapIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -128,13 +128,7 @@ function VirtualizedListBody<T>({
 const UnreconciledTransactions = ({ contentHeight }: { contentHeight: number }) => {
     const bankAccount = useAtomValue(selectedBankAccountAtom)
 
-    // Read once here, for the whole list, and handed down to every row. The hook shares the bank
-    // picker's SWR entry rather than issuing its own request, but a subscription per virtualised row
-    // would still be pointless churn when every row is describing the SAME account. Sourcing it here
-    // also guarantees the amount filter below and the rows' currency indicators can never disagree.
-    const freshAccountCurrency = useSelectedBankAccountCurrency()
-
-    const currency = freshAccountCurrency ?? bankAccount?.account_currency ?? getCompanyCurrency(bankAccount?.company ?? '')
+    const currency = bankAccount?.account_currency ?? getCompanyCurrency(bankAccount?.company ?? '')
     const currencySymbol = getCurrencySymbol(currency)
     const formatInfo = getCurrencyFormatInfo(currency)
     const groupSeparator = formatInfo.group_sep || ","
@@ -290,7 +284,7 @@ const UnreconciledTransactions = ({ contentHeight }: { contentHeight: number }) 
             estimateSize={74}
             getItemKey={(transaction) => transaction.name}
         >
-            {(transaction) => <UnreconciledTransactionItem transaction={transaction} accountCurrency={freshAccountCurrency} />}
+            {(transaction) => <UnreconciledTransactionItem transaction={transaction} />}
         </VirtualizedListBody>
 
     </div>
@@ -331,7 +325,7 @@ const UnreconciledTransactionsLoadingState = () => {
     </div>
 }
 
-const UnreconciledTransactionItem = ({ transaction, accountCurrency }: { transaction: UnreconciledTransaction, accountCurrency?: string }) => {
+const UnreconciledTransactionItem = ({ transaction }: { transaction: UnreconciledTransaction }) => {
 
     const selectedBank = useAtomValue(selectedBankAccountAtom)
 
@@ -341,20 +335,19 @@ const UnreconciledTransactionItem = ({ transaction, accountCurrency }: { transac
 
     const isSelected = selectedTransaction?.some((t) => t.name === transaction.name)
 
-    const currency = transaction.currency ?? accountCurrency ?? selectedBank?.account_currency ?? getCompanyCurrency(selectedBank?.company ?? '')
+    const currency = transaction.currency ?? selectedBank?.account_currency ?? getCompanyCurrency(selectedBank?.company ?? '')
 
-    // Compares the transaction currency against the account currency the SERVER'S CURRENT
-    // bank-account list reports for the selected account (`accountCurrency`, sourced from
-    // `useSelectedBankAccountCurrency` by the list above). It deliberately does NOT fall back to
-    // `selectedBank.account_currency` for this decision, even though the display currency above
-    // does: that value is a `localStorage` snapshot of the account row as it looked when it was last
-    // picked, and `account_currency` is derived by the endpoint from the linked `Account` rather than
-    // stored on `Bank Account` - so the snapshot can name a currency the account no longer uses.
-    // Deciding this from stale data can invent a mismatch or hide a real one, and a warning that is
-    // wrong in either direction is worse than no warning. Either side may legitimately be absent
-    // (`currency` is optional on the transaction, and the endpoint cannot always derive one), and an
-    // absent value means "nothing to compare" rather than a mismatch - so no advisory is shown until
-    // both values are actually known.
+    // Both sides of the comparison come from the SAME resolution path the server uses -
+    // `Bank Account.account` -> `Account.account_currency` - so the indicator cannot contradict the
+    // backend's own view. `account_currency` is not stored on `Bank Account`; `bank_account.get_list`
+    // derives it per row and the bank picker writes the row it was given into this atom, which is why
+    // the field is optional here.
+    //
+    // Either side may legitimately be absent (`currency` is optional on the transaction, and the
+    // endpoint cannot always derive one), and an absent value means "nothing to compare" rather than a
+    // mismatch - so no advisory is shown until both values are actually known. A warning that is wrong
+    // in either direction is worse than no warning.
+    const accountCurrency = selectedBank?.account_currency
     const isCurrencyMismatch = Boolean(transaction.currency && accountCurrency && transaction.currency !== accountCurrency)
 
     // The advisory is authored once and consumed twice - as the badge's tooltip for pointer users and
@@ -425,22 +418,30 @@ const UnreconciledTransactionItem = ({ transaction, accountCurrency }: { transac
                             further down this file. Because a <span> cannot take focus, the tooltip alone
                             would be hover-only, so the advisory is ALSO published as the `sr-only`
                             description the row points at with `aria-describedby` - one shared string, so
-                            the two can never disagree. No LOCAL TooltipProvider is needed: App.tsx wraps
-                            the whole router in one. */}
-                        {isCurrencyMismatch && <Tooltip>
-                            <TooltipTrigger asChild>
-                                <Badge variant="subtle" theme="orange" size="sm">
-                                    <AlertCircleIcon /> {currency}</Badge>
-                            </TooltipTrigger>
-                            {/* TooltipContent is `w-fit` with no intrinsic maximum, so this two-sentence
-                                advisory laid out as a single ~1050px line that Radix then clamped flush
-                                against the viewport edge, breaching the page gutter. `max-w-sm` with
-                                balanced wrapping is the constraint the design system already uses for long
-                                tooltip copy (see ui/list-view.tsx). */}
-                            <TooltipContent side="top" className="max-w-sm text-balance wrap-break-word">
-                                {currencyAdvisory}
-                            </TooltipContent>
-                        </Tooltip>}
+                            the two can never disagree.
+
+                            The LOCAL TooltipProvider is required, not redundant. Every other tooltip in
+                            this file is wrapped in one (see the transaction-actions cluster, the
+                            keyboard-shortcut row and the voucher card below), and that is the file's own
+                            composition contract: it keeps each subtree independently mountable instead of
+                            depending on App.tsx happening to wrap the router in a provider. Relying on the
+                            ancestor made this row throw when mounted on its own. */}
+                        {isCurrencyMismatch && <TooltipProvider>
+                            <Tooltip>
+                                <TooltipTrigger asChild>
+                                    <Badge variant="subtle" theme="orange" size="sm">
+                                        <AlertCircleIcon /> {currency}</Badge>
+                                </TooltipTrigger>
+                                {/* TooltipContent is `w-fit` with no intrinsic maximum, so this two-sentence
+                                    advisory laid out as a single ~1050px line that Radix then clamped flush
+                                    against the viewport edge, breaching the page gutter. `max-w-sm` with
+                                    balanced wrapping is the constraint the design system already uses for long
+                                    tooltip copy (see ui/list-view.tsx). */}
+                                <TooltipContent side="top" className="max-w-sm text-balance wrap-break-word">
+                                    {currencyAdvisory}
+                                </TooltipContent>
+                            </Tooltip>
+                        </TooltipProvider>}
                     </div>
                     <span className="text-sm wrap-anywhere" title={transaction.description}>{transaction.description}</span>
                 </div>
@@ -912,7 +913,17 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
     const selectedBank = useAtomValue(selectedBankAccountAtom)
     const selectedTransaction = useAtomValue(bankRecSelectedTransactionAtom(selectedBank?.name || ''))
 
-    const { amountMatches, postingDateMatches, referenceDateMatches, referenceMatchesFull, referenceMatchesPartial, isSuggested, referenceLabel } = useMemo(() => {
+    /*
+     * MATCH SCORING IS FROZEN. Every comparison below is the pre-existing implementation, kept
+     * byte-for-byte: the Agent Action Plan limits this file to three surgical edits (the dialog
+     * mount, the currency advisory and the confirm guard) and explicitly requires "the match-badge
+     * confidence states" to be preserved. A previous revision replaced these comparisons with
+     * shared blank-aware graders, which changed which voucher receives the Suggested / solid-green
+     * treatment; that is a behaviour change outside this work's authorised surface and has been
+     * reverted here. Do not re-introduce it as a drive-by improvement - it needs its own approved
+     * scope, because it decides what a reviewer is steered towards on a financial posting screen.
+     */
+    const { amountMatches, postingDateMatches, referenceDateMatches, referenceMatchesFull, referenceMatchesPartial, isSuggested } = useMemo(() => {
 
         const transaction = selectedTransaction?.[0]
 
@@ -923,35 +934,24 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
         // Whether this is suggested or not - depends on the above scores
 
         const amountMatches = voucher.paid_amount === transaction?.unallocated_amount
+        const postingDateMatches = voucher.posting_date === transaction?.date
+        const referenceDateMatches = voucher.reference_date === transaction?.date
+        const referenceMatchesFull = voucher.reference_no === transaction?.reference_number || voucher.reference_no === transaction?.description
 
-        // Dates and references are graded by the shared predicates in `./utils` rather than
-        // compared inline, because a raw comparison cannot tell "these agree" apart from
-        // "neither side has a value". Two of the four voucher types `get_linked_payments`
-        // unions supply `reference_no`/`reference_date` as a constant empty string and a third
-        // can supply NULL, and `BankTransaction.date`/`reference_number`/`description` are all
-        // optional - so blank-versus-blank was reading as a match, and `includes('')` (always
-        // true) scored EVERY blank-reference invoice as a partial match against EVERY
-        // transaction. That fed the `isSuggested` disjunction below and promoted an
-        // amount-only coincidence to a green, solid-button "suggested" row.
-        const postingDateMatches = matchVoucherDate(voucher.posting_date, transaction?.date)
-        const referenceDateMatches = matchVoucherDate(voucher.reference_date, transaction?.date)
+        // `reference_no` is typed `string | null` because that is what the endpoint really
+        // projects: the Purchase Invoice branch sends a constant empty string, but the Sales
+        // Invoice branch selects the nullable `Sales Invoice Payment.reference_no` and the
+        // Journal Entry branch selects `Max(je.cheque_no)`, either of which can be NULL. The
+        // scoring itself is FROZEN, so a missing reference is coerced to the empty string it used
+        // to arrive as rather than being scored differently - and never handed to `includes()`
+        // as `null`, which would silently search for the literal text "null".
+        const voucherReference = voucher.reference_no ?? ''
+        const referenceMatchesPartial = transaction?.reference_number?.includes(voucherReference) || transaction?.description?.includes(voucherReference)
 
-        const referenceMatch = matchVoucherReference(voucher.reference_no, [transaction?.reference_number, transaction?.description])
-        const referenceMatchesFull = referenceMatch === 'full'
-        const referenceMatchesPartial = referenceMatch === 'partial'
 
-        // Any genuine reference agreement counts here, exactly as before: under the previous
-        // inline comparison an exact match implied the partial one too (a string contains
-        // itself), so testing `!== 'none'` preserves that behaviour now that the two grades
-        // are mutually exclusive.
-        const isSuggested = amountMatches && (postingDateMatches || referenceDateMatches || referenceMatch !== 'none') && index === 0
+        const isSuggested = amountMatches && (postingDateMatches || referenceDateMatches || referenceMatchesPartial) && index === 0
 
-        // The trimmed reference, used to decide whether the reference row is rendered at all -
-        // a whitespace-only value must not paint an empty label with a "No Match" badge beside
-        // it.
-        const referenceLabel = (voucher.reference_no ?? '').trim()
-
-        return { isSelected: false, amountMatches, postingDateMatches, referenceDateMatches, referenceMatchesFull, referenceMatchesPartial, isSuggested: isSuggested, referenceLabel }
+        return { isSelected: false, amountMatches, postingDateMatches, referenceDateMatches, referenceMatchesFull, referenceMatchesPartial, isSuggested: isSuggested }
 
     }, [voucher, selectedTransaction, index])
 
@@ -971,11 +971,16 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
         ? transactionUnderReview.status === 'Reconciled' || (transactionUnderReview.unallocated_amount ?? 0) <= 0
         : false
 
+    // FAILS CLOSED on the ROW, not on the array. The previous test was `!selectedTransaction`, which
+    // an array - empty or not - always satisfies, so an empty selection posted
+    // `bank_transaction_name: undefined`. It matters here because the rejection path now DROPS a
+    // selected row the server no longer reports, so an empty selection is a state a refused attempt
+    // can genuinely leave behind.
     const onClick = () => {
-        if (!selectedTransaction) {
+        if (!transactionUnderReview) {
             return
         }
-        reconcileTransaction(selectedTransaction[0], voucher)
+        reconcileTransaction(transactionUnderReview, voucher)
     }
 
     // `isSettling` covers a strictly wider window than `loading`: it stays raised past the point the
@@ -1025,21 +1030,15 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
                                 <div className="text-base font-medium flex items-center gap-1">{formatDate(voucher.posting_date)} {postingDateMatches ? <MatchBadge matchType="full" label={_("Posting date matches the selected transaction")} /> : <MatchBadge matchType="none" label={_("Posting date does not match the selected transaction")} />}</div>
                             </div>
 
-                            {/* Trimmed, because the invoice branches of `get_linked_payments`
-                                supply a constant empty string here and the Journal Entry branch
-                                can supply NULL - neither of which should reach `formatDate`. */}
-                            {voucher.reference_date?.trim() && <div className="flex flex-col gap-1 min-w-24">
+                            {voucher.reference_date && <div className="flex flex-col gap-1 min-w-24">
                                 <div className="text-xs text-ink-gray-6">{_("Reference Date")}</div>
                                 <div className="text-base font-medium flex items-center gap-1">{formatDate(voucher.reference_date)} {referenceDateMatches ? <MatchBadge matchType="full" label={_("Reference date matches the selected transaction")} /> : <MatchBadge matchType="none" label={_("Reference date does not match the selected transaction")} />}</div>
                             </div>}
 
                         </div>
-                        {/* Same reasoning as the reference date: a blank or whitespace-only
-                            reference is not rendered at all, so no voucher is ever labelled
-                            with an empty reference and a grade beside it. */}
-                        {referenceLabel && <div className="flex items-start gap-1">
+                        {voucher.reference_no && <div className="flex items-start gap-1">
                             <span className="text-p-base">
-                                {referenceLabel}
+                                {voucher.reference_no}
                                 &nbsp;&nbsp;
                                 <Tooltip>
                                     <TooltipTrigger>
@@ -1058,18 +1057,24 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
                     {/* A disabled control emits no pointer or focus events, so the reason is anchored to a
                         focusable wrapper span rather than to the Button, keeping it discoverable by mouse
                         and keyboard alike. The Tooltip is mounted only when the guard fires, so the enabled
-                        path never stamps an `aria-describedby` pointing at content that is not rendered. */}
+                        path never stamps an `aria-describedby` pointing at content that is not rendered.
+
+                        Wrapped in its OWN TooltipProvider, matching every other tooltip in this file: the
+                        component must stay mountable on its own rather than depending on an ancestor
+                        provider from App.tsx. */}
                     {isAlreadyReconciled
-                        ? <Tooltip>
-                            <TooltipTrigger asChild>
-                                <span tabIndex={0} className="inline-flex rounded outline-none focus-visible:shadow-focus-gray">{reconcileButton}</span>
-                            </TooltipTrigger>
-                            {/* End-aligned so the tooltip stays inside the page gutter at the far right of
-                                the voucher card. */}
-                            <TooltipContent side="top" align="end" className="max-w-sm text-balance wrap-break-word">
-                                {_("This bank transaction is already fully reconciled, so it cannot be reconciled again.")}
-                            </TooltipContent>
-                        </Tooltip>
+                        ? <TooltipProvider>
+                            <Tooltip>
+                                <TooltipTrigger asChild>
+                                    <span tabIndex={0} className="inline-flex rounded outline-none focus-visible:shadow-focus-gray">{reconcileButton}</span>
+                                </TooltipTrigger>
+                                {/* End-aligned so the tooltip stays inside the page gutter at the far right of
+                                    the voucher card. */}
+                                <TooltipContent side="top" align="end" className="max-w-sm text-balance wrap-break-word">
+                                    {_("This bank transaction is already fully reconciled, so it cannot be reconciled again.")}
+                                </TooltipContent>
+                            </Tooltip>
+                        </TooltipProvider>
                         : reconcileButton}
                 </div>
             </div>

@@ -155,11 +155,23 @@ export const useGetAccountClosingBalanceAsPerStatement = (swrConfig: SWRConfigur
 
 export type UnreconciledTransaction = Pick<BankTransaction, 'name' | 'matched_transaction_rule' | 'date' | 'withdrawal' | 'deposit' | 'currency' | 'description' | 'status' | 'transaction_type' | 'reference_number' | 'party_type' | 'party' | 'bank_account' | 'company' | 'unallocated_amount'>
 
+/**
+ * The endpoint both transaction lists are served by - once filtered to the unreconciled rows and
+ * once with `all_transactions` - and the same one the post-rejection authoritative read calls
+ * imperatively.
+ *
+ * Named once because those three callers MUST agree: the imperative read exists precisely to obtain
+ * the rows the cached lists may no longer be telling the truth about, so a read pointed at a
+ * different endpoint - or at a misspelt one - would answer a different question while looking
+ * correct.
+ */
+const GET_BANK_TRANSACTIONS_METHOD =
+    'erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.get_bank_transactions'
 
 export const useGetUnreconciledTransactions = () => {
     const bankAccount = useAtomValue(selectedBankAccountAtom)
     const dates = useAtomValue(bankRecDateAtom)
-    return useFrappeGetCall<{ message: UnreconciledTransaction[] }>('erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.get_bank_transactions', {
+    return useFrappeGetCall<{ message: UnreconciledTransaction[] }>(GET_BANK_TRANSACTIONS_METHOD, {
         bank_account: bankAccount?.name,
         from_date: dates.fromDate,
         to_date: dates.toDate
@@ -200,71 +212,20 @@ export interface LinkedPayment {
     currency: string
 }
 
-/** How strongly a voucher's reference agrees with the transaction under review. */
-export type VoucherReferenceMatch = 'full' | 'partial' | 'none'
-
-/**
- * Trims, and treats null/undefined as blank, so every comparison below operates on a value
- * that is either meaningful or empty - never on whitespace that merely looks meaningful.
- */
-const normalizeReference = (value: string | null | undefined): string => (value ?? '').trim()
-
-/**
- * Grades a voucher's reference against the transaction's own reference candidates (its
- * reference number and its description).
+/*
+ * NOTE - there are deliberately no reference/date GRADING helpers here.
  *
- * A BLANK reference on either side is evidence of NOTHING and can never produce a match.
- * That rule is the whole point of this function. Two of the four voucher types
- * `get_linked_payments` returns supply `reference_no` as a constant empty string and a third
- * can supply NULL, so blanks are not an edge case here - they are the normal shape of an
- * invoice row. Compared naively, a blank sails through as a match twice over: `'' === ''`
- * reads as an exact match against a transaction that also has no reference, and - far worse -
- * `String.prototype.includes('')` is ALWAYS true, so every blank-reference voucher scored as
- * a partial match against every transaction. Because a partial match is one of the three
- * disjuncts that promote the first voucher to "suggested", an amount-only coincidence was
- * being presented to the reviewer as a rule-quality suggestion, in green, with a solid
- * Reconcile button. Requiring a trimmed, non-blank reference on both sides removes that
- * false signal without weakening any genuine one.
- *
- * Case is deliberately NOT folded: bank references are identifiers, and the backend's own
- * matching is case-sensitive.
+ * The suggested-match scoring is a FROZEN behaviour that lives inline in `MatchAndReconcile`'s
+ * `VoucherItem`, and exported graders beside the type above are how it came to be rewritten once
+ * already. The projection quirks they existed to absorb are documented on `LinkedPayment` instead,
+ * where every consumer sees them, and the nullable typing forces each one to decide what a missing
+ * reference means at its own call site rather than inheriting a decision made here.
  */
-export const matchVoucherReference = (
-    voucherReference: string | null | undefined,
-    transactionCandidates: (string | null | undefined)[]
-): VoucherReferenceMatch => {
-    const reference = normalizeReference(voucherReference)
-    if (reference.length === 0) return 'none'
-
-    const candidates = transactionCandidates
-        .map(normalizeReference)
-        .filter((candidate) => candidate.length > 0)
-
-    if (candidates.some((candidate) => candidate === reference)) return 'full'
-    if (candidates.some((candidate) => candidate.includes(reference))) return 'partial'
-    return 'none'
-}
-
-/**
- * Compares a voucher date against the transaction date under the same blank-is-not-evidence
- * rule. `reference_date` arrives as `""` for both invoice branches and can be NULL for a
- * Journal Entry, while `BankTransaction.date` is itself optional - so a bare `===` reports a
- * match whenever both sides happen to be absent, which is the same false signal in a
- * different column.
- */
-export const matchVoucherDate = (
-    voucherDate: string | null | undefined,
-    transactionDate: string | null | undefined
-): boolean => {
-    const voucher = normalizeReference(voucherDate)
-    const transaction = normalizeReference(transactionDate)
-    return voucher.length > 0 && voucher === transaction
-}
 
 export const useGetBankTransactions = () => {
     const bankAccount = useAtomValue(selectedBankAccountAtom)
     const dates = useAtomValue(bankRecDateAtom)
-    return useFrappeGetCall<{ message: BankTransaction[] }>('erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.get_bank_transactions', {
+    return useFrappeGetCall<{ message: BankTransaction[] }>(GET_BANK_TRANSACTIONS_METHOD, {
         bank_account: bankAccount?.name,
         from_date: dates.fromDate,
         to_date: dates.toDate,
@@ -313,15 +274,31 @@ export const useRefreshUnreconciledTransactions = () => {
      * This function should be called after a transaction is reconciled
      * It will get the next unreconciled transaction and select it
      * And then refresh the balance + unreconciled transactions list
+     *
+     * RETURNS A PROMISE that settles only once every invalidation it issued has completed and, on
+     * the full-allocation branch, once the selection has been rebuilt from the refreshed list. A
+     * caller that gates an affordance on "the outcome is still settling" must AWAIT it: this used to
+     * be a `void` function that started the refresh and returned immediately, so the reconcile
+     * hook's shared settling flag cleared in its `finally` while the list was still being re-read -
+     * leaving the just-reconciled transaction and the voucher it consumed actionable against a
+     * snapshot the client had already superseded. Nothing about WHICH keys are invalidated, or the
+     * order they are issued in, changes: they are still dispatched synchronously and in the same
+     * sequence, and only the settling of the returned promise is new.
      */
-    const onReconcileTransaction = (transaction: UnreconciledTransaction, updatedTransaction?: BankTransaction) => {
+    const onReconcileTransaction = async (transaction: UnreconciledTransaction, updatedTransaction?: BankTransaction): Promise<void> => {
 
         // If the updated transaction has an unallocated amount of 0, then we need to select the next unreconciled transaction
         if (updatedTransaction && updatedTransaction?.unallocated_amount !== 0) {
-            mutate(bankRecUnreconciledTransactionsKey(selectedBank?.name, dates.fromDate, dates.toDate))
-            mutate(bankRecClosingBalanceKey(selectedBank?.name, dates.toDate))
-            // Update the matching vouchers for the selected transaction
-            mutate(`bank-reconciliation-vouchers-${transaction.name}-${dates.fromDate}-${dates.toDate}-${matchFilters.join(',')}`)
+            // Issued together and awaited as a set, so the branch converges before the caller
+            // reopens anything. `allSettled`, because one key failing must not leave the others
+            // unawaited - and because a failed revalidation is not a reason to reject a
+            // reconciliation the server has already accepted.
+            await withDeadline(Promise.allSettled([
+                mutate(bankRecUnreconciledTransactionsKey(selectedBank?.name, dates.fromDate, dates.toDate)),
+                mutate(bankRecClosingBalanceKey(selectedBank?.name, dates.toDate)),
+                // Update the matching vouchers for the selected transaction
+                mutate(`bank-reconciliation-vouchers-${transaction.name}-${dates.fromDate}-${dates.toDate}-${matchFilters.join(',')}`)
+            ]))
             return
         }
 
@@ -346,7 +323,14 @@ export const useRefreshUnreconciledTransactions = () => {
         }
 
         // We need to select the next unreconciled transaction for a better UX
-        mutate(bankRecUnreconciledTransactionsKey(selectedBank?.name, dates.fromDate, dates.toDate))
+        //
+        // Both invalidations are DISPATCHED here, in the order they always were, and only awaited
+        // afterwards - so the calls a suite (or SWR) observes are unchanged, while the promise this
+        // function returns still covers the selection being rebuilt from the refreshed list.
+        const listRefresh = mutate(bankRecUnreconciledTransactionsKey(selectedBank?.name, dates.fromDate, dates.toDate))
+        const balanceRefresh = mutate(bankRecClosingBalanceKey(selectedBank?.name, dates.toDate))
+
+        await withDeadline(listRefresh
             .then(res => {
                 if (nextTransaction) {
                     // Check if next transaction is there in the response
@@ -362,134 +346,20 @@ export const useRefreshUnreconciledTransactions = () => {
                     setSelectedTransaction([])
                 }
             })
-        mutate(bankRecClosingBalanceKey(selectedBank?.name, dates.toDate))
+            // A refresh that fails in turn leaves the selection where it is rather than rejecting:
+            // the reconciliation itself succeeded, and the caller is awaiting convergence, not an
+            // outcome. Reported so it is never silent.
+            // Reported as a FIXED diagnostic rather than as the caught object: these rejections
+            // carry the whole Frappe response envelope, and a reconciliation's transport detail does
+            // not belong in a browser console. The reviewer is told through the dialog and the toast;
+            // the console only records that a contained follow-up did not finish.
+            .catch(() => console.error('Bank reconciliation: the post-reconciliation transaction refresh did not complete.')))
+
+        await withDeadline(balanceRefresh.catch(() => console.error('Bank reconciliation: the post-reconciliation balance refresh did not complete.')))
     }
 
     return onReconcileTransaction
 
-}
-
-/**
- * How long the client is prepared to wait for the rule-evaluation worker to finish stamping the
- * transactions an import just created, and how often it asks. Bounded on purpose: the wait is a
- * convenience, never a correctness requirement, so it must always end.
- */
-const RULE_EVALUATION_POLL_INTERVAL_MS = 700
-const RULE_EVALUATION_POLL_ATTEMPTS = 8
-
-/**
- * Waits, within a bound, for rule evaluation to have been applied to the bank transactions in a
- * date range - then reports whether it converged.
- *
- * WHY THIS IS NEEDED. `insert_transactions` calls the whitelisted `run_rule_evaluation`, which
- * enqueues the evaluator with `frappe.enqueue(...)`. That defaults to `enqueue_after_commit=False`,
- * so the job is queued immediately, BEFORE the request-level commit that makes the imported
- * transactions visible to other connections. A worker that picks the job up promptly runs
- * `_run_rule_evaluation`, whose query finds none of the new rows, and returns having stamped
- * nothing. The import then commits. The result is transactions that are permanently unevaluated
- * until some later trigger, and a reviewer looking at a freshly imported statement with no
- * suggested matches on it.
- *
- * WHY THE FIX IS HERE AND NOT IN THE BACKEND. Passing `enqueue_after_commit=True` would fix this at
- * source, but that is a change to existing backend behaviour on a shared, already-whitelisted
- * method, and it is not within the authorised change surface for this work: the only backend file in
- * scope is a test module. So this is resolved from the client, using an endpoint the application
- * already calls, and nothing about the server is altered.
- *
- * HOW. Re-invoking `run_rule_evaluation` from here is what makes this deterministic rather than a
- * hopeful wait. This call happens strictly AFTER the import's HTTP response has been received,
- * which means the import transaction has already committed; the job this enqueues therefore cannot
- * fail to see the imported rows the way the server-side call could. It is also safe to repeat:
- * `_run_rule_evaluation` selects only transactions with `is_rule_evaluated = 0`, so a re-run stamps
- * the stragglers and does no work at all when there are none, and the endpoint asks only for read
- * permission on Bank Transaction.
- *
- * The poll then watches the authoritative field the evaluator writes. `is_rule_evaluated` goes to 1
- * for every transaction the evaluator considers, whether or not a rule matched, so a count of zero
- * remaining is a positive statement that evaluation has been applied to this range - not an
- * inference from a matched-rule count, which would be indistinguishable from "no rule matched".
- *
- * WHY IT ASKS HOW MANY RULES EXIST FIRST. The evaluator's own first act is to read every
- * `Bank Transaction Rule` and `return` immediately if there are none - WITHOUT stamping anything.
- * On a site with no rules, therefore, `is_rule_evaluated` stays 0 for every imported transaction
- * no matter how many times the evaluator runs, the exit condition below is unreachable, and the
- * poll can only ever exhaust its full bound. That is not a slow wait, it is a wait that is
- * guaranteed to fail, and it delayed EVERY import on a default site by the whole bound while the
- * reviewer looked at a screen that had already finished its work. There is also nothing to
- * trigger in that state, so the re-invocation is skipped along with the poll.
- *
- * The rule count deliberately carries NO filters, because the evaluator's query carries none
- * either: it considers every rule, disabled or not, so any narrowing here could disagree with the
- * server about whether there is work to wait for. A count that cannot be READ is a different
- * matter - `Bank Transaction Rule` is a separate permission grant from the `Bank Transaction` read
- * this endpoint requires - and is NOT treated as "no rules": the bounded trigger and poll run as
- * before, because failing to read the count is not evidence about the site's configuration.
- *
- * Returns `true` when the range drained or when there is no rule that could ever stamp it, `false`
- * when the bound expired or the pending count could not be read. It NEVER rejects and never blocks
- * indefinitely: a caller that gets `false` has simply learned that suggested matches may still be
- * arriving, which is a display concern, not an error.
- */
-export const useWaitForRuleEvaluation = () => {
-
-    const { db } = useContext(FrappeContext) as FrappeConfig
-    const { call: runRuleEvaluation } = useFrappePostCall('erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule.run_rule_evaluation')
-
-    return useCallback(async (bankAccountName: string, fromDate: string, toDate: string): Promise<boolean> => {
-
-        // Nothing can stamp these transactions, so there is nothing to trigger and nothing that
-        // waiting could ever observe. Reported as converged because that is the honest answer to
-        // the question the caller is asking - no suggested match is still on its way.
-        try {
-            const ruleCount = await db.getCount('Bank Transaction Rule')
-
-            if (ruleCount === 0) {
-                return true
-            }
-        } catch (ruleCountError) {
-            // Unreadable, not absent. Fall through to the bounded wait rather than assume either way.
-            console.error(ruleCountError)
-        }
-
-        // Enqueued post-commit, so unlike the server-side call this one is guaranteed to see the
-        // rows the import just created. A failure here is not fatal: the scheduled evaluation will
-        // still get to them, so the poll below is attempted regardless.
-        try {
-            await runRuleEvaluation({})
-        } catch (triggerError) {
-            console.error(triggerError)
-        }
-
-        for (let attempt = 0; attempt < RULE_EVALUATION_POLL_ATTEMPTS; attempt++) {
-
-            try {
-                // Mirrors the evaluator's own selection (`status`, `docstatus`, `is_rule_evaluated`)
-                // and narrows it to the imported range, so the count answers a question about this
-                // import rather than about the whole account.
-                const pending = await db.getCount('Bank Transaction', [
-                    ['bank_account', '=', bankAccountName],
-                    ['date', 'between', [fromDate, toDate]],
-                    ['docstatus', '=', 1],
-                    ['status', '=', 'Unreconciled'],
-                    ['is_rule_evaluated', '=', 0]
-                ])
-
-                if (pending === 0) {
-                    return true
-                }
-            } catch (countError) {
-                // The count is unavailable, so convergence cannot be established. Reported as not
-                // converged rather than retried blindly.
-                console.error(countError)
-                return false
-            }
-
-            await new Promise((resolve) => setTimeout(resolve, RULE_EVALUATION_POLL_INTERVAL_MS))
-        }
-
-        return false
-
-    }, [db, runRuleEvaluation])
 }
 
 /**
@@ -516,6 +386,52 @@ export const useWaitForRuleEvaluation = () => {
  * emptied entry is refilled immediately rather than waiting for a remount. `populateCache: true`
  * is SWR's default and is stated explicitly because it is the load-bearing half of the fix.
  */
+/**
+ * How long the client is prepared to WAIT on a follow-up request before it stops waiting.
+ *
+ * Follow-ups are the cache invalidations and the authoritative re-read that run after a
+ * reconciliation or a statement import has already been answered. They are awaited for a reason -
+ * the confirm affordance stays closed until they converge, so the reviewer is never offered an
+ * action against a snapshot the server has superseded - and that is exactly why they need a bound.
+ * Neither the SDK's `call.get` nor `useSWRConfig().mutate` accepts an `AbortSignal`, and the
+ * underlying Axios instance sets no timeout, so a request that never answers is a promise that
+ * never settles: the affordance would sit disabled reading "Checking..." forever, on a screen whose
+ * whole job is to let an accountant post.
+ */
+const FOLLOW_UP_REQUEST_DEADLINE_MS = 15_000
+
+/**
+ * Races a follow-up against {@link FOLLOW_UP_REQUEST_DEADLINE_MS} and NEVER rejects.
+ *
+ * Expiry is not an error to report: the work was already done and acknowledged by the server, and
+ * the caller is awaiting convergence rather than an outcome - so a deadline that passes simply
+ * means "stop waiting", and every caller's own no-rows / no-snapshot path then applies unchanged.
+ *
+ * Two details are load-bearing. The timer is cleared in `finally`, so a fast follow-up does not
+ * hold the event loop open for the rest of the window - which in a test run would keep the
+ * environment alive past the assertion. And the abandoned promise gets a no-op `catch`, because a
+ * request that rejects AFTER its deadline has passed still has an unhandled rejection to deliver,
+ * and that surfaces as an `unhandledrejection` on a screen that has already moved on.
+ */
+export const withDeadline = async <T,>(work: Promise<T>): Promise<T | undefined> => {
+    work.catch(() => undefined)
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    try {
+        return await Promise.race([
+            work,
+            new Promise<undefined>((resolve) => {
+                timer = setTimeout(() => resolve(undefined), FOLLOW_UP_REQUEST_DEADLINE_MS)
+            })
+        ])
+    } finally {
+        if (timer !== undefined) {
+            clearTimeout(timer)
+        }
+    }
+}
+
 const EVICT_CACHE_ENTRY = { revalidate: true, populateCache: true } as const
 
 /**
@@ -549,13 +465,78 @@ export const useRefreshImportedTransactions = () => {
     const { mutate } = useSWRConfig()
 
     return useCallback(async (bankAccountName: string, fromDate: string, toDate: string): Promise<void> => {
-        await Promise.allSettled([
+        // Every invalidation is DISPATCHED unconditionally, so the cache WRITE always happens; only
+        // the WAIT for the revalidations they trigger is bounded.
+        await withDeadline(Promise.allSettled([
             mutate(bankRecUnreconciledTransactionsKey(bankAccountName, fromDate, toDate), undefined, EVICT_CACHE_ENTRY),
             mutate(bankRecBankTransactionsKey(bankAccountName, fromDate, toDate), undefined, EVICT_CACHE_ENTRY),
             mutate(bankRecClosingBalanceKey(bankAccountName, toDate), undefined, EVICT_CACHE_ENTRY),
             mutate(bankRecClosingBalanceAsPerStatementKey(bankAccountName, toDate), undefined, EVICT_CACHE_ENTRY)
-        ])
+        ]))
     }, [mutate])
+}
+
+/**
+ * Reads the server's CURRENT view of this bank account's transactions for the selected date range,
+ * imperatively and unconditionally - the whole set, including rows the unreconciled query filters
+ * out.
+ *
+ * WHY AN IMPERATIVE READ, AND NOT `mutate(key)`. SWR's keyed mutate performs a revalidation by
+ * invoking the key's registered revalidator, and revalidators are registered by MOUNTED
+ * subscribers. With no subscriber there is nothing to invoke, so the call resolves with whatever
+ * the cache currently holds and reports no problem at all. The all-transactions list lives in a
+ * different tab of the workbench, and Radix unmounts inactive tab content, so at the moment a
+ * confirm is refused that key routinely has NO subscriber - and its cached rows are the
+ * PRE-ATTEMPT snapshot, in which the transaction is still `Unreconciled` with a positive
+ * unallocated amount. Feeding that back into the selection is what let a stale row survive an
+ * "already fully reconciled" refusal and re-enable Confirm, which is the exact stale-client case
+ * FM3 exists to close.
+ *
+ * A `call.get` cannot be served from a cache, so what it returns is the server's answer or nothing.
+ * It is also the same read the workbench's own "Bank Transactions" tab performs - same endpoint,
+ * same arguments, `all_transactions` included - so the rows come back with an identical projection
+ * and a transaction the server now considers reconciled is PRESENT in them, carrying its true
+ * `status` and `unallocated_amount`, rather than merely missing.
+ *
+ * Never rejects. A failed read means the client could not establish the server's view, which the
+ * caller must handle as "unknown" rather than as an empty result; `undefined` says exactly that,
+ * while an empty ARRAY is a real answer and is treated as one.
+ */
+const useAuthoritativeTransactionRead = () => {
+
+    const { call: frappeCall } = useContext(FrappeContext) as FrappeConfig
+
+    const selectedBank = useAtomValue(selectedBankAccountAtom)
+
+    const dates = useAtomValue(bankRecDateAtom)
+
+    return useCallback(async (): Promise<UnreconciledTransaction[] | undefined> => {
+
+        if (!selectedBank?.name) {
+            return undefined
+        }
+
+        try {
+            const response = await frappeCall.get<{ message: UnreconciledTransaction[] }>(
+                GET_BANK_TRANSACTIONS_METHOD,
+                {
+                    bank_account: selectedBank.name,
+                    from_date: dates.fromDate,
+                    to_date: dates.toDate,
+                    all_transactions: true
+                }
+            )
+
+            return response?.message
+        } catch {
+            // Reported, not thrown: the caller is already surfacing the original rejection, and a
+            // second failure must not replace that message with this one. Fixed diagnostic only;
+            // see the note above.
+            console.error('Bank reconciliation: the authoritative transaction re-read did not complete.')
+            return undefined
+        }
+
+    }, [frappeCall, selectedBank?.name, dates.fromDate, dates.toDate])
 }
 
 export const useReconcileTransaction = () => {
@@ -575,6 +556,12 @@ export const useReconcileTransaction = () => {
     const { mutate } = useSWRConfig()
 
     const setBankRecErrorDialog = useSetAtom(bankRecErrorDialogAtom)
+
+    /**
+     * The subscriber-independent read the rejection path resolves the transaction's true state
+     * with. Held here rather than called inside the handler because it is a hook.
+     */
+    const readTransactionsFromServer = useAuthoritativeTransactionRead()
 
     /**
      * The selection the reviewer is acting on. It is written from the SAME atom-family instance
@@ -603,54 +590,66 @@ export const useReconcileTransaction = () => {
     const [isSettling, setIsSettling] = useAtom(bankRecReconcileSettlingAtom)
 
     /**
-     * Re-reads the server's own view of the two transaction lists and rebuilds the selection from
-     * whatever came back. Called only after a rejection.
+     * Re-establishes the server's own view after a rejection, and rebuilds the selection from it.
      *
-     * Both keys are EXISTING families and are re-derived here as the literal strings the query
-     * hooks build, so no sixth cache key appears and no key text changes. `allSettled` is used so
-     * a refresh that fails in turn is observed rather than escaping as an unhandled rejection, and
-     * the whole thing is awaited so the caller can keep the action closed until it finishes.
+     * TWO SEPARATE JOBS, deliberately not conflated - conflating them is what F5 was:
      *
-     * Both keys are served by the SAME endpoint (`get_bank_transactions`, once with
-     * `all_transactions`), so their rows carry an identical projection and can be searched as one
-     * pool. The unreconciled rows are consulted first purely so a still-unreconciled transaction
-     * resolves against the narrower, more specific list.
+     *  1. LEARN the truth, for the guard. Done with {@link useAuthoritativeTransactionRead}, an
+     *     imperative `call.get` that cannot be served from a cache. The previous version instead
+     *     read the RETURN VALUE of a bare `mutate(key)`, which for an unsubscribed key is simply
+     *     the current cache contents - so the pre-attempt snapshot of the all-transactions list
+     *     (transaction still `Unreconciled`, unallocated amount still positive) could override a
+     *     correct, freshly fetched unreconciled result, keep the stale row selected, and re-enable
+     *     Confirm on a transaction the server had just refused as already reconciled.
+     *  2. INVALIDATE what is DISPLAYED. Both list keys are emptied with the same
+     *     {@link EVICT_CACHE_ENTRY} treatment a statement import uses, because eviction is the only
+     *     form that applies WITHOUT a subscriber: a mounted list refills immediately, and an
+     *     unmounted one cannot later serve rows from before the attempt - which matters because
+     *     `useGetUnreconciledTransactions` disables both `revalidateOnFocus` and
+     *     `revalidateIfStale`, so a populated entry would otherwise survive a remount untouched.
+     *
+     * Both keys are EXISTING families, built by the same builders the query hooks use, so no sixth
+     * cache key appears and no key text changes. Nothing but emptiness is ever written into the
+     * cache, so this cannot put a differently-parameterised payload where a query's own answer
+     * belongs. `allSettled`, so one key failing does not prevent the other from being invalidated,
+     * and the whole thing is awaited so the caller can keep the action closed until it finishes.
      */
     const refreshFromServerAfterRejection = async () => {
 
-        const [unreconciledResult, allTransactionsResult] = await Promise.allSettled([
-            mutate<{ message: UnreconciledTransaction[] }>(bankRecUnreconciledTransactionsKey(selectedBank?.name, dates.fromDate, dates.toDate)),
-            mutate<{ message: BankTransaction[] }>(bankRecBankTransactionsKey(selectedBank?.name, dates.fromDate, dates.toDate))
-        ])
+        // Asked FIRST, and independently of the cache, so what the guard is rebuilt from is the
+        // server's answer rather than a by-product of an invalidation.
+        // Bounded like every other follow-up: `undefined` from an expiry is the same "nothing was
+        // established" answer the read's own failure path already returns, and the no-snapshot
+        // branch below handles it identically.
+        const authoritativeRows = await withDeadline(readTransactionsFromServer())
 
-        const unreconciledRows = unreconciledResult.status === 'fulfilled' ? unreconciledResult.value?.message : undefined
-        const allTransactionRows = allTransactionsResult.status === 'fulfilled' ? allTransactionsResult.value?.message : undefined
+        await withDeadline(Promise.allSettled([
+            mutate(bankRecUnreconciledTransactionsKey(selectedBank?.name, dates.fromDate, dates.toDate), undefined, EVICT_CACHE_ENTRY),
+            mutate(bankRecBankTransactionsKey(selectedBank?.name, dates.fromDate, dates.toDate), undefined, EVICT_CACHE_ENTRY)
+        ]))
 
-        // No authoritative snapshot came back at all - both refreshes failed, or neither key had a
-        // mounted fetcher to serve them. The selection is then left EXACTLY as it is: rebuilding it
-        // from nothing would either invent state or silently discard the reviewer's selection on the
-        // strength of a second failure. An empty array is not "nothing": a list that legitimately
-        // came back empty is authoritative and does clear the selection below.
-        if (!unreconciledRows && !allTransactionRows) {
+        // The read failed, so the client did not establish anything. The selection is then left
+        // EXACTLY as it is: rebuilding it from nothing would either invent state or silently discard
+        // the reviewer's selection on the strength of a second failure. The affordance stays closed
+        // for this attempt regardless, and the server remains the authority on any further one. An
+        // empty array is NOT this case - a list that legitimately came back empty is authoritative
+        // and does clear the selection below.
+        if (!authoritativeRows) {
             return
         }
-
-        const refreshedRows: UnreconciledTransaction[] = [...(unreconciledRows ?? []), ...(allTransactionRows ?? [])]
 
         // Replace every entry with the server's current row, and drop the ones the server no longer
         // reports for this account and date range. Nothing is merged or patched: the refreshed row
         // is taken whole, so `status` and `unallocated_amount` - the two fields the confirm guard
         // reads - can only ever be the server's own values.
         //
-        // Both outcomes are safe, and which one occurs depends on what the refreshed pool contains.
-        // A transaction the server now reports as reconciled is absent from the unreconciled list by
-        // construction (that endpoint filters on `unallocated_amount > 0`) but present in the
-        // all-transactions list, so where that view is also live the row is KEPT with its true
-        // status and the guard disables the action; where it is not, the row is dropped and the
-        // action is simply no longer offered. Neither path leaves a stale row behind still claiming
-        // to be reconcilable, which is the only outcome that would matter.
+        // Because the read carries `all_transactions`, a transaction the server now considers
+        // reconciled comes back PRESENT rather than missing, so the row is kept with its true status
+        // and the guard disables the action against it. A row the server genuinely no longer reports
+        // for this range is dropped, and the action is simply no longer offered. Neither outcome
+        // leaves a stale row behind still claiming to be reconcilable.
         setSelectedTransaction((currentSelection) => currentSelection.flatMap((selected) => {
-            const refreshed = refreshedRows.find((row) => row.name === selected.name)
+            const refreshed = authoritativeRows.find((row) => row.name === selected.name)
             return refreshed ? [refreshed] : []
         }))
     }
@@ -684,7 +683,8 @@ export const useReconcileTransaction = () => {
                     }
                 ]
             })
-            onReconcileTransaction(transaction, res.message)
+            // Raised BEFORE the refresh is awaited, so the confirmation does not wait on the
+            // network - the same ordering the rejection path uses for its message.
             toast.success(_("Reconciled"), {
                 duration: 4000,
                 closeButton: true,
@@ -696,8 +696,17 @@ export const useReconcileTransaction = () => {
                     backgroundColor: "rgb(0, 138, 46)"
                 }
             })
+            // RETURNED into the chain, so `isSettling` in the `finally` below cannot clear until the
+            // transaction lists have been re-read and the selection rebuilt from them. Returning it
+            // is the whole fix: this was previously called as a void function, so the shared flag
+            // cleared while the refresh was still in flight and the reconciled transaction - and the
+            // voucher just consumed - were briefly actionable again against the superseded snapshot.
+            return onReconcileTransaction(transaction, res.message)
         }).catch((reason: unknown) => {
-            console.error(reason)
+            // NOT logged. The rejection is surfaced in full to the reviewer through the dialog and
+            // the toast below, so a console copy would add nothing but a second, unredacted record
+            // of a financial transport failure.
+            //
             // Stored raw so the shared dialog parses the server's own envelope; only a rejection that
             // brought back no usable response is substituted, and then there is no server text to
             // preserve. The dialog and the toast read the same resolved value, so they cannot
@@ -812,54 +821,6 @@ export const useGetBankAccounts = (onSuccess?: (data?: Omit<SelectedBank, 'logo'
         error
     }
 
-}
-
-/**
- * The account currency of the currently selected bank account, read from the SERVER'S CURRENT
- * bank-account list rather than from the stored selection.
- *
- * Why this exists at all: `selectedBankAccountAtom` is an `atomWithStorage` over `localStorage`
- * with `getOnInit`, so the selected bank is a SNAPSHOT of a row as it looked whenever it was last
- * chosen - potentially days or weeks earlier, on another browser session. `account_currency` is
- * also the most likely field on that row to have moved on without the snapshot noticing, because
- * it is not a `Bank Account` field at all: `bank_account.get_list` derives it per row from the
- * linked `Account.account_currency` after the query, so editing the GL account - or repointing the
- * bank account at a different one - changes it with nothing written to the stored copy. Deciding a
- * currency comparison from that snapshot can therefore report a mismatch that no longer exists, or
- * miss one that now does. Neither is acceptable for a value a reviewer is being asked to act on.
- *
- * Why it is a second hook rather than a parameter on `useGetBankAccounts`: it shares that hook's
- * SWR ENTRY instead of opening a second request. `useFrappeGetCall` derives its cache key as
- * `` `${method}?${encodeQueryData(params)}` `` whenever the explicit `swrKey` argument is
- * `undefined`, so passing the identical method and the identical `{ company }` params produces a
- * byte-identical key - the same cached entry, the same in-flight request, deduped by SWR. No sixth
- * cache-key family is introduced and no extra network call is made.
- *
- * `revalidateIfStale` is deliberately LEFT AT ITS DEFAULT here, unlike on `useGetBankAccounts`
- * where it is switched off. That single difference is what makes this value fresh: mounting this
- * hook revalidates the shared entry, so every consumer of that entry - this hook, the bank picker,
- * and the picker's rehydration of the stored selection - sees the server's current rows.
- * `revalidateOnFocus` stays off to match the sibling hook, so focus behaviour is unchanged.
- *
- * Returns `undefined` while the list is loading, when the selected account is not in it, and when
- * the endpoint could not derive a currency for that row. Callers must treat `undefined` as
- * "nothing to compare" - never as a mismatch.
- */
-export const useSelectedBankAccountCurrency = (): string | undefined => {
-
-    const company = useCurrentCompany()
-    const selectedBank = useAtomValue(selectedBankAccountAtom)
-
-    const { data } = useFrappeGetCall<{ message: BankAccountWithCurrency[] }>('erpnext.accounts.doctype.bank_account.bank_account.get_list', {
-        company: company
-    }, undefined, {
-        revalidateOnFocus: false
-    })
-
-    return useMemo(
-        () => data?.message?.find((bank) => bank.name === selectedBank?.name)?.account_currency,
-        [data, selectedBank?.name]
-    )
 }
 
 export const useIsTransactionWithdrawal = (transaction: UnreconciledTransaction) => {
