@@ -64,9 +64,6 @@ export const useGetAccountClosingBalance = () => {
 
 }
 
-/**
- * Hook to fetch the closing balance set in the database for the given bank and date
- */
 export const useGetAccountClosingBalanceAsPerStatement = (swrConfig: SWRConfiguration = {}) => {
 
     const dates = useAtomValue(bankRecDateAtom)
@@ -139,10 +136,6 @@ export const useGetVouchersForTransaction = (transaction: UnreconciledTransactio
     })
 }
 
-/**
- * Common hook to refresh the unreconciled transactions list after a transaction is reconciled
- * @returns function to call to refresh the unreconciled transactions list AFTER the operation is done
- */
 export const useRefreshUnreconciledTransactions = () => {
 
     const selectedBank = useAtomValue(selectedBankAccountAtom)
@@ -158,23 +151,15 @@ export const useRefreshUnreconciledTransactions = () => {
 
     const { data: unreconciledTransactions } = useGetUnreconciledTransactions()
 
-    /** 
-     * This function should be called after a transaction is reconciled
-     * It will get the next unreconciled transaction and select it
-     * And then refresh the balance + unreconciled transactions list
-     */
     const onReconcileTransaction = (transaction: UnreconciledTransaction, updatedTransaction?: BankTransaction) => {
 
-        // If the updated transaction has an unallocated amount of 0, then we need to select the next unreconciled transaction
         if (updatedTransaction && updatedTransaction?.unallocated_amount !== 0) {
             mutate(`bank-reconciliation-unreconciled-transactions-${selectedBank?.name}-${dates.fromDate}-${dates.toDate}`)
             mutate(`bank-reconciliation-account-closing-balance-${selectedBank?.name}-${dates.toDate}`)
-            // Update the matching vouchers for the selected transaction
             mutate(`bank-reconciliation-vouchers-${transaction.name}-${dates.fromDate}-${dates.toDate}-${matchFilters.join(',')}`)
             return
         }
 
-        // From unreconciled transactions list, first apply the filters based on the search criteria and other filters
 
         const searchIndex = unreconciledTransactions ? new Fuse(unreconciledTransactions.message, {
             keys: ['description', 'reference_number'],
@@ -188,26 +173,21 @@ export const useRefreshUnreconciledTransactions = () => {
         let nextTransaction = null
 
         if (currentIndex !== -1) {
-            // Check if there is a next transaction
             if (currentIndex < (results.length || 0) - 1) {
                 nextTransaction = results[currentIndex + 1]
             }
         }
 
-        // We need to select the next unreconciled transaction for a better UX
         mutate(`bank-reconciliation-unreconciled-transactions-${selectedBank?.name}-${dates.fromDate}-${dates.toDate}`)
             .then(res => {
                 if (nextTransaction) {
-                    // Check if next transaction is there in the response
                     const nextTransactionObj = res?.message.find((t: UnreconciledTransaction) => t.name === nextTransaction.name)
                     if (nextTransactionObj) {
                         setSelectedTransaction([nextTransactionObj])
                     } else {
-                        // If the next transaction is not there in the response, we need to clear the selection
                         setSelectedTransaction([])
                     }
                 } else {
-                    // If there is no next transaction, we need to clear the selection
                     setSelectedTransaction([])
                 }
             })
@@ -228,8 +208,6 @@ export const useReconcileTransaction = () => {
 
     const addToActionLog = useUpdateActionLog()
 
-    // FM1/FM3: the rejection path below needs the shared error-dialog atom and the two transaction
-    // cache keys, so these four reads live at the top of the hook (never inside a callback).
     const setBankRecErrorDialog = useSetAtom(bankRecErrorDialogAtom)
     const selectedBank = useAtomValue(selectedBankAccountAtom)
     const dates = useAtomValue(bankRecDateAtom)
@@ -281,12 +259,8 @@ export const useReconcileTransaction = () => {
                 description: getErrorMessage(error)
             })
             /*
-             * FM1/FM3: the RAW, unmodified Frappe error goes to the shared dialog atom so the server's
-             * own message surfaces verbatim in the dismissible BankRecErrorDialog, and the two
-             * transaction reads are revalidated so a stale client is corrected. Nothing is mutated
-             * optimistically anywhere in this hook - the server rolls the request back and remains the
-             * sole source of truth - which is what makes "the transaction stays unreconciled with its
-             * state unchanged" true by construction rather than by rollback.
+             * Preserve the raw error for the shared dialog and revalidate both transaction lists.
+             * The client makes no optimistic state change and relies on refreshed server state.
              */
             setBankRecErrorDialog(error)
             mutate(`bank-reconciliation-unreconciled-transactions-${selectedBank?.name}-${dates.fromDate}-${dates.toDate}`)
@@ -338,7 +312,6 @@ export const useGetBankAccounts = (onSuccess?: (data?: Omit<SelectedBank, 'logo'
     })
 
     const banks = useMemo(() => {
-        // Match the bank account to the logo
         const banksWithLogos = data?.message.map((bank) => {
             const logo = findBankLogoForName(bank.bank)
             return {
@@ -388,7 +361,6 @@ export const useGetRuleForTransaction = (transaction: UnreconciledTransaction) =
     )
 }
 
-/** Hook to handle the search input while maintaining debouncing and global state. */
 export function useTransactionSearch(): [string, DebouncedState<(value: string) => void>] {
     const delay = 500
     const unwrappedInitialValue = ''
@@ -401,7 +373,6 @@ export function useTransactionSearch(): [string, DebouncedState<(value: string) 
         delay,
     )
 
-    // Update the debounced value if the initial value changes
     if (!eq(previousValueRef.current as string, unwrappedInitialValue)) {
         updateDebouncedValue(unwrappedInitialValue)
         previousValueRef.current = unwrappedInitialValue
@@ -410,17 +381,11 @@ export function useTransactionSearch(): [string, DebouncedState<(value: string) 
     return [debouncedValue, updateDebouncedValue]
 }
 
-/** Utility function to get the search results based on the search index, search string, type filter, amount filter and unreconciled transactions */
 export const getSearchResults = (
-    /** Fuse index of the unreconciled transactions */
     searchIndex: Fuse<UnreconciledTransaction> | null,
-    /** Search string */
     search: string,
-    /** Type filter */
     typeFilter: string,
-    /** Amount filter */
     amountFilter: number,
-    /** Unreconciled transactions */
     unreconciledTransactions?: UnreconciledTransaction[]) => {
 
     let r = []
@@ -461,7 +426,7 @@ export const useUpdateActionLog = () => {
     const setActionLog = useSetAtom(bankRecActionLog)
 
     const addToActionLog = (action: ActionLog) => {
-        // Store at max 100 actions
+        // Cap the log at the 100 most recent actions.
         setActionLog((prev) => {
             const newActions = [action, ...prev]
             if (newActions.length > 100) {

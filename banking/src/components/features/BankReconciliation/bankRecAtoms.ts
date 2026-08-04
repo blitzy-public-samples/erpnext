@@ -86,36 +86,27 @@ export const bankRecActionLog = atomWithStorage<ActionLog[]>('bank-rec-action-lo
 })
 
 /*
- * Failure-path state (FM1, FM2). Two atoms, and deliberately PLAIN IN-MEMORY ones rather than the
- * `atomWithStorage`/`createJSONStorage` their neighbours above use: each records a single observation
- * of a single request, and a reload re-reads the server, so a dialog or a per-file marker that
- * survived one would assert something nobody has re-checked.
- *
- * `bankRecErrorDialogAtom` is shared by all three dialog mount points - the reconciliation workbench,
- * the CSV statement-import step and the statement-importer list page - which live in two different
- * route trees; one atom is what guarantees those surfaces can never show conflicting error state.
+ * Failure-path state. Plain in-memory atoms, unlike the persisted atoms above: each records one
+ * observation of one request, and a reload re-reads the server, so a value that survived a reload
+ * would assert something nothing has re-checked.
  */
 
 /**
- * The rejection the shared dismissible `BankRecErrorDialog` is currently reporting, or `null` when the
- * dialog renders nothing - the same falsy-means-closed convention `bankRecUnreconcileModalAtom` uses.
+ * The rejection the shared dismissible `BankRecErrorDialog` is reporting, or `null` when the dialog
+ * renders nothing - the falsy-means-closed convention `bankRecUnreconcileModalAtom` also uses.
  *
- * The value is the Frappe error EXACTLY as the SDK handed it over, never reshaped: `ErrorBanner` parses
- * `_server_messages` itself and picks its severity from the server's own `indicator`, so passing the
- * object through by identity is what makes the server's wording - for example
- * `"Bank Transaction {0} is already fully reconciled"` - reach the reviewer verbatim.
+ * Held exactly as the SDK handed it over, never reshaped: `ErrorBanner` parses `_server_messages`
+ * itself and picks its severity from the server's own `indicator`, so passing the object through by
+ * identity is what makes the server's own wording reach the reviewer verbatim.
  */
 export const bankRecErrorDialogAtom = atom<FrappeError | null>(null)
 
 /**
- * Per-file import failures, keyed by `Bank Statement Import Log` name, holding the raw rejection the
- * server refused the import with so the rendering layer parses it through the same shared path.
+ * Per-file import failures, keyed by `Bank Statement Import Log` name and holding the raw rejection so
+ * the rendering layer parses it through that same shared path.
  *
- * FM2 requires the import status view to indicate failure per file, and this is the only place that
- * marker can live: `Bank Statement Import Log` offers exactly two status values - `Not Started` and
- * `Completed` - and carries no error field of any kind. Because the import executes synchronously and
- * rolls back on failure, a refused import simply leaves the log at `Not Started`, indistinguishable
- * from one merely waiting to be imported. The marker is therefore written from the observed
- * synchronous rejection and read by the importer list to render its third badge state.
+ * The marker cannot come from the row itself: the DocType offers only `Not Started` and `Completed`
+ * and carries no error field, and a failed import rolls back, so the log reads exactly as one nobody
+ * has tried yet.
  */
 export const bankRecImportFailuresAtom = atom<Record<string, FrappeError>>({})

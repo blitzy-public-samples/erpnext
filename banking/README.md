@@ -115,8 +115,8 @@ Node 24 is the only line that satisfies all four at once.
 
 ```bash
 yarn install --frozen-lockfile   # respects the committed v1 lockfile
-yarn typecheck                   # tsc -b — must exit 0
-yarn lint                        # eslint .
+yarn typecheck
+yarn lint
 yarn test                        # vitest run — no bench config needed
 yarn test:coverage               # enforces the >= 80% aggregate line threshold
 rm -rf coverage                  # generated output — see the coverage section

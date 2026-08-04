@@ -1,26 +1,20 @@
 /*
  * The reconciliation workbench. Three properties of this environment shape the harness:
  *
- *  1. Both lists render through `@tanstack/react-virtual`, whose range calculation returns nothing
- *     when the scroll container measures zero - and jsdom performs no layout. The virtualiser reads
- *     the viewport from `offsetHeight`, so {@link stubLayoutMeasurement} gives that one property a
- *     non-zero value; without it NO row renders. The spy is restored per test, because the shared
- *     teardown resets mock functions and not property getters.
+ *  1. Both lists render through `@tanstack/react-virtual`, which reads its viewport from
+ *     `offsetHeight` and renders NO row when that measures zero - as it does under jsdom, which
+ *     performs no layout. {@link stubLayoutMeasurement} answers that one property.
  *
- *  2. A router is required, not decorative: the "no transactions" empty state renders a `<Link>`.
- *     A `TooltipProvider` is deliberately NOT supplied by default - the subject wraps every tooltip
- *     it renders in its own provider, and a harness-supplied one would hide a missing local provider
- *     (see `withAncestorTooltipProvider` for the single scoped opt-in, which exists only for the
- *     out-of-scope modal bodies). Jotai is per-provider and the harness performs no global store
- *     reset, so each test builds its own store and seeds `selectedBankAccountAtom` (the component
- *     early-returns without it) and `bankRecDateAtom` (interpolated into the cache keys, so seeding
- *     it keeps key assertions independent of the calendar month).
+ *  2. A router is required rather than decorative: the empty state renders a `<Link>`. A
+ *     `TooltipProvider` is deliberately NOT supplied by default, because the subject wraps every
+ *     tooltip it renders in its own provider and a harness-supplied one would hide a missing local
+ *     provider. Jotai is per-provider and the harness performs no global store reset, so each test
+ *     builds its own store and seeds `selectedBankAccountAtom` (the component early-returns without
+ *     it) and `bankRecDateAtom` (interpolated into the cache keys).
  *
- *  3. The currency advisory chip is a `Badge` inside a `TooltipTrigger asChild`, and Radix's `Slot`
- *     spreads the trigger's props AFTER the Badge's - so `data-slot="badge"` is OVERWRITTEN with
- *     `data-slot="tooltip-trigger"` while `data-variant`, `data-size` and `data-theme` survive.
- *     {@link currencyAdvisoryChip} therefore selects on the surviving variant triple, scoped to one
- *     row so it cannot collide with the voucher panel's own orange "Partial Match" badge.
+ *  3. Radix's `Slot` spreads a `TooltipTrigger asChild`'s props AFTER its child's, so the advisory
+ *     chip loses `data-slot="badge"` and keeps `data-variant`/`data-size`/`data-theme`.
+ *     {@link currencyAdvisoryChip} therefore selects on that surviving triple.
  */
 
 import { act, render, screen, waitFor, within } from '@testing-library/react'
@@ -68,18 +62,10 @@ vi.mock('frappe-react-sdk', () => createFrappeSDKMock())
  * Toast spies, created with `vi.hoisted` so the `vi.mock` factory below - which the transform lifts
  * above every import - can close over them.
  *
- * ⚠️ MOCKED FOR ISOLATION, NOT FOR CONVENIENCE. `sonner` keeps every emitted notification in a
- * MODULE-LEVEL store, and nothing in this environment ever dismisses one: the toaster itself is
- * mounted in `App.tsx`, which this suite never renders, so a real `toast.success` leaves an entry
- * behind that outlives the test that raised it and is carried into every test that follows in this
- * file. Replacing the module keeps each test's notifications its own, and it also makes them
- * ASSERTABLE - which is the second half of the point: a mock that merely silenced the calls would be
- * weaker than the code it replaced, so the confirm-success and confirm-rejection paths below assert
- * exactly which notification was raised and that the other was not.
- *
- * Only `success` and `error` are stubbed, because they are the only members this component's module
- * graph reaches: `utils.ts:688,710` on the reconcile paths, and the three lazily-imported modal
- * bodies use the same two. `toast.promise` lives in `BankBalance.tsx`, which is not in this graph.
+ * Mocked for ISOLATION, not convenience: `sonner` keeps every emitted notification in a module-level
+ * store and nothing here ever dismisses one, because the toaster is mounted in `App.tsx`, which this
+ * suite never renders. Replacing the module keeps each test's notifications its own and makes them
+ * assertable. Only `success` and `error` are stubbed, the two members this module graph reaches.
  */
 const { toastSuccess, toastError } = vi.hoisted(() => ({
 	toastSuccess: vi.fn<(message: string, options?: unknown) => void>(),
@@ -102,28 +88,14 @@ type QueryResponse = ReturnType<typeof frappeSDKMock.useFrappeGetCall>
 
 type QueryError = NonNullable<QueryResponse['error']>
 
-/**
- * The rule document `RuleAction` renders, taken from the hook that fetches it. Deriving the
- * type from `useGetRuleForTransaction` rather than importing the generated declaration keeps
- * this fixture bound to the same contract the component consumes.
- */
 type RuleDocument = NonNullable<ReturnType<typeof useGetRuleForTransaction>['data']>
 
-/**
- * The date range every test seeds. Fixed rather than derived from "this month", because both
- * revalidated cache keys interpolate it and the assertions below spell those keys out in full.
- */
 const FROM_DATE = '2024-01-01'
 const TO_DATE = '2024-01-31'
 
 const UNRECONCILED_KEY = `bank-reconciliation-unreconciled-transactions-${TEST_BANK_ACCOUNT}-${FROM_DATE}-${TO_DATE}`
 const CLOSING_BALANCE_KEY = `bank-reconciliation-account-closing-balance-${TEST_BANK_ACCOUNT}-${TO_DATE}`
 
-/**
- * The all-transactions key, which the REJECTION path re-reads alongside the unreconciled one. It is
- * the key that can still carry a now-reconciled row, because the unreconciled endpoint filters on
- * `unallocated_amount > 0` and therefore cannot.
- */
 const BANK_TRANSACTIONS_KEY = `bank-reconciliation-bank-transactions-${TEST_BANK_ACCOUNT}-${FROM_DATE}-${TO_DATE}`
 
 const DEFAULT_MATCH_FILTERS = 'payment_entry,journal_entry'
@@ -135,9 +107,8 @@ const RECONCILE_ENDPOINT =
 	'erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.reconcile_vouchers'
 
 /**
- * A realistic non-zero pane height. The component sizes both virtualised viewports from it
- * (`contentHeight - 72` and `contentHeight - 120`), so a zero would starve them even with the
- * measurement stub in place.
+ * A realistic non-zero pane height. The component sizes both virtualised viewports from it, so a
+ * zero would starve them even with the measurement stub in place.
  */
 const CONTENT_HEIGHT = 800
 
@@ -169,14 +140,10 @@ const WITHDRAWAL_ROW = makeUnreconciledTransaction({
 })
 
 /**
- * A rule as the server stores it, used to drive the recommended-action card that a rule-matched
- * transaction opens. `classify_as: 'Payment Entry'` selects the green branch of that card.
- *
- * Built from the SHARED builder rather than assembled here, because the DocType marks
- * `description_rules` REQUIRED: a rule with no condition rows is a document the server cannot
- * produce, so a locally-written fixture with an empty table would be asserting against an
- * impossible response. The builder supplies one valid `Contains` row; only the members these tests
- * actually read are overridden.
+ * A rule as the server stores it, driving the recommended-action card a rule-matched transaction
+ * opens; `classify_as: 'Payment Entry'` selects that card's green branch. Built from the shared
+ * builder because the DocType marks `description_rules` REQUIRED, so a locally written fixture with
+ * an empty table would assert against a document the server cannot produce.
  */
 const MATCHED_RULE: RuleDocument = {
 	...makeBankTransactionRule({
@@ -185,9 +152,6 @@ const MATCHED_RULE: RuleDocument = {
 		rule_description: 'Credits whose description names ACME Traders',
 		transaction_type: 'Deposit',
 		priority: 4,
-		// The constant rather than `BANK.company`: `company` is optional on a bank account and
-		// required on a rule, so reading it off the account would not type-check - and the harness
-		// seeds exactly this company, so the two cannot disagree.
 		company: TEST_COMPANY,
 		classify_as: 'Payment Entry',
 		// Deliberately NOT the bank account's own GL account: the card renders this string, and a
@@ -229,14 +193,10 @@ const refused = (error: QueryError): QueryResponse => ({
 /**
  * Gives the virtualised scroll containers a non-zero viewport.
  *
- * `@tanstack/react-virtual` reads its container height from `offsetHeight`, and jsdom reports
- * zero for every element because it performs no layout - at which point the virtualiser's range
- * calculation returns nothing and the lists render no rows whatsoever. This is the ONE property
- * that has to be answered honestly for a virtualised list to be observable headlessly; the
- * component itself is untouched.
- *
- * Returned so the caller can restore it: the shared teardown resets mock FUNCTIONS, not property
- * getters, so a suite that installs one owns putting it back.
+ * `@tanstack/react-virtual` reads its container height from `offsetHeight`, and jsdom reports zero
+ * for every element, at which point the range calculation returns nothing and the lists render no
+ * rows at all. Returned so the caller can restore it: the shared teardown resets mock FUNCTIONS, not
+ * property getters.
  */
 const stubLayoutMeasurement = () =>
 	vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(CONTENT_HEIGHT)
@@ -246,13 +206,10 @@ interface WorkbenchOptions {
 	vouchers?: LinkedPayment[]
 	selected?: UnreconciledTransaction[]
 	/**
-	 * The account currency the CURRENT `bank_account.get_list` response carries - i.e. the server's
-	 * present answer, which is what the mismatch advisory is required to compare against.
-	 *
-	 * `account_currency` is not a `Bank Account` field: the endpoint derives it per row from the
-	 * linked `Account.account_currency`. Pass `null` to model an account whose currency the endpoint
-	 * could not derive; `null` rather than `undefined`, because an omitted option has to remain
-	 * distinguishable from one deliberately left unresolved.
+	 * The account currency the CURRENT `bank_account.get_list` response carries. It is not a
+	 * `Bank Account` field - the endpoint derives it per row from the linked `Account.account_currency`
+	 * - so pass `null` to model an account whose currency it could not derive, `null` rather than
+	 * `undefined` so an omitted option stays distinguishable from one deliberately unresolved.
 	 */
 	accountCurrency?: string | null
 	withoutBank?: boolean
@@ -264,26 +221,14 @@ interface WorkbenchOptions {
 	dialogError?: QueryError
 	amountFilter?: number
 	/*
-	 * Supplies an ANCESTOR `TooltipProvider`, for the two tests that open a create-a-voucher modal.
-	 *
-	 * It is off by default and must stay that way. The subject wraps every tooltip IT renders in its
-	 * own provider, so the default (absent) case is the real production contract for this file and
-	 * is what proves that composition - a harness-supplied provider would hide a missing local one.
-	 *
-	 * The exception is the lazily-loaded modal BODIES (`TransferModalContent`,
-	 * `RecordPaymentModalContent`, `BankEntryModalContent`). Those are separate, out-of-scope
-	 * components that legitimately consume the application-level provider `App.tsx` wraps the whole
-	 * router in, and they throw without an ancestor. Opting in for exactly those two tests keeps the
-	 * compensation visible and scoped, instead of blanketing the whole file with it.
+	 * Supplies an ANCESTOR `TooltipProvider`, and is off by default deliberately: the subject wraps
+	 * every tooltip IT renders in its own provider, so the absent case is the production contract this
+	 * file proves. The exception is the lazily loaded modal BODIES, which are separate components that
+	 * legitimately consume the application-level provider and throw without an ancestor.
 	 */
 	withAncestorTooltipProvider?: boolean
 }
 
-/*
- * Routes responses by endpoint so the real hooks generate the cache keys, the search grading and the
- * reconcile payload. A single render calls `useFrappeGetCall` with several different methods, so a
- * blanket stub cannot serve them.
- */
 const renderWorkbench = (options: WorkbenchOptions = {}) => {
 	const {
 		transactions = [],
@@ -329,13 +274,9 @@ const renderWorkbench = (options: WorkbenchOptions = {}) => {
 			return answered({ message: vouchers })
 		}
 
-		// Shared with the bank picker, which resolves the row's logo. The mismatch advisory compares
-		// against the account currency carried by the SELECTED-BANK atom, not against this response.
-		//
-		// Answered with the ENDPOINT-row builder rather than by spreading `BANK`: that constant is
-		// the persisted selection, whose shape differs from this endpoint's projection in both
-		// directions (it carries `integration_id`, which is not projected, and lacks
-		// `account_subtype`, which is). The row's `name` still matches the selection.
+		// Answered with the ENDPOINT-row builder rather than by spreading `BANK`: that constant is the
+		// persisted selection, whose shape differs from this endpoint's projection in both directions. The
+		// advisory compares against the selected-bank atom's currency, not against this response.
 		if (method.endsWith('bank_account.bank_account.get_list')) {
 			return answered({
 				message: [makeBankAccountListRow({ name: BANK.name, account_currency: accountCurrency ?? undefined })]
@@ -351,12 +292,6 @@ const renderWorkbench = (options: WorkbenchOptions = {}) => {
 
 	frappeSDKMock.useFrappeGetDoc.mockImplementation(() => answered(rule))
 
-	/*
-	 * By DEFAULT there is no outer `TooltipProvider`. The subject composes its own provider around
-	 * every tooltip it renders, and supplying one here unconditionally would MASK a missing local
-	 * provider - the component would look mountable in the suite while throwing wherever it is not
-	 * wrapped at this level. See `withAncestorTooltipProvider` for the one scoped exception.
-	 */
 	const subject = (
 		<MemoryRouter>
 			<MatchAndReconcile contentHeight={CONTENT_HEIGHT} />
@@ -387,12 +322,9 @@ const transactionRow = (transaction: UnreconciledTransaction): HTMLElement => {
 }
 
 /**
- * The currency-mismatch advisory chip inside one row, or `null` when the row shows none.
- *
- * Selected on the variant triple that SURVIVES the `asChild` merge (see the file header: the chip
- * loses `data-slot="badge"` to the tooltip trigger). Scoping the query to a row, and pinning
- * `data-size="sm"`, is what makes it impossible for this to match the voucher panel's own orange
- * "Partial Match" badge, which is a default-size badge in a different subtree.
+ * The currency-mismatch advisory chip inside one row, or `null` when the row shows none. Selected on
+ * the variant triple that SURVIVES the `asChild` merge; scoping to a row and pinning
+ * `data-size="sm"` is what stops it matching the voucher panel's own orange "Partial Match" badge.
  */
 const currencyAdvisoryChip = (row: HTMLElement): HTMLElement | null =>
 	row.querySelector<HTMLElement>('[data-theme="orange"][data-variant="subtle"][data-size="sm"]')
@@ -403,15 +335,9 @@ const ruleBadge = (row: HTMLElement): HTMLElement | null =>
 /**
  * The voucher card enclosing a named voucher, so a confirm control can be scoped to ONE candidate.
  *
- * Resolved upwards from the voucher's own link to the enclosing VIRTUAL ROW - the element the
- * virtualiser stamps with `data-index` and hands to its `measureElement` ref
- * (`MatchAndReconcile.tsx:113-117`). That attribute is functional rather than presentational, so it
- * is exactly as stable as the list itself; scoping on a utility class instead would couple these
- * posting tests to Tailwind, and a harmless restyle of the card's wrapper would fail TC3/TC4 while
- * the behaviour they assert was still correct.
- *
- * The link is unique to the voucher panel, so there is no risk of resolving to a transaction row's
- * virtual wrapper even though both lists are built from the same component.
+ * Resolved upwards from the voucher's own link to the virtual row the virtualiser stamps with
+ * `data-index`. That attribute is functional rather than presentational, so it is as stable as the
+ * list itself, whereas scoping on a utility class would couple these tests to Tailwind.
  */
 const voucherCard = (voucher: LinkedPayment): HTMLElement => {
 	const card = screen.getByRole('link', { name: voucher.name }).closest<HTMLElement>('[data-index]')
@@ -440,13 +366,11 @@ const postEndpointsUsed = (): string[] => [
 	...new Set(frappeSDKMock.useFrappePostCall.mock.calls.map(([method]) => method))
 ]
 
-/** Every dialog surface currently mounted, in document order, whether or not Radix has hidden it. */
 const dialogSurfaces = (): HTMLElement[] =>
 	Array.from(
 		document.querySelectorAll<HTMLElement>('[data-slot="dialog-content"], [data-slot="alert-dialog-content"]')
 	)
 
-/** The text of every mounted dialog's title, again regardless of whether Radix has hidden it. */
 const dialogTitles = (): (string | null)[] =>
 	Array.from(
 		document.querySelectorAll<HTMLElement>('[data-slot="dialog-title"], [data-slot="alert-dialog-title"]')
@@ -456,22 +380,15 @@ const dialogTitles = (): (string | null)[] =>
  * Asserts that a dialog titled `title` is open, then closes EVERY open dialog and waits for the
  * document to be clear of them.
  *
- * ⚠️ WHY THE TITLE IS MATCHED ACROSS ALL DIALOGS RATHER THAN ON `getByRole('dialog')`.
- * Opening the record-payment body auto-opens a NESTED dialog: `RecordPaymentModalContent.tsx:295`
- * raises the "Select Invoices" dialog from an effect whenever the rule it was opened from carries a
- * party, a party type and an account - which the rule fixture here does. Radix marks everything
- * beneath a nested modal `aria-hidden`, and Testing Library's role queries skip hidden subtrees, so
- * `getByRole('dialog')` legitimately resolves to the CHILD dialog and never sees the parent's title.
- * Whether that happens depends only on how quickly the lazily-imported body arrives - i.e. on
- * whether an earlier test in this file already warmed the module cache - which made the previous
- * single-dialog query pass in declaration order and fail under `--sequence.shuffle`. Reading the
- * title slots directly is immune to both the nesting and the timing.
+ * The title is matched across all dialogs rather than through `getByRole('dialog')` because opening
+ * the record-payment body auto-opens a NESTED dialog. Radix marks everything beneath a nested modal
+ * `aria-hidden` and role queries skip hidden subtrees, so a role query can resolve to the CHILD and
+ * never see the parent's title - and whether it does depends on how quickly the lazily imported body
+ * arrives, i.e. on module-cache warmth and therefore on test order.
  *
- * Closing is not tidiness either. A Radix dialog manages document-level state while open - it hides
- * the rest of the tree from assistive technology and takes over pointer handling - and a tree
- * unmounted with one still open leaves that state behind for whatever renders next, which
- * suppresses the following test's own dialog. One Escape dismisses one layer, so the loop runs
- * until none is left; each pass must strictly reduce the count, which is what bounds it.
+ * Closing is not tidiness: a Radix dialog manages document-level state while open, and a tree
+ * unmounted with one still open suppresses the next test's dialog. One Escape dismisses one layer, so
+ * the loop runs until none is left and each pass must strictly reduce the count.
  */
 const expectDialogTitled = async (user: ReturnType<typeof userEvent.setup>, title: string) => {
 	await waitFor(() => {
@@ -491,45 +408,27 @@ const expectDialogTitled = async (user: ReturnType<typeof userEvent.setup>, titl
 }
 
 /*
- * TIMEOUT: this file declares a per-case budget above Vitest's 5s default, and it is a measurement
- * rather than a preference.
+ * TIMEOUT: this file declares a per-suite budget above Vitest's 5 s default because these cases mount
+ * the whole workbench and several then await a DYNAMICALLY IMPORTED modal body. The first
+ * `await import()` pays transform and evaluation cost inside whichever case reaches it first, so the
+ * expense moves with test order and is multiplied by coverage instrumentation, which can fail a case
+ * on timing alone.
  *
- * These cases mount the whole reconciliation workbench - a virtualised list, the Radix tab shell and
- * the tooltip/theme providers - and several of them then open a voucher route, which awaits a
- * DYNAMICALLY IMPORTED modal body: `RecordPaymentModalContent` is 52 KB of source,
- * `BankEntryModalContent` 34 KB and `TransferModalContent` 24 KB. The first `await import()` of each
- * pays transform and evaluation cost inside the case that happens to reach it first, and the
- * remainder are then served from the module cache - so the expense is real but MOVES: under
- * `--sequence.shuffle` it lands on whichever case runs first, and under `--coverage` V8
- * instrumentation multiplies it. Measured on a four-core runner: the same case ran at 3.0s
- * uninstrumented, 5.1s instrumented, and a different case in the same group peaked at 5.7s once the
- * order changed - i.e. cases whose every assertion passes were failing the `test` and
- * `test:coverage` gates on timing alone, and never the same case twice.
- *
- * A per-case budget was therefore the wrong instrument (it just moves the failure to its neighbour)
- * and a global `testTimeout` in `vitest.config.ts` would be the wrong place - the other seven suites
- * are fast and should keep the strict default, which is what catches a genuine hang early. Declaring
- * it once here scopes the allowance to exactly the suite that needs it: every case in this file
- * inherits it, no case outside it does, and 20s still fails a real hang rather than running forever.
+ * Declared here rather than as a global `testTimeout`, so the allowance is scoped to the one suite
+ * that needs it while the other suites keep the strict default that catches a genuine hang early.
  */
 describe('MatchAndReconcile', { timeout: 20000 }, () => {
 	let layoutMeasurement: ReturnType<typeof stubLayoutMeasurement>
 
 	/**
-	 * Loads the three lazily-imported modal bodies ONCE, before any test runs.
+	 * Loads the three lazily imported modal bodies ONCE, before any test runs. Each is large and sits
+	 * behind a `lazy()` boundary, so whichever test opens one first would otherwise pay the whole
+	 * import cost inside its own budget - which surfaced as an intermittent timeout that moved between
+	 * tests with `--sequence.shuffle`.
 	 *
-	 * They are large - 52 KB, 34 KB and 24 KB of TSX with their own dependency graphs - and each is
-	 * behind a `lazy()` boundary, so whichever test opens one FIRST pays the whole import cost inside
-	 * its own 5 s budget. Under V8 coverage instrumentation with several workers competing that first
-	 * open measured over 5 s, which surfaced as an intermittent timeout rather than as a behavioural
-	 * failure, and it moved from test to test with `--sequence.shuffle`.
-	 *
-	 * Warming the cache here makes the cost a fixed, once-per-file charge on a hook with its own
-	 * budget, and it makes the module-cache state the same for every test regardless of the order the
-	 * runner chose - which is also the second guard against the nested-dialog race documented on
-	 * {@link expectDialogTitled}. Nothing is rendered or asserted here: the imports are evaluated for
-	 * their side effect on the loader cache alone, and every module they reach that talks to a server
-	 * is already mocked above.
+	 * Warming the cache makes that a fixed once-per-file charge and makes module-cache state identical
+	 * for every test regardless of order, which is also the second guard against the nested-dialog race
+	 * documented on {@link expectDialogTitled}. Nothing is rendered or asserted here.
 	 */
 	beforeAll(async () => {
 		await Promise.all([
@@ -583,10 +482,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 		})
 
 		it('renders each row exactly as the backend produced it, with no client-side deduplication', async () => {
-			// A re-import legitimately produces two Bank Transaction records that agree on every
-			// visible field. The list must show BOTH: collapsing them would hide real duplicated
-			// bank activity that a reviewer has to resolve, and the server is the only authority on
-			// whether two rows are the same event.
 			const first = makeUnreconciledTransaction({ name: 'ACC-BTN-2024-02001', description: 'Repeat wire' })
 			const second = makeUnreconciledTransaction({ name: 'ACC-BTN-2024-02002', description: 'Repeat wire' })
 
@@ -599,9 +494,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 		})
 
 		it('resolves amounts through the currency helpers', async () => {
-			// The row falls back transaction currency -> fresh account currency -> stored account
-			// currency -> company default, then formats with the symbol and grouping the currency
-			// document carries. Asserting the rendered figure is what proves that whole chain ran.
 			const partlyAllocated = makeUnreconciledTransaction({
 				name: 'ACC-BTN-2024-03001',
 				description: 'Partly allocated wire',
@@ -659,9 +551,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			const badge = ruleBadge(transactionRow(stamped))
 			expect(badge).not.toBeNull()
 
-			// Both halves matter: the badge has to be the violet one AND it has to name the rule,
-			// because a reviewer acts on WHICH rule proposed the match, not merely on the fact that
-			// one did.
 			expect(badge).toHaveAttribute('data-theme', 'violet')
 			expect(badge).toHaveTextContent(TEST_TRANSACTION_RULE)
 		})
@@ -749,25 +638,11 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			).toBeInTheDocument()
 		})
 
-		/**
-		 * Offering the right label and then opening the wrong document would be worse than offering
-		 * nothing, so the routing is asserted for each classification rather than inferred from the
-		 * label.
-		 *
-		 * One case per test, deliberately. Each pass mounts the workbench and then lazily imports a
-		 * modal body of 24-52 KB, so driving all three from a single `it` put one test at ~3 s of the
-		 * 5 s default budget in isolation - and over it whenever coverage instrumentation and worker
-		 * contention were added, which showed up as an intermittent timeout rather than as a
-		 * behavioural failure. Splitting keeps every case comfortably inside the budget and names
-		 * exactly which classification broke when one does.
-		 */
 		const openRecommendedAction = async (
 			user: ReturnType<typeof userEvent.setup>,
 			classification: RuleDocument['classify_as'],
 			expectedTitle: string
 		) => {
-			// One object in both the list and the selection, exactly as the reviewer's own click would
-			// leave it.
 			const stamped = makeRuleMatchedTransaction({ description: 'Rule-stamped ACME credit' })
 
 			renderWorkbench({
@@ -815,8 +690,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 	describe('creating a voucher instead of matching one', () => {
 		it('opens each create-a-voucher route for the transaction under review', async () => {
 			const user = userEvent.setup()
-			// The only two tests that need an ancestor provider: the lazily-loaded modal BODIES are
-			// separate, out-of-scope components that consume the application-level provider.
 			renderWorkbench({ transactions: [DEPOSIT_ROW], selected: [DEPOSIT_ROW], withAncestorTooltipProvider: true })
 
 			await waitFor(() => {
@@ -838,7 +711,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			renderWorkbench({
 				transactions: [DEPOSIT_ROW, WITHDRAWAL_ROW],
 				selected: [DEPOSIT_ROW, WITHDRAWAL_ROW],
-				// Same reason: this path opens the out-of-scope modal bodies too.
 				withAncestorTooltipProvider: true
 			})
 
@@ -858,7 +730,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 
 		it('honours the shortcuts its own tooltips advertise', async () => {
 			const user = userEvent.setup()
-			// Opens the same modal bodies as the test above, hence the same scoped opt-in.
 			renderWorkbench({ transactions: [DEPOSIT_ROW], selected: [DEPOSIT_ROW], withAncestorTooltipProvider: true })
 
 			await waitFor(() => {
@@ -933,8 +804,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 				WITHDRAWAL_ROW.name
 			])
 
-			// Several transactions cannot be matched to one voucher, so the confirm affordance is
-			// withheld and only the create-a-voucher actions remain.
 			expect(screen.queryByRole('button', { name: 'Reconcile' })).not.toBeInTheDocument()
 			expect(screen.getByRole('button', { name: /Record a bank journal entry/ })).toBeInTheDocument()
 		})
@@ -942,9 +811,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 		it('grades each candidate against the transaction under review', async () => {
 			const suggested = makeSuggestedLinkedPayment(DEPOSIT_ROW)
 			const unrelated = makeAlternateLinkedPayment()
-			// An invoice row as `get_linked_payments` really returns one: the amount agrees but both
-			// reference columns are the empty string. It is included so the badge grid is asserted
-			// against the shapes the endpoint actually produces, not only against tidy ones.
 			const blankReference = makeBlankReferenceLinkedPayment()
 
 			renderWorkbench({
@@ -957,9 +823,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 				expect(screen.getByRole('link', { name: suggested.name })).toBeInTheDocument()
 			})
 
-			// The suggestion is the FIRST candidate that agrees on amount AND on a date or reference —
-			// the scoring is `index === 0` gated, which is why position matters here and why the two
-			// later rows carry no Suggested badge whatever they agree on.
 			const suggestedBadge = within(voucherCard(suggested)).getByText('Suggested')
 			expect(suggestedBadge).toHaveAttribute('data-theme', 'green')
 			expect(within(voucherCard(unrelated)).queryByText('Suggested')).not.toBeInTheDocument()
@@ -968,14 +831,11 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			expect(within(voucherCard(suggested)).getByText('Complete Match')).toBeInTheDocument()
 			expect(within(voucherCard(unrelated)).getByText('No Match')).toBeInTheDocument()
 
-			// An empty `reference_no` renders no reference row at all, so no grade badge accompanies it.
 			expect(within(voucherCard(blankReference)).queryByText('No Match')).not.toBeInTheDocument()
 			expect(within(voucherCard(blankReference)).queryByText('Complete Match')).not.toBeInTheDocument()
 		})
 
 		it('still suggests a first candidate whose reference genuinely matches', async () => {
-			// The legitimate path: a real reference and no date agreement, promoted at index 0 on the
-			// strength of the reference alone.
 			const candidate = makeLinkedPayment({
 				name: 'ACC-PAY-2024-04091',
 				reference_no: DEPOSIT_ROW.reference_number,
@@ -1032,18 +892,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 	})
 
 	describe('TC3 - a manual override to a different voucher', () => {
-		/**
-		 * The suggestion and the override, ORDERED BY THE ENDPOINT'S OWN RULE rather than by hand.
-		 *
-		 * `check_matching` concatenates every branch's rows and returns them sorted by `rank`
-		 * DESCENDING, and each builder derives its rank from its own branch formula - the suggested
-		 * Payment Entry agrees on reference, amount and party, giving 4 of that branch's maximum 4,
-		 * while the Journal Entry agrees on neither of the two indicators its branch measures, giving
-		 * 1 of 3. Passing them through `sortLinkedPaymentsAsEndpoint` is what makes the order a
-		 * CONSEQUENCE of those ranks instead of an arrangement the suite asserts and the fixtures
-		 * contradict. It matters because the suggestion predicate additionally requires `index === 0`,
-		 * so this sort decides which candidate the workbench proposes.
-		 */
 		const suggested = makeSuggestedLinkedPayment(DEPOSIT_ROW)
 		const different = makeAlternateLinkedPayment()
 		const candidatesAsReturned = sortLinkedPaymentsAsEndpoint([different, suggested])
@@ -1056,7 +904,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			})
 
 		it('returns the higher-ranked candidate first, as the endpoint sorts them', () => {
-			// The premise every test in this block rests on, asserted rather than assumed.
 			expect(suggested.rank).toBe(4)
 			expect(different.rank).toBe(1)
 			expect(candidatesAsReturned.map((voucher) => voucher.name)).toEqual([suggested.name, different.name])
@@ -1111,9 +958,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 				expect(frappePostCall).toHaveBeenCalledTimes(1)
 			})
 
-			// Posting an existing voucher's doctype and name is what selects the server's `Matched`
-			// path, so the client side of that is what is asserted: an existing voucher was named and
-			// nothing was created.
 			const [{ payment_doctype: doctype, payment_name: name }] = JSON.parse(
 				String(capturedReconcileRequest().vouchers)
 			)
@@ -1170,16 +1014,11 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 				expect(frappePostCall).toHaveBeenCalledTimes(1)
 			})
 
-			// One server-side operation, on one endpoint. Confirm/post is atomic on the server, so
-			// the client's whole contribution is to make exactly this one request.
 			expect(postEndpointsUsed()).toEqual([RECONCILE_ENDPOINT])
 
-			// The request is asserted as the SERVER reads it. `add_payment_entries` consumes
-			// `payment_doctype` and `payment_name` and nothing else; it appends the child row at
-			// `allocated_amount: 0.0` and `allocate_payment_entries` then derives the real allocation
-			// from the voucher's GL entries and its prior allocations. `amount` is a legacy member of
-			// the Desk tool's payload that the server IGNORES, so it is asserted as a field that is
-			// still sent - not as one that controls anything.
+			// Asserted as the SERVER reads it: `add_payment_entries` consumes `payment_doctype` and
+			// `payment_name` and derives the allocation itself, so `amount` is asserted as a field that is
+			// still sent, not as one that controls anything.
 			const [voucherPayload] = JSON.parse(String(capturedReconcileRequest().vouchers)) as {
 				payment_doctype: string
 				payment_name: string
@@ -1190,7 +1029,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			expect(voucherPayload.payment_name).toBe(suggested.name)
 			expect(voucherPayload.amount).toBe(suggested.paid_amount)
 
-			// And the reviewer is told it succeeded, once, with an Undo offered - not told it failed.
 			await waitFor(() => {
 				expect(toastSuccess).toHaveBeenCalledTimes(1)
 			})
@@ -1210,23 +1048,14 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 				expect(frappeSWRMutate).toHaveBeenCalledWith(UNRECONCILED_KEY)
 			})
 
-			// The balance panel is revalidated alongside the list, because a posted reconciliation
-			// moves both.
 			expect(frappeSWRMutate).toHaveBeenCalledWith(CLOSING_BALANCE_KEY)
 
-			// The selection is rebuilt from that refresh rather than patched: the server reported
-			// the transaction fully allocated, so it leaves the unreconciled list and the reviewer
-			// is advanced off it. No status was written client-side anywhere.
 			await waitFor(() => {
 				expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([])
 			})
 		})
 
 		it('revalidates the candidate list too when the server reports a partial allocation', async () => {
-			// A partial allocation keeps the reviewer on the same transaction, so its remaining
-			// candidates have to be re-read as well - the voucher just consumed is no longer one.
-			// The unallocated figure alone states the branch: the builder derives the allocated
-			// amount, the status and the child allocation row that must accompany it.
 			frappePostCall.mockResolvedValue(
 				makeReconcileSuccessResponse({ unallocated_amount: 2500 })
 			)
@@ -1243,8 +1072,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 		})
 
 		it('closes the affordance while a post is in flight', async () => {
-			// The in-flight window is the double-click guard, and it is the one state that has to be
-			// driven from the hook rather than from a fixture: `loading` belongs to the post hook.
 			frappeSDKMock.useFrappePostCall.mockImplementation(() => ({
 				call: frappePostCall,
 				result: null,
@@ -1262,11 +1089,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			expect(screen.queryByRole('button', { name: 'Reconcile' })).not.toBeInTheDocument()
 		})
 
-		/*
-		 * FM1/FM3/TC6. A refusal is reported and NOTHING is mutated optimistically: the selected row
-		 * keeps the state the server gave it, no row is marked reconciled, and the authoritative reads
-		 * are revalidated so the server's own answer is what corrects the client.
-		 */
 		it('reports the refusal and leaves the transaction unreconciled and unchanged', async () => {
 			const user = userEvent.setup()
 			const refusal = makeAlreadyReconciledError(DEPOSIT_ROW.name)
@@ -1283,14 +1105,12 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			})
 			await user.click(confirmControlFor(suggested))
 
-			// The raw rejection reaches the shared dialog by identity, and the row is untouched.
 			await waitFor(() => {
 				expect(store.get(bankRecErrorDialogAtom)).toBe(refusal)
 			})
 			expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([DEPOSIT_ROW])
 			expect(store.get(SELECTED_TRANSACTION_ATOM)?.[0].status).toBe('Unreconciled')
 
-			// One request, and nothing was posted: the reviewer is told it failed.
 			expect(frappePostCall).toHaveBeenCalledTimes(1)
 			expect(toastSuccess).not.toHaveBeenCalled()
 			await waitFor(() => {
@@ -1302,8 +1122,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			const user = userEvent.setup()
 			frappePostCall.mockRejectedValue(makeAlreadyReconciledError(DEPOSIT_ROW.name))
 
-			// Even when the follow-up revalidation itself fails, the client makes exactly one attempt:
-			// a second post would be one made without knowing the outcome of the first.
 			frappeSWRMutate.mockRejectedValue(new Error('revalidation unavailable'))
 
 			renderWorkbench({
@@ -1321,16 +1139,13 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 				expect(frappePostCall).toHaveBeenCalledTimes(1)
 			})
 
-			// Given time for any deferred retry to land, there is still exactly one request.
 			await new Promise((resolve) => setTimeout(resolve, 50))
 			expect(frappePostCall).toHaveBeenCalledTimes(1)
 		})
 
 		/*
-		 * The ACCEPTED path advances the reviewer from the REFRESHED list rather than from the
-		 * snapshot it posted against. Holding the invalidation open makes that observable: until it
-		 * resolves the selection is untouched, and when it does the transaction is absent from the
-		 * refreshed list, so the selection is emptied and there is nothing left to confirm.
+		 * Holding the invalidation open is what makes the advance observable: until it resolves the
+		 * selection is untouched, and when it does the transaction is absent from the refreshed list.
 		 */
 		it('advances the selection only once the accepted post\'s refresh converges', async () => {
 			const user = userEvent.setup()
@@ -1357,7 +1172,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 				expect(toastSuccess).toHaveBeenCalledTimes(1)
 			})
 
-			// Not yet converged: nothing has been written to the selection from a list nobody has read.
 			expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([DEPOSIT_ROW])
 
 			await act(async () => {
@@ -1375,23 +1189,16 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 
 	describe('TC5 and FM3 - an already-reconciled transaction cannot be reconciled again', () => {
 		/**
-		 * A transaction the server considers fully reconciled. BOTH signals are set because the
-		 * server derives them from one another - `status === 'Reconciled'` holds exactly when
-		 * `unallocated_amount <= 0` - so setting only one would model a state the server can never
-		 * produce, and the guard would be tested against a fiction.
+		 * A transaction the server considers fully reconciled. BOTH signals are set because the server
+		 * derives them from one another, so setting only one would model a state it can never produce.
 		 *
-		 * HOW SUCH A ROW REACHES THIS SURFACE, precisely. It does NOT arrive in this tab's list:
-		 * `useGetUnreconciledTransactions` calls `get_bank_transactions` WITHOUT `all_transactions`,
-		 * and the endpoint filters `unallocated_amount > 0` server-side, so a reconciled row is never
-		 * among the rows rendered here. The unfiltered set is requested by a DIFFERENT tab
-		 * (`BankTransactionList`), which renders no Reconcile control at all.
-		 *
-		 * It reaches this surface through the SELECTION, which is where the guard reads it from:
-		 * `bankRecSelectedTransactionAtom` holds a row captured earlier, and this tab's list
-		 * revalidates neither on focus nor when stale - so a selection made before a reconciliation
-		 * (performed here in another tab, in the Desk, or by a rule) outlives it. Every case below
-		 * therefore seeds the SELECTION with the settled row while the list answers with rows the
-		 * endpoint could really return.
+		 * Such a row does not arrive in THIS tab's list - `get_bank_transactions` filters
+		 * `unallocated_amount > 0` server-side unless `all_transactions` is passed, and this tab does not
+		 * pass it. It reaches the guard through the SELECTION, which is where the guard reads it from:
+		 * `bankRecSelectedTransactionAtom` holds a row captured earlier, and this tab's list revalidates
+		 * neither on focus nor when stale, so a selection made before a reconciliation outlives it. Every
+		 * case below therefore seeds the SELECTION with the settled row while the list answers with rows
+		 * the endpoint could really return.
 		 */
 		const reconciled = makeReconciledTransaction({ description: 'Already reconciled wire' })
 		const stillUnreconciled = makeUnreconciledTransaction({
@@ -1403,9 +1210,7 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 
 		it('disables the confirm control', async () => {
 			renderWorkbench({
-				// The endpoint's own answer, which cannot contain the settled row.
 				transactions: [stillUnreconciled],
-				// ...while the persisted selection still names it.
 				selected: [reconciled],
 				vouchers: [makeSuggestedLinkedPayment(reconciled)]
 			})
@@ -1415,11 +1220,10 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 		})
 
 		/*
-		 * The predicate the BACKEND actually tests is the FIGURE, not the label - its guard reads
-		 * `if 0.0 >= self.unallocated_amount`. The two rows below are the ones that separate the two
-		 * halves of the client's `status === 'Reconciled' || unallocated_amount <= 0`, and they are
-		 * the reason the second half exists: a label that has not caught up, and an over-allocation,
-		 * are both states the server refuses while `status` still reads `Unreconciled`.
+		 * The predicate the BACKEND tests is the FIGURE, not the label: its guard reads
+		 * `if 0.0 >= self.unallocated_amount`. The two rows below separate the two halves of the client's
+		 * `status === 'Reconciled' || unallocated_amount <= 0` - a label that has not caught up, and an
+		 * over-allocation - both of which the server refuses while `status` still reads `Unreconciled`.
 		 */
 		it('withholds it on a fully allocated row whose status label has not caught up', async () => {
 			const laggingLabel = makeUnreconciledTransaction({
@@ -1491,9 +1295,8 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			const control = await screen.findByRole('button', { name: 'Reconcile' })
 
 			// A disabled button emits no pointer or focus events, so the explanation is anchored to a
-			// focusable wrapper around it. Asserting the wrapper - rather than hovering for the
-			// tooltip text, which is portaled behind a delay - is the stable way to prove the reason
-			// is reachable by mouse AND keyboard.
+			// focusable wrapper around it; asserting the wrapper rather than hovering for the portaled
+			// tooltip text is the stable way to prove the reason is reachable by mouse and keyboard.
 			const trigger = control.parentElement
 			expect(trigger).toHaveAttribute('data-slot', 'tooltip-trigger')
 			expect(trigger).toHaveAttribute('tabindex', '0')
@@ -1511,18 +1314,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			expect(control.parentElement).not.toHaveAttribute('data-slot', 'tooltip-trigger')
 		})
 
-		/*
-		 * The guard governs the ACTION, never the VISIBILITY, and this is asserted on rows the
-		 * endpoint can really return.
-		 *
-		 * It previously handed the workbench list a RECONCILED row and asserted that it rendered - a
-		 * premise this endpoint cannot satisfy, because `useGetUnreconciledTransactions` omits
-		 * `all_transactions` and the server filters `unallocated_amount > 0`. Passing an impossible
-		 * response made the test unfalsifiable in the direction that mattered: it would have gone on
-		 * passing if the client had started filtering by status itself, since the fixture guaranteed
-		 * a row the client would then have hidden. Rendering exactly what the endpoint returns is the
-		 * contract, so the fixture is now exactly what it returns.
-		 */
 		it('renders every row the endpoint returns, filtering none of them client-side', async () => {
 			const secondOpenRow = makeUnreconciledTransaction({
 				name: 'ACC-BTN-2024-05005',
@@ -1541,14 +1332,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			expect(screen.getByText('2 results')).toBeInTheDocument()
 		})
 
-		/*
-		 * THE STALE-CLIENT CASE, end to end. A client holding a row the server has since settled can
-		 * still reach an enabled control, because its list revalidates neither on focus nor when
-		 * stale - so the guard cannot be a first-load-only check. The server refuses, its own words
-		 * are reported verbatim in the dismissible dialog, and BOTH authoritative reads are
-		 * revalidated so the server's answer is what corrects the client. No status is written
-		 * locally anywhere and nothing is mutated optimistically.
-		 */
 		it('reports the server\'s own words and re-reads the server after a refusal', async () => {
 			const user = userEvent.setup()
 			const stale = makeUnreconciledTransaction({
@@ -1566,36 +1349,28 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 				vouchers: [makeSuggestedLinkedPayment(stale)]
 			})
 
-			// The stale snapshot genuinely offers the action - which is the premise of the case.
 			const control = await screen.findByRole('button', { name: 'Reconcile' })
 			expect(control).toBeEnabled()
 
 			await user.click(control)
 
-			// The refusal is reported in the dismissible dialog, verbatim.
 			expect(await screen.findByRole('alertdialog')).toHaveTextContent(
 				formatAlreadyReconciledMessage(stale.name)
 			)
 
 			await user.click(await screen.findByRole('button', { name: 'Dismiss' }))
 
-			// ...and dismissing it changes nothing else: the row is exactly as the server left it, with
-			// no local status written and nothing marked reconciled.
 			await waitFor(() => {
 				expect(store.get(bankRecErrorDialogAtom)).toBeNull()
 			})
 			expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([stale])
 			expect(store.get(SELECTED_TRANSACTION_ATOM)?.[0].status).toBe('Unreconciled')
 
-			// Both authoritative reads were revalidated, so the row's true state comes from the
-			// server's current answer rather than from this client.
 			expect(frappeSWRMutate).toHaveBeenCalledWith(UNRECONCILED_KEY)
 			expect(frappeSWRMutate).toHaveBeenCalledWith(BANK_TRANSACTIONS_KEY)
 
 			expect(frappePostCall).toHaveBeenCalledTimes(1)
 
-			// The notification carries the SERVER's own words, and no success is ever claimed - the
-			// dialog and the toast read the same resolved error, so they cannot disagree about it.
 			expect(toastError).toHaveBeenCalledTimes(1)
 			expect(toastError).toHaveBeenCalledWith(
 				'Error',
@@ -1621,18 +1396,12 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			const chip = currencyAdvisoryChip(transactionRow(mismatched))
 			expect(chip).not.toBeNull()
 
-			// `orange` - Badge declares no `amber` theme at all - in its subtle variant, which is what
-			// resolves to the amber tokens a caution calls for.
 			expect(chip).toHaveAttribute('data-theme', 'orange')
 			expect(chip).toHaveAttribute('data-variant', 'subtle')
 			expect(chip).toHaveTextContent(TEST_ALTERNATE_CURRENCY)
 		})
 
 		it('leaves the confirm control ENABLED, because the server decides the outcome', async () => {
-			// The half of FM5 that carries the requirement. "Non-blocking" is a statement about the
-			// INDICATOR: the interface must not pre-emptively refuse an action on the strength of a
-			// comparison it made itself. The server remains the authority on whether the post is
-			// allowed, and a refusal surfaces through the shared dismissible dialog like any other.
 			renderWorkbench({
 				transactions: [mismatched],
 				selected: [mismatched],
@@ -1662,8 +1431,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			})
 			await user.click(confirmControlFor(voucher))
 
-			// The advisory changes nothing about the request that is made. No conversion, no rate and
-			// no revaluation is involved anywhere: the chip is display only.
 			await waitFor(() => {
 				expect(frappePostCall).toHaveBeenCalledTimes(1)
 			})
@@ -1684,9 +1451,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 		})
 
 		it('shows no chip when the account currency is unknown, because there is nothing to compare', async () => {
-			// `account_currency` is derived by the endpoint from the linked GL account and cannot
-			// always be resolved. An absent value is an ABSENCE OF EVIDENCE, not a mismatch - a
-			// warning that is wrong in that direction is worse than no warning.
 			renderWorkbench({
 				transactions: [mismatched],
 				accountCurrency: null
@@ -1849,8 +1613,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 				expect(screen.getByText('No transactions found for the given filters.')).toBeInTheDocument()
 			})
 
-			// The empty state distinguishes "your filters excluded everything" from "there is nothing
-			// to reconcile", and offers the corresponding way out.
 			expect(screen.getByText('Try adjusting your search or filter criteria.')).toBeInTheDocument()
 
 			await user.click(screen.getByRole('button', { name: 'Clear Filters' }))
@@ -1881,8 +1643,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 		it('shows placeholders instead of an empty list', () => {
 			renderWorkbench({ transactionsState: 'loading' })
 
-			// A skeleton, not "no unreconciled transactions" - which would be a claim about the
-			// account that has not been established yet.
 			expect(document.querySelectorAll('[data-slot="skeleton"]').length).toBeGreaterThan(0)
 			expect(screen.queryByText('No unreconciled transactions found')).not.toBeInTheDocument()
 		})
@@ -1927,7 +1687,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 				expect(screen.getByText('Not permitted to read Payment Entry')).toBeInTheDocument()
 			})
 
-			// Nothing is offered for confirmation while the candidate list is unknown.
 			expect(screen.queryByRole('button', { name: 'Reconcile' })).not.toBeInTheDocument()
 		})
 	})
@@ -1945,7 +1704,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 
 			await user.click(screen.getByRole('button', { name: /View older transactions/ }))
 
-			// The range moves to the oldest date the server reported, so the next read covers them.
 			expect(store.get(bankRecDateAtom)).toEqual({ fromDate: '2023-12-01', toDate: TO_DATE })
 		})
 

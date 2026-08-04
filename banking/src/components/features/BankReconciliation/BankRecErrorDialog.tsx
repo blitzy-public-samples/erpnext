@@ -13,21 +13,15 @@ import { bankRecErrorDialogAtom } from "./bankRecAtoms"
 import _ from "@/lib/translate"
 
 /**
- * Shared, dismissible error dialog for the Bank Reconciliation and Bank Statement Importer surfaces
- * (FM1, FM2, FM3). Takes no props: one shared atom drives every mount site across both route trees,
- * so the surfaces can never show conflicting error state.
+ * Shared, dismissible error dialog for the Bank Reconciliation and Bank Statement Importer surfaces.
+ * Takes no props: one shared atom drives every mount site across both route trees, so the surfaces
+ * cannot report different errors at once.
  *
- * The rejection is handed to the SHARED `ErrorBanner` EXACTLY as the SDK delivered it - by identity,
- * with nothing reshaped, cleared or re-encoded, and with `overrideHeading` left unset. That is what
- * makes the parser (`getErrorMessages`), the severity rule (`indicator === 'yellow'` -> amber, else
- * red), the heading rule and the message rendering the same single implementation the inline banner
- * call sites use, so this dialog and an inline banner can never disagree about the same rejection and
- * the server's own words - for example `"Bank Transaction {0} is already fully reconciled"` - reach
- * the reviewer verbatim.
+ * The rejection reaches the shared `ErrorBanner` by identity, with `overrideHeading` left unset, so
+ * parsing, severity and heading stay the single implementation the inline banner call sites use and
+ * the server's own words reach the reviewer verbatim.
  *
- * Dismissing clears the dialog atom and nothing else - it issues no request, triggers no revalidation
- * and raises no notification, because the calling hook owns revalidation and the backend remains the
- * sole authority on what was recorded.
+ * Dismissing clears the atom and nothing else: the calling hook owns revalidation.
  */
 const BankRecErrorDialog = () => {
 	const [error, setError] = useAtom(bankRecErrorDialogAtom)
@@ -41,22 +35,16 @@ const BankRecErrorDialog = () => {
 		}
 	}
 
-	// An empty atom means "no error to show", mirroring the falsy-means-closed modal-atom convention
-	// used throughout this feature folder.
 	if (!error) {
 		return null
 	}
 
 	return (
 		<AlertDialog open onOpenChange={onOpenChange}>
-			{/* Width follows the canonical pattern this dialog imitates,
-			    `BankTransactionUnreconcileModal.tsx:37`. */}
 			<AlertDialogContent className="min-w-2xl">
 				<AlertDialogHeader>
-					{/* Deliberately outcome-NEUTRAL: this chrome renders before the rejection has been
-					    inspected, and a transport-level failure carries no server response at all, so the
-					    client cannot know whether the operation was applied and must not say. FM1 makes
-					    the backend response the sole source of truth. */}
+					{/* Outcome-neutral: a transport-level failure carries no server response, so the client
+					    cannot know whether the operation was applied and must not say. */}
 					<AlertDialogTitle>{_("Something went wrong")}</AlertDialogTitle>
 					<AlertDialogDescription>
 						{_("Review the details below, then dismiss this message to continue. The server remains the authority on what was recorded.")}

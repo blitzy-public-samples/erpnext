@@ -1,17 +1,12 @@
 /*
- * `BankRecErrorDialog` — the dismissible error dialog (FM1, FM2, FM3).
- *
- * The component is a COMPOSITION and this suite specifies it as one: an `AlertDialog` wrapping the
- * shared `ErrorBanner`, handed the `FrappeError` EXACTLY as the SDK delivered it. So the assertions
- * fall into three groups — that the server's own words reach the reader through the shared parser and
- * the shared renderer; that the severity the reader sees is the server's own; and that dismissal
- * touches nothing but the dialog atom.
+ * `BankRecErrorDialog` is a COMPOSITION and this suite specifies it as one: an `AlertDialog` wrapping
+ * the shared `ErrorBanner`, handed the `FrappeError` exactly as the SDK delivered it.
  *
  * `AlertDialogContent` renders inside `AlertDialogPortal`, so the dialog is portaled to
  * `document.body` and is NOT inside the tree `render()` returns: every query goes through
  * `screen`/`document`, and the render helper exposes no `container` to reach for by mistake.
  *
- * Severity is asserted on the theme's token CLASSES because `ui/alert.tsx` emits no `data-theme` — it
+ * Severity is asserted on the theme's token CLASSES because `ui/alert.tsx` emits no `data-theme` - it
  * carries the theme only in its `cva` class list, so the class is the sole observable signal.
  */
 import { render, screen, waitFor } from '@testing-library/react'
@@ -126,11 +121,6 @@ describe('BankRecErrorDialog', () => {
 	})
 
 	describe("renders the server's own words", () => {
-		/*
-		 * The real server text, thrown by the guard that makes a double post impossible. Both halves are
-		 * checked: that the shared factory still transcribes the template exactly, and that the banner
-		 * renders the formatted result character for character.
-		 */
 		it('renders "Bank Transaction {0} is already fully reconciled" verbatim', () => {
 			expect(ALREADY_RECONCILED_MESSAGE_TEMPLATE).toBe(
 				'Bank Transaction {0} is already fully reconciled'
@@ -148,11 +138,6 @@ describe('BankRecErrorDialog', () => {
 			expect(getBannerMessageText()).toContain(transaction)
 		})
 
-		/**
-		 * `getErrorMessages` resolves in a fixed order, and a rejection can arrive on any of these paths
-		 * depending on how it was raised. Covering each one is what stops the dialog rendering an empty
-		 * banner for a shape nobody happened to test.
-		 */
 		describe('across every envelope path the shared parser resolves', () => {
 			it('PATH 1 — the double-encoded `_server_messages` a frappe.throw produces', () => {
 				renderDialog(makeServerMessagesError('Nothing was posted'))
@@ -167,8 +152,6 @@ describe('BankRecErrorDialog', () => {
 			})
 
 			it('PATH 3 — the text after the first colon of `exception`', () => {
-				// Reached only because there are no server messages at all. The parsed message keeps the
-				// space that follows the colon, which markdown then folds away on render.
 				renderDialog(makeExceptionError('Bank Account is disabled'))
 
 				expect(getBannerMessageText().trim()).toBe('Bank Account is disabled')
@@ -181,8 +164,6 @@ describe('BankRecErrorDialog', () => {
 			})
 
 			it('appends `_error_message` to `_server_messages` rather than replacing it', () => {
-				// The append is additive by design, so a rejection carrying both shows BOTH — one
-				// rendered message per parsed entry (`ui/error-banner.tsx:43-45`).
 				renderDialog(
 					makeFrappeError({
 						_server_messages: encodeServerMessages({
@@ -208,12 +189,6 @@ describe('BankRecErrorDialog', () => {
 			})
 		})
 
-		/*
-		 * THE RAW-ERROR CONTRACT. The dialog hands `ErrorBanner` the object the atom holds, by identity
-		 * and untouched. That is what makes this dialog and any inline banner incapable of disagreeing
-		 * about the same rejection, and it is asserted directly rather than inferred, because the way
-		 * this contract gets broken is by a well-meaning transformation that "only" normalises a field.
-		 */
 		it('never reshapes, clears or re-encodes the rejection it was handed', () => {
 			const error = makeFrappeError({
 				_server_messages: encodeServerMessages({
@@ -248,8 +223,6 @@ describe('BankRecErrorDialog', () => {
 			})
 
 			it('keeps a distinctive server title, so the dialog sets no overrideHeading', () => {
-				// `overrideHeading` would win over the parsed title unconditionally. It is left unset,
-				// which is only observable when the server sends a title worth keeping.
 				renderDialog(
 					makeFrappeError({
 						_server_messages: encodeServerMessages({
@@ -283,9 +256,6 @@ describe('BankRecErrorDialog', () => {
 		})
 
 		it("keeps Frappe's own inline emphasis, which the shared markdown path renders", () => {
-			// A bespoke text-only renderer here would have shown these tags literally. The server's
-			// `frappe.bold()` wrappers — used by the currency guard at `bank_transaction.py:64-83`, among
-			// others — must arrive as emphasis, exactly as they do in every inline banner.
 			renderDialog(makeServerMessagesError('Transaction currency: <b>USD</b> cannot be different'))
 
 			const banner = getBanner()
@@ -335,8 +305,6 @@ describe('BankRecErrorDialog', () => {
 			expect(screen.getByText(DIALOG_TITLE)).toBeInTheDocument()
 			expect(screen.getByText(DIALOG_DESCRIPTION)).toBeInTheDocument()
 			expect(screen.getByRole('button', { name: DISMISS_LABEL })).toBeInTheDocument()
-			// One control only: an error that must be acknowledged offers no second way out, so there is
-			// deliberately no Cancel.
 			expect(content.querySelectorAll('button')).toHaveLength(1)
 			expect(getBanner()).toBeInTheDocument()
 		})
@@ -349,8 +317,6 @@ describe('BankRecErrorDialog', () => {
 		})
 
 		it('follows the width of the canonical modal it imitates, and adds nothing else', () => {
-			// `BankTransactionUnreconcileModal.tsx:37` is the pattern; matching it exactly is what keeps
-			// this dialog from carrying sizing rules of its own.
 			renderDialog(makeServerMessagesError('Nothing was posted'))
 
 			expect(getDialogContent().className).toContain('min-w-2xl')
@@ -382,8 +348,6 @@ describe('BankRecErrorDialog', () => {
 		})
 
 		it('leaves every other piece of reconciliation state byte-identical', async () => {
-			// FM1: dismissing acknowledges a message. It must not stand in for the revalidation the
-			// calling hook owns, and it must not disturb the selection that hook already corrected.
 			const bank = makeSelectedBank()
 			const selection = [makeUnreconciledTransaction()]
 

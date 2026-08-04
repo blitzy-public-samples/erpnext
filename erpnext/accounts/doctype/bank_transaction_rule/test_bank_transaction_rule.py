@@ -278,12 +278,6 @@ class TestBankTransactionRule(ERPNextTestSuite, AccountsTestMixin):
 	# --- _run_rule_evaluation ---
 
 	def test_run_rule_evaluation_stamps_matched_rule(self):
-		"""A submitted, unreconciled transaction is stamped with the rule that matches it.
-
-		This and the priority test below are the only backend coverage of the rule engine
-		stamping a suggested match onto an unreconciled bank transaction, which is what the
-		reconciliation workbench renders as its suggestion.
-		"""
 		# The token is regenerated on every run and appears in both the rule condition and the
 		# description. The evaluator loads every rule on the site, with no company filter, so
 		# this is what keeps the transaction matchable by this test's rule alone.
@@ -314,16 +308,14 @@ class TestBankTransactionRule(ERPNextTestSuite, AccountsTestMixin):
 		# "Unreconciled", so the document has to be submitted and not merely inserted.
 		transaction.submit()
 
-		# Assert the filters the evaluator selects on, so a green run below cannot be vacuous.
 		self.assertEqual(transaction.docstatus, 1)
 		self.assertEqual(transaction.status, "Unreconciled")
 		self.assertEqual(transaction.company, self.company)
 		self.assertEqual(transaction.is_rule_evaluated, 0)
 
 		# The whitelisted run_rule_evaluation() only checks permission and then enqueues a
-		# background job, so it is asynchronous and would stamp nothing inside a synchronous test.
-		# The private entry point it enqueues is therefore the one a test can assert the stamping
-		# on, and it is also the only place in the application that writes the rule stamp.
+		# background job, so it would stamp nothing inside a synchronous test. The private entry
+		# point it enqueues is the one a test can assert the stamping on.
 		_run_rule_evaluation()
 
 		# The evaluator writes through frappe.db.set_value and never updates the in-memory
@@ -339,15 +331,13 @@ class TestBankTransactionRule(ERPNextTestSuite, AccountsTestMixin):
 		self.assertEqual(evaluated.is_rule_evaluated, 1)
 
 	def test_run_rule_evaluation_lower_priority_number_wins(self):
-		"""Of two matching rules, the one with the lower priority number is the one stamped."""
 		token = f"btr-priority-{frappe.generate_hash(length=8)}"
-		# Both rules match the same transaction and the insertion order is deliberately INVERTED
-		# against priority: the higher priority number is inserted FIRST. The evaluator orders
-		# rules by "priority asc" and breaks on the first match, so only a genuinely
-		# priority-ordered evaluation can stamp the second-inserted rule. Inserting the lower
-		# number first - or leaving priority to before_insert, which back-fills it in insertion
-		# order - would make the assertion below hold under plain creation ordering too, and
-		# prove nothing. Do not "tidy" the inversion away.
+		# The insertion order is deliberately INVERTED against priority: the higher priority number
+		# is inserted FIRST. The evaluator orders rules by "priority asc" and breaks on the first
+		# match, so only a genuinely priority-ordered evaluation can stamp the second-inserted rule.
+		# Inserting the lower number first - or leaving priority to before_insert, which back-fills
+		# it in insertion order - would make the assertion below hold under plain creation ordering
+		# too, and prove nothing.
 		runner_up = self._rule("prio_high", [{"check": "Contains", "value": token}], priority=91)
 		runner_up.insert()
 		winner = self._rule("prio_low", [{"check": "Contains", "value": token}], priority=21)
@@ -366,8 +356,6 @@ class TestBankTransactionRule(ERPNextTestSuite, AccountsTestMixin):
 		).insert()
 		transaction.submit()
 
-		# Guard this fixture's eligibility too: the evaluator only looks at submitted,
-		# "Unreconciled", not-yet-evaluated transactions.
 		self.assertEqual(transaction.docstatus, 1)
 		self.assertEqual(transaction.status, "Unreconciled")
 		self.assertEqual(transaction.is_rule_evaluated, 0)

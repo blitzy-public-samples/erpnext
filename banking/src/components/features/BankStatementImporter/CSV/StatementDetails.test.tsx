@@ -1,43 +1,19 @@
 /*
  * The statement-import review step shared by the CSV and PDF flows.
  *
- * Two render gates decide what exists in the tree: the Import control renders only while
- * `doc.status !== 'Completed'` and is disabled when `final_transactions` is empty; the preview table
- * and `ConflictingTransactions` render only while `doc.status === 'Not Started'`. The base fixture
- * opens both gates and every variant is derived from it.
+ * Two render gates silently decide what exists in the tree: the Import control renders only while
+ * `doc.status !== 'Completed'` and is disabled when `final_transactions` is empty, and the preview
+ * table and `ConflictingTransactions` render only while `doc.status === 'Not Started'`. The base
+ * fixture opens both gates and every variant is derived from it.
  *
- * FM1, FM3, FM4 and FM5 belong to the reconciliation workbench and are covered beside it; they
- * are deliberately not restated here.
- *
- * ─── Why the fixtures are composed rather than built by a factory ───────────────────────
- * `@/test/factories` intentionally exposes no `GetStatementDetailsResponse` builder, so the
- * prop is composed HERE from the factory's import-log builder plus inline
- * `conflicting_transactions` / `final_transactions` / `date_format` / `raw_data` / `currency`,
- * typed against the interface the endpoint actually declares (`../import_utils`). Typing it
- * that way is what makes "never invent a field" mechanically enforced by `tsc -b` rather than
- * merely promised. The optional `pdf_tables` is omitted, because this component never reads it.
- *
- * ─── Two render gates that silently decide what exists ─────────────────────────────────
- *   1. The Import control exists only while `doc.status !== 'Completed'`, and is disabled when
- *      `final_transactions` is empty.
- *   2. `ConflictingTransactions` and the preview table render only while
- *      `doc.status === 'Not Started'`, and the former early-returns on an empty array.
- * The base fixture therefore uses `status: 'Not Started'` with both arrays non-empty, so both
- * gates are open; every variant is derived from it.
- *
- * ─── Instrumentation notes that are easy to get wrong ──────────────────────────
- *   • Toasts emit NO DOM here. `<Toaster />` is mounted once, in `src/App.tsx`, and this suite
- *     renders the component directly — so `sonner` is mocked and the toast CALLS are asserted.
- *   • A rejecting `call` does NOT populate the hook's own `error` member, so the inline
- *     `ErrorBanner` is exercised by overriding that hook's RETURN — a separate seam from the
- *     dialog, which is driven by the rejection the component's own `.catch` receives.
- *   • `useGetBankAccounts` reads `data.message`, so the bank list has to be supplied
- *     explicitly or the account cells render blank.
- *   • The import is ONE server call and the server is the whole of the authority: the component
- *     consults nothing else, re-reads no document to second-guess the answer, and classifies
- *     nothing. A resolved call is a success and continues to the reconciliation view; a rejected
- *     call opens the shared dialog with the server's error passed through unmodified and records
- *     that one import log as failed. Those are the only two outcomes, and each has its own test.
+ * Three instrumentation constraints are easy to get wrong:
+ *   • Toasts emit NO DOM here, because `<Toaster />` is mounted in `src/App.tsx` and this suite
+ *     renders the component directly, so `sonner` is mocked and the toast CALLS are asserted.
+ *   • A rejecting `call` does not populate the hook's own `error` member, so the inline `ErrorBanner`
+ *     is exercised by overriding that hook's RETURN - a separate seam from the dialog, which is driven
+ *     by the rejection the component's own `.catch` receives.
+ *   • `useGetBankAccounts` reads `data.message`, so the bank list has to be supplied explicitly or the
+ *     account cells render blank.
  */
 
 
@@ -77,10 +53,6 @@ import type { BankStatementImportLog } from '@/types/Accounts/BankStatementImpor
 const { toastError, toastSuccess, toastWarning } = vi.hoisted(() => ({
 	toastError: vi.fn<(message: string) => void>(),
 	toastSuccess: vi.fn<(message: string) => void>(),
-	// The UNCONFIRMED-outcome channel. It is a distinct member rather than a reuse of `error`, because
-	// the client observed no refusal and must not announce one; omitting it from this mock made
-	// `toast.warning` throw, which the rejection handler then reported as a server refusal. The options
-	// argument is typed because the unconfirmed-outcome copy carries its explanation in `description`.
 	toastWarning: vi.fn<(message: string, options?: { description?: string }) => void>()
 }))
 
@@ -102,17 +74,8 @@ const IMPORT_PROGRESS_CHANNEL = 'bank-rec-statement-import-progress'
 
 const RUN_DOC_METHOD = 'run_doc_method'
 /**
- * The whitelisted rule evaluator, spelt exactly as the server exposes it — and asserted here as an
- * endpoint this surface MUST NOT CALL.
- *
- * Evaluation of the rows an import created is server-owned: `insert_transactions` queues it through
- * `enqueue_rule_evaluation(bank_account=self.bank_account)` after saving the log and after the rows
- * commit, so the worker is guaranteed to see them and the scope comes from the log rather than from a
- * client. `run_rule_evaluation` itself now requires `Bank Transaction` WRITE permission, which makes it
- * a manager-level action rather than something a review surface should fire implicitly.
- *
- * A client-side call was present at one point and has been removed, so the constant is retained
- * purely as the negative assertion's subject.
+ * The whitelisted rule evaluator, retained as the subject of a negative assertion: import triggers rule
+ * evaluation server-side, so this client surface must not issue a second evaluator call.
  */
 const RUN_RULE_EVALUATION = 'erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule.run_rule_evaluation'
 const INSERT_TRANSACTIONS = 'insert_transactions'
@@ -120,12 +83,6 @@ const INSERT_TRANSACTIONS = 'insert_transactions'
 const STATEMENT_START_DATE = '2024-01-01'
 const STATEMENT_END_DATE = '2024-01-31'
 
-/**
- * The range the SAVED document comes back with, deliberately DIFFERENT from the range on the
- * fixture the component was rendered with. The import resolves the statement's dates
- * server-side, so the continuation must follow the server's copy — using the local one would
- * point the reconciliation page at a range the new transactions may not fall in.
- */
 const SAVED_START_DATE = '2024-01-04'
 const SAVED_END_DATE = '2024-01-29'
 
@@ -136,12 +93,6 @@ const OTHER_BANK_ACCOUNT = 'Second Bank - Test Company'
 
 const RECONCILIATION_SENTINEL = 'Reconciliation workbench'
 
-/**
- * The transactions the SERVER parsed out of the file. Exactly one of `withdrawal`/`deposit` is
- * positive on each row, matching how a statement line is actually shaped, and `reference` is
- * spelt as the endpoint spells it — not `reference_number`, which is the CONFLICTING row's
- * spelling.
- */
 const FINAL_TRANSACTIONS: GetStatementDetailsResponse['final_transactions'] = [
 	{
 		date: '2024-01-05',
@@ -168,11 +119,6 @@ const FINAL_TRANSACTIONS: GetStatementDetailsResponse['final_transactions'] = [
 	}
 ]
 
-/*
- * The second row is denominated in the harness's OTHER registered currency and carries a blank
- * `reference_number`: a conflicting row is formatted in its OWN currency rather than the
- * statement's, and a blank reference renders as a dash.
- */
 const CONFLICTING_TRANSACTIONS: GetStatementDetailsResponse['conflicting_transactions'] = [
 	{
 		name: 'ACC-BTN-2024-00007',
@@ -203,8 +149,6 @@ const RAW_DATA: GetStatementDetailsResponse['raw_data'] = [
 
 const DETECTED_DATE_FORMAT = '%d-%m-%Y'
 
-// `status` is overridden because the factory defaults to `'Completed'`, which closes both render
-// gates.
 const makeImportLog = (overrides: Partial<BankStatementImportLog> = {}): BankStatementImportLog =>
 	makeBankStatementImportLog({
 		status: 'Not Started',
@@ -221,17 +165,11 @@ const makeImportLog = (overrides: Partial<BankStatementImportLog> = {}): BankSta
 	})
 
 /**
- * The response as `get_statement_details` actually returns it: `doc`, `date_format`,
- * `conflicting_transactions`, `final_transactions`, `raw_data` and — for a PDF — `pdf_tables`.
- * The statement currency is a field of the DOCUMENT (`doc.currency`), populated read-only from the
- * bank account's GL account currency; see {@link makeImportLog}.
- *
- * NOTE ON THE RESPONSE-LEVEL `currency` MEMBER. `GetStatementDetailsResponse` declares a top-level
- * `currency: string`, and the component formats every figure from it. `import_utils.ts` is not a path
- * this work may change (Agent Action Plan sections 0.8.1.6 and 0.9.1: it is not among the authorised
- * files) and neither is the formatting on this screen, so the declaration and that read both stand
- * exactly as they are. The fixture therefore supplies the member as declared, and the assertions below
- * pin the rendering this screen actually performs rather than a different one.
+ * The prop this step consumes, composed from the shared import-log builder plus the members the screen
+ * reads. It is typed against `GetStatementDetailsResponse`, so the fixture supplies that interface's
+ * declared members - including the top-level `currency` the screen formats its figures from - and a
+ * member the interface does not declare cannot be invented here without a compile error. The optional
+ * `pdf_tables` is omitted, because this component never reads it.
  */
 const RESPONSE_CURRENCY = TEST_CURRENCY
 
@@ -244,19 +182,11 @@ const makeStatementDetails = (
 	date_format: DETECTED_DATE_FORMAT,
 	raw_data: RAW_DATA,
 	...overrides,
-	// Resolved AFTER the spread, so a `Partial` override cannot widen the declared `string` to
-	// `string | undefined`, while an explicit override still wins over the sentinel.
 	currency: overrides.currency ?? RESPONSE_CURRENCY
 })
 
 const importCall = vi.fn<(params: Record<string, unknown>) => Promise<unknown>>()
 
-/**
- * A second post spy, kept SEPARATE from {@link importCall} and wired to every method OTHER than
- * `run_doc_method`. It exists so "the import was posted exactly once" is a statement about the
- * import itself, and so any other post this surface were ever made to issue would show up as a call
- * on this spy rather than silently inflating the import's own count.
- */
 const otherPostCall = vi.fn<(params: Record<string, unknown>) => Promise<unknown>>()
 
 const queryResponse = (data: unknown) => ({
@@ -290,13 +220,12 @@ const installPostCallHook = ({
 }
 
 /**
- * Answers the bank-account list with one row whose `name` MATCHES the log's `bank_account`,
- * which is what the component looks the account up by. Any other endpoint answers empty.
+ * Answers the bank-account list with one row whose `name` MATCHES the log's `bank_account`, which is
+ * what the component looks the account up by. Any other endpoint answers empty.
  *
- * The default row comes from the ENDPOINT builder, not from the persisted-selection builder: the
- * two projections differ in both directions (`integration_id` is on the selection but not in this
- * endpoint's `SELECT`; `account_subtype` is in the `SELECT` but not on the selection), so the
- * selection fixture would answer with a row the server cannot produce.
+ * The row comes from the ENDPOINT builder, not the persisted-selection builder: the two projections
+ * differ in both directions, so the selection fixture would answer with a row the server cannot
+ * produce.
  */
 const installBankAccountList = (rows: unknown[] = [makeBankAccountListRow()]) => {
 	frappeSDKMock.useFrappeGetCall.mockImplementation((method) =>
@@ -305,11 +234,11 @@ const installBankAccountList = (rows: unknown[] = [makeBankAccountListRow()]) =>
 }
 
 /*
- * `TooltipProvider` is required rather than decorative: Radix's tooltip context has no default, so
- * the details table's info tooltips throw without it. `MemoryRouter` is required because the step
- * renders a `Link` and calls `useNavigate`, and the sentinel route makes navigation observable
- * without mocking the hook. The store is per render because `bankRecDateAtom` is backed by
- * `localStorage` and the harness performs no global atom reset.
+ * `TooltipProvider` is required rather than decorative: Radix's tooltip context has no default, so the
+ * details table's info tooltips throw without it. `MemoryRouter` is required because the step renders a
+ * `Link` and calls `useNavigate`, and the sentinel route makes navigation observable without mocking
+ * the hook. The store is per render because `bankRecDateAtom` is backed by `localStorage` and the
+ * harness performs no global atom reset.
  */
 const renderStatementDetails = (
 	data: GetStatementDetailsResponse,
@@ -357,18 +286,11 @@ const clickImport = async (transactionCount: number = FINAL_TRANSACTIONS.length)
 	await userEvent.click(screen.getByRole('button', { name: `Import ${transactionCount} transactions` }))
 }
 
-/*
- * Answered BY DOCTYPE, because the bounded wait asks `getCount` two different questions: how many
- * `Bank Transaction Rule` documents exist, returning immediately when the answer is zero, and then
- * how many `Bank Transaction` rows in the range still await evaluation. A blanket
- * `mockResolvedValue(0)` takes the no-rules short circuit and never dispatches the trigger.
- */
 const installRuleEvaluationCounts = ({ rules = 1, pending = 0 }: { rules?: number, pending?: number } = {}) => {
 	frappeContextValue.db.getCount.mockImplementation(async (doctype: string) =>
 		doctype === 'Bank Transaction Rule' ? rules : pending)
 }
 
-/** Every distinct endpoint the component has instantiated a post hook for. */
 const postEndpointsUsed = (): string[] => [
 	...new Set(frappeSDKMock.useFrappePostCall.mock.calls.map(([method]) => method))
 ]
@@ -516,32 +438,17 @@ describe('StatementDetails', () => {
 			renderStatementDetails(data)
 			await clickImport()
 
-			// ONE call, on the generic document-method bridge, naming the document and the method.
-			// Confirm/post is a single server-side operation, so the client's whole contribution is
-			// exactly this request.
 			await waitFor(() => {
 				expect(importCall).toHaveBeenCalledTimes(1)
 			})
 			expect(importCall).toHaveBeenCalledWith({ docs: data.doc, method: INSERT_TRANSACTIONS })
 
-			// The import is ONE server-side operation on the document-method bridge, and it is the ONLY
-			// endpoint this surface posts to. `toEqual` on a single-element list is the whole point: it
-			// fails if any further endpoint is ever instantiated here, which is what keeps the
-			// globally-scoped rule evaluator out (see RUN_RULE_EVALUATION and the negative assertion
-			// below). No endpoint is added anywhere.
 			expect(postEndpointsUsed()).toEqual([RUN_DOC_METHOD])
 			expect(postEndpointsUsed()).not.toContain(RUN_RULE_EVALUATION)
 			expect(otherPostCall).not.toHaveBeenCalled()
 		})
 
 		it('never posts to the globally-scoped rule evaluator, on either outcome', async () => {
-			/*
-			 * SEC-07. The endpoint authorises an unscoped background write across every company and every
-			 * bank account on `Bank Transaction` READ permission alone, so an importer that triggers it
-			 * escalates a read into a system-wide write. Both outcomes are checked because a call placed
-			 * on the success path only is still a call, and because the constant alone would be satisfied
-			 * by a suite that never drove an import at all.
-			 */
 			importCall.mockResolvedValue({
 				docs: [makeImportLog({
 					status: 'Completed',
@@ -576,9 +483,6 @@ describe('StatementDetails', () => {
 		})
 
 		it('moves the reconciliation range to the range the SERVER resolved, then navigates', async () => {
-			// The saved document carries the range the server derived while parsing, which is not the
-			// range the reconciliation page happened to be filtered to. Reading it off the response is
-			// what points the reviewer at the rows that were just created.
 			importCall.mockResolvedValue({
 				docs: [makeImportLog({
 					status: 'Completed',
@@ -601,8 +505,6 @@ describe('StatementDetails', () => {
 		})
 
 		it('leaves the reconciliation range untouched when the saved document carries no dates', async () => {
-			// A statement the server could resolve no range for must not overwrite the reviewer's own
-			// filter with two empty values.
 			importCall.mockResolvedValue({
 				docs: [makeImportLog({ status: 'Completed', start_date: undefined, end_date: undefined })]
 			})
@@ -658,21 +560,12 @@ describe('StatementDetails', () => {
 		})
 
 		it('withholds the control for a file the server recognised no transactions in', () => {
-			// Nothing to post, so nothing is offered. This is the ORIGINAL guard on the control and is
-			// unrelated to the failure marker below, which describes a refused ATTEMPT.
 			renderStatementDetails(makeStatementDetails({ final_transactions: [], conflicting_transactions: [] }))
 
 			expect(screen.getByRole('button', { name: 'Import 0 transactions' })).toBeDisabled()
 		})
 	})
 
-	/*
-	 * FM2. A malformed or empty statement file, a disabled or non-company bank account, a missing PDF
-	 * password, an unreadable file type or an insufficiently privileged user all make
-	 * `insert_transactions` throw, and the whole request rolls back. The rejection callback used to
-	 * take NO argument at all, so the server's own account of the refusal was discarded and the
-	 * reviewer saw only a generic toast.
-	 */
 	describe('FM2 — a refused import surfaces the backend error and creates nothing', () => {
 
 		const REFUSAL = 'The bank account is disabled. Please enable it'
@@ -704,12 +597,6 @@ describe('StatementDetails', () => {
 		})
 
 		it('records the RAW error as a per-file marker keyed by this import log', async () => {
-			// The only place a per-file failure can live: `Bank Statement Import Log` offers just
-			// `Not Started` and `Completed`, carries no error field, and a refused import rolls back -
-			// so the row would otherwise look exactly like one merely waiting to be imported.
-			//
-			// The marker holds the FrappeError by identity, exactly as the dialog atom does, so the
-			// rendering layer parses it through the one shared path and the two cannot disagree.
 			const { store, data, error } = await refuseImport()
 
 			await waitFor(() => {
@@ -795,7 +682,6 @@ describe('StatementDetails', () => {
 			await waitFor(() => {
 				expect(store.get(bankRecErrorDialogAtom)).toBeNull()
 			})
-			// The dialog is transient; the row has to keep saying the import failed after it is gone.
 			expect(store.get(bankRecImportFailuresAtom)[data.doc.name]).toBeDefined()
 		})
 
@@ -807,8 +693,7 @@ describe('StatementDetails', () => {
 
 		it("renders the post call's own error inline, through the shared banner", async () => {
 			// The hook's OWN `error` member, which a rejected `call` never populates - so this path is
-			// reachable only from the hook. It renders inline through the same shared banner the dialog
-			// composes, so the two cannot disagree about the same rejection.
+			// reachable only from the hook, and it renders through the same shared banner the dialog composes.
 			installPostCallHook({ hookError: makeServerMessagesError('This bank account is disabled') })
 
 			renderStatementDetails(makeStatementDetails({ conflicting_transactions: [] }))
@@ -831,13 +716,6 @@ describe('StatementDetails', () => {
 			expect(getFrappeEventListener(IMPORT_PROGRESS_CHANNEL)).toBeTypeOf('function')
 		})
 
-		/*
-		 * The channel's payload and the label the page renders from it are both pre-existing and
-		 * unchanged by this work: `insert_transactions` publishes `{ progress: <percent> }` after each
-		 * row plus one final `{ progress: 100, total: <rows> }`, and the page renders the `progress`
-		 * member through its own existing copy. The assertions below pin exactly that, so a change to
-		 * either side is visible.
-		 */
 		it('renders the pushed figure alongside the bar, and follows each subsequent push', () => {
 			renderStatementDetails(makeStatementDetails())
 
@@ -890,7 +768,6 @@ describe('StatementDetails', () => {
 			expect(alert).toHaveTextContent(PLURAL_WARNING)
 			expect(alert).toHaveClass('text-ink-red-3')
 
-			// Advisory only: the import remains available, because the server decides.
 			expect(screen.getByRole('button', { name: 'Import 3 transactions' })).toBeEnabled()
 		})
 
@@ -943,8 +820,6 @@ describe('StatementDetails', () => {
 				''
 			])
 
-			// The second row is formatted in ITS OWN currency, not the statement's, and its
-			// blank reference renders as a dash rather than as an empty cell.
 			const secondRow = within(dialog)
 				.getByText('Card settlement recorded in a second currency')
 				.closest('tr')

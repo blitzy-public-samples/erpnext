@@ -61,7 +61,6 @@ const StatementDetails = ({ data }: Props) => {
 
     const setDates = useSetAtom(bankRecDateAtom)
 
-    // FM2: the shared error-dialog atom and the per-file import-failure map the rejection path writes.
     const setBankRecErrorDialog = useSetAtom(bankRecErrorDialogAtom)
     const setImportFailures = useSetAtom(bankRecImportFailuresAtom)
 
@@ -84,21 +83,8 @@ const StatementDetails = ({ data }: Props) => {
             navigate(`/`)
         }).catch((error: FrappeError) => {
             toast.error(_("There was an error while importing the bank statement."))
-            /*
-             * FM2: the backend's own rejection used to be DISCARDED here - this handler took no
-             * argument at all - so a malformed or empty statement produced only the generic sentence
-             * above. The raw, unreshaped FrappeError now goes to the shared dismissible dialog, which
-             * parses `_server_messages` itself and shows the server's own throw title verbatim
-             * (permission denied, invalid or disabled bank account, invalid file type, password
-             * required, no tables detected, missing dependency, already imported).
-             *
-             * It is ALSO recorded against this import log's name, because `Bank Statement Import Log`
-             * has no error field and only two status values: the import runs synchronously and rolls
-             * back, so a refused import simply stays at "Not Started" and is otherwise
-             * indistinguishable from one merely waiting. That marker is what lets the importer list
-             * render its per-file failure state. No transaction is created client-side - only the
-             * server inserts them, and it created none.
-             */
+            /* Preserve the raw import error for the shared dialog and record it for this log in memory;
+             * the persisted import-log schema has no error field. */
             setBankRecErrorDialog(error)
             setImportFailures((failures) => ({ ...failures, [data.doc.name]: error }))
         })
@@ -286,10 +272,8 @@ const StatementDetails = ({ data }: Props) => {
                 </div>
             </> : null}
 
-            {/* FM2: the shared dismissible dialog for a refused import. It renders null unless
-                bankRecErrorDialogAtom is set, and the same atom drives the mounts on the importer list
-                and the reconciliation workbench - one atom across two route trees, so those surfaces can
-                never show conflicting error state. */}
+            {/* Mounted here as well as on the reconciliation workbench because those surfaces sit in a
+                different route tree; both mounts read the one atom. */}
             <BankRecErrorDialog />
         </div>
 

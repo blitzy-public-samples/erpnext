@@ -1,80 +1,23 @@
 /*
- * `lib/frappe.ts` is the only path a backend refusal takes to the user, so the server's wording has
- * to survive the parse unaltered. Five branches behave in ways the source does not telegraph, and
- * each is pinned below under a QUIRK label.
+ * `lib/frappe.ts` is the only path a backend refusal takes to the user, so the server's wording has to
+ * survive the parse unaltered: getting it wrong silently changes what a reviewer is told about a
+ * rejected posting. This suite therefore specifies what the parser DOES, not what it ideally would.
  *
- * WHY THIS SUITE IS A SPECIFICATION AND NOT A WISH LIST
- * ----------------------------------------------------
- * `frappe.ts` is the single code path through which every backend refusal reaches the user.
- * `ErrorBanner` (`src/components/ui/error-banner.tsx:35`) funnels the raw `FrappeError`
- * straight into `getErrorMessages`, and the reconciliation error dialog renders whatever
- * comes back — so the server's own text, for example "Bank Transaction {0} is already fully
- * reconciled", reaches the accountant VERBATIM with no client-side paraphrasing. Getting the
- * parse wrong does not produce a cosmetic defect; it silently changes what a reviewer is told
- * about a rejected posting.
+ * Five branches behave in ways the source does not telegraph. Three are pinned below under a QUIRK
+ * label - the colon-slice step guards on TRUTHINESS, so a colon at index 0 is skipped; `indexOf(':')`
+ * returning -1 is truthy, so a colon-less exception survives whole; and `_error_message` is APPENDED to
+ * the parsed messages rather than substituted for them.
  *
- * The module is mature, working code. These tests therefore DOCUMENT what it actually does,
- * including three behaviours that are surprising on first reading. Each is labelled QUIRK and
- * pinned with an explicit assertion, so a later change that "tidies" one of them fails loudly
- * here instead of quietly altering the user-facing message:
+ * The other two are specified as LIMITS in the `parsed UNGUARDED` block below, because they bound what
+ * a caller may assume: the outer `JSON.parse` of `_server_messages` is unguarded, so a body that is
+ * not a JSON array throws out of the parser; and a SINGLY encoded element survives as a bare string
+ * with no `message` property, which also suppresses the `_error_message` -> `exception` -> `message`
+ * fallback, since that chain is gated on the parsed array being empty.
  *
- *   QUIRK 3  The colon-slice step guards with a TRUTHINESS test, so a colon at index 0 is
- *            skipped and resolution falls through to `message` (`frappe.ts:150`).
- *   QUIRK 4  `indexOf(':')` returning -1 is truthy, so a colon-LESS exception is sliced from
- *            index 0 and survives whole (`frappe.ts:150-151`).
- *   QUIRK 5  `_error_message` is APPENDED to the parsed server messages, never substituted
- *            for them (`frappe.ts:137-145`).
- *
- * The numbering starts at 3 deliberately. QUIRKS 1 and 2 are not pinned as quirks but specified as
- * LIMITS, in the `the envelope is parsed UNGUARDED` block below, because they bound what a caller of
- * this parser is entitled to assume:
- *
- *   LIMIT 1  The outer `JSON.parse` of `_server_messages` is UNGUARDED, and `.map` then runs on
- *            whatever it produced - so a truncated body, a rewritten body, or valid JSON that is not
- *            an array THROWS out of this parser.
- *   LIMIT 2  A SINGLY encoded element survives as a bare string with no `message` property, and an
- *            entry carrying no `message` is kept - which also SUPPRESSES the
- *            `_error_message` -> `exception` -> `message` fallback chain, because that chain is gated
- *            on the parsed array being empty.
- *
- * This module is FROZEN by the Agent Action Plan - section 0.6.4 records the error-transport envelope
- * as "Unchanged - reused verbatim by the new dialog", and section 0.9.1 does not list it among the
- * paths this work may touch - so neither limit is repaired here, and no wrapper is introduced to hide
- * one. They are SPECIFIED instead, which is the useful thing a frozen contract's suite can do: the
- * dialog this work adds renders through `ErrorBanner`, so it reads the envelope through exactly this
- * parser, and the block below pins what that parser really does so a future change to it fails here
- * rather than quietly altering what a reviewer is told about a refusal.
- *
- * LIMIT 1 is also worth putting in proportion: it is unreachable through the real transport. A
- * `FrappeError` only carries `_server_messages` once the response body has already parsed as JSON, so
- * a truncated body or an intermediary's HTML error page never produces the field at all - it produces
- * an error resolved through the `_error_message` -> `exception` -> `message` chain instead.
- *
- * Every other behaviour below is asserted as the module BEHAVES, never as it ideally would: this
- * suite is a specification of the shipped parser, so a future change to it fails here rather than
- * silently altering what a reviewer is told about a refusal.
- *
- * Every expected value below was produced by executing the real module under this harness,
- * not reasoned about on paper.
- *
- * CONVENTIONS THIS FILE IS OBLIGED TO FOLLOW
- * ------------------------------------------
- *  - Vitest symbols are imported explicitly. `vitest.config.ts` sets `globals: true`, which
- *    exposes the API at RUNTIME, but `tsconfig.app.json` declares no `types` array, so nothing
- *    is ambiently typed and an implicit `describe` would not compile.
- *  - The parsed-message interface at `frappe.ts:3-7` is private to that module and is
- *    deliberately NOT imported here; assertions are structural instead.
- *    `error-banner.tsx:14-18` declares its own local copy for exactly the same reason.
- *  - No ambient global is declared here. Live `ts-expect-error` directives across `src/` —
- *    `lib/company.ts`, `lib/currency.ts`, `hooks/useDocType.ts` and `main.tsx` among them —
- *    depend on the bare `frappe` and `locals` globals staying untyped; typing either would
- *    orphan those directives and fail the build with `TS2578`. The count is deliberately not
- *    stated, because a stated count goes stale the moment a directive is added or removed.
- *  - Error envelopes come from `src/test/factories.ts`. Only the malformed shapes it has no named
- *    builder for — a SINGLY encoded element, an unparseable envelope, a non-array envelope and an
- *    entry carrying no `message` — are composed here, through the base builder the factory
- *    exposes for precisely that purpose. That builder also owns the single `FrappeError` cast, so
- *    this file needs no cast of its own.
+ * Two conventions this file is obliged to follow: the parsed-message interface is private to
+ * `frappe.ts`, so assertions here are structural rather than typed against it; and no ambient global is
+ * declared, because the live `ts-expect-error` directives across `src/` depend on the bare `frappe` and
+ * `locals` globals staying untyped.
  */
 
 import { afterEach, describe, expect, it } from 'vitest'
@@ -103,23 +46,7 @@ import {
 	makeWarningServerMessagesError
 } from '@/test/factories'
 
-/* ── Local fixtures ─────────────────────────────────────────────────────────────────
- * The factory covers one envelope per resolution path, which is all its named builders
- * need to do. The remaining shapes are composed below from the exposed base builder
- * rather than hand-rolled:
- *   - a MULTI-message envelope, required to prove server ORDER and to prove QUIRK 5's
- *     append-not-substitute behaviour;
- *   - the four MALFORMED envelopes the guard is verified against — singly encoded,
- *     unparseable, non-array, and an entry carrying no `message`. The factory's own
- *     encoder always produces a well-formed double-encoded envelope, so none of these
- *     can come from it.
- * ─────────────────────────────────────────────────────────────────────────────────── */
 
-/**
- * Structural mirror of the shape a parsed server message has. Declared locally, exactly as
- * `error-banner.tsx:14-18` does, because the equivalent interface at `frappe.ts:3-7` is
- * private to that module and importing it is out of bounds.
- */
 interface ServerMessagePayload {
 	message: string
 	title?: string
@@ -179,9 +106,6 @@ describe('getErrorMessages', () => {
 		})
 
 		it('carries the server severity through untouched, including the amber warning', () => {
-			/* The `indicator` is the WHOLE amber-versus-red decision at
-			 * `error-banner.tsx:39`; the client makes no severity judgement of its own, so a
-			 * parser that normalised this value would silently repaint every warning red. */
 			const result = getErrorMessages(
 				makeWarningServerMessagesError('Transaction currency differs from the account')
 			)
@@ -201,9 +125,6 @@ describe('getErrorMessages', () => {
 		})
 
 		it('prefers _server_messages over exception when the error carries both', () => {
-			/* The factory populates `exception` as well, so this pins the PRECEDENCE at
-			 * `frappe.ts:147`: the colon-slice step is guarded by `eMessages.length === 0` and
-			 * is therefore unreachable while any server message parsed. */
 			const result = getErrorMessages(makeServerMessagesError('Duplicate reference number'))
 
 			expect(result).toHaveLength(1)
@@ -214,20 +135,14 @@ describe('getErrorMessages', () => {
 	})
 
 	/*
-	 * ══════════════════════════════════════════════════════════════════════════════════════════════
-	 * THE ENVELOPE IS PARSED UNGUARDED — this shared parser is NOT total
+	 * THE ENVELOPE IS PARSED UNGUARDED - this shared parser is not total. `_server_messages` is
+	 * server-controlled and only conventionally well formed, and the module parses it with a bare
+	 * `JSON.parse` and then `.map`s the result, so a body that is not a JSON array throws out of
+	 * `getErrorMessages` - during RENDER, in the case of `ErrorBanner`.
 	 *
-	 * `_server_messages` is server-controlled and only CONVENTIONALLY well formed: a truncated
-	 * response, a proxy that rewrote the body, or an intermediary's HTML error page can deliver
-	 * something else entirely. This module parses it with a bare `JSON.parse` and then `.map`s the
-	 * result, so all three of those inputs throw out of `getErrorMessages` — during RENDER, in the case
-	 * of `ErrorBanner` (`error-banner.tsx:34`).
-	 *
-	 * The module is frozen (see the file header), so the cases below are specified as LIMITS rather
-	 * than repaired. They exist to pin exactly what a caller is and is not entitled to assume — and
-	 * the inputs that reach them do not arise on the real transport, because `_server_messages` only
-	 * exists on an error whose body already parsed as JSON.
-	 * ══════════════════════════════════════════════════════════════════════════════════════════════ */
+	 * The cases below specify that as a LIMIT rather than repairing it, so a caller knows what it is and
+	 * is not entitled to assume.
+	 */
 	describe('the envelope is parsed UNGUARDED — specified LIMITS of the shared parser', () => {
 		it('LIMIT 1: THROWS on an envelope that is not valid JSON at all', () => {
 			const truncated = makeFrappeError({
@@ -239,8 +154,6 @@ describe('getErrorMessages', () => {
 		})
 
 		it('LIMIT 1: THROWS on a NON-ARRAY envelope, because `.map` is reached on an object', () => {
-			// Valid JSON, wrong shape — a distinct failure from the parse above, and the reason the
-			// wrapper has to guard the `.map` as well as the `JSON.parse`.
 			const nonArray = makeFrappeError({
 				_server_messages: '{"message":"Reconciliation refused"}',
 				exception: '',
@@ -270,10 +183,6 @@ describe('getErrorMessages', () => {
 		})
 
 		it('LIMIT 2: leaves a SINGLY encoded element as a bare string with no `message`', () => {
-			// Frappe's convention is DOUBLE encoding, so the inner parse is what turns each element into
-			// an object. When an element is a bare string that parse throws and the string survives — and
-			// a plain string has no `message`, so the banner renders `undefined`: an empty body, for a
-			// refusal that did carry text.
 			const result = getErrorMessages(
 				makeFrappeError({
 					_server_messages: JSON.stringify(['Bank Transaction is already fully reconciled'])
@@ -285,8 +194,6 @@ describe('getErrorMessages', () => {
 		})
 
 		it('LIMIT 2: KEEPS an entry carrying no `message`, which suppresses the `exception` fallback', () => {
-			// The array is non-empty, and the fallback chain is gated on it being empty — so an entry that
-			// says nothing actively denies the reviewer text that was available on a different field.
 			const result = getErrorMessages(
 				makeFrappeError({
 					_server_messages: JSON.stringify([JSON.stringify({ title: 'Message', indicator: 'red' })]),
@@ -342,13 +249,10 @@ describe('getErrorMessages', () => {
 				indicator: 'yellow'
 			})
 			expect(result[1]).toBe('Singly encoded')
-			// Order is the server's, and the FIRST entry is the one `error-banner.tsx:37` themes on.
 			expect(result[0].indicator).toBe('yellow')
 		})
 
 		it('treats an EMPTY array envelope as no messages, exactly as an absent one', () => {
-			// The one malformed-ish shape this module handles on its own: an empty array leaves the
-			// parsed list empty, so the fallback chain runs as designed.
 			const result = getErrorMessages(
 				makeFrappeError({ _server_messages: '[]', exception: '', message: 'Internal Server Error' })
 			)
@@ -359,8 +263,6 @@ describe('getErrorMessages', () => {
 		})
 
 		it('appends `_error_message` only when the envelope parsed, so an unreadable one costs it', () => {
-			// The append itself is independent of the envelope, but it is placed AFTER the parse — so a
-			// malformed envelope denies the reviewer a message that arrived on a different field.
 			expect(() => getErrorMessages(
 				makeFrappeError({
 					_server_messages: 'not json',
@@ -392,9 +294,6 @@ describe('getErrorMessages', () => {
 		})
 
 		it('QUIRK 5: appends the _error_message entry LAST instead of substituting it', () => {
-			/* `frappe.ts:139` pushes onto the already-parsed array. Asserting the LENGTH and the
-			 * LAST index together is what distinguishes append from substitute — either
-			 * behaviour would satisfy a test that only looked at `result[0]`. */
 			const result = getErrorMessages(
 				makeFrappeError({
 					_server_messages: TWO_MESSAGE_ENVELOPE,
@@ -413,8 +312,6 @@ describe('getErrorMessages', () => {
 
 	describe('path 3 — recovering the text from the exception field', () => {
 		it('slices off the exception type and KEEPS the leading space after the colon', () => {
-			/* The parser preserves the leading space after the colon; assert parser output
-			 * exactly. */
 			const result = getErrorMessages(makeExceptionError(FIRST_SERVER_MESSAGE))
 
 			expect(result).toHaveLength(1)
@@ -426,10 +323,6 @@ describe('getErrorMessages', () => {
 		})
 
 		it('leaves indicator UNSET on the colon-slice path, unlike every other path', () => {
-			/* `frappe.ts:153-156` builds the entry without an `indicator`, whereas paths 2 and 4
-			 * both set `'red'`. That difference is load-bearing at `error-banner.tsx:39`, which
-			 * themes amber only on `'yellow'` and therefore falls to red here — so the absent
-			 * key is the signal that path 3, not path 4, produced this entry. */
 			const result = getErrorMessages(makeExceptionError('Voucher is over-allocated'))
 
 			expect(result[0].indicator).toBeUndefined()
@@ -440,10 +333,6 @@ describe('getErrorMessages', () => {
 		})
 
 		it('QUIRK 3: skips the slice when the colon sits at index 0 and falls through to message', () => {
-			/* `frappe.ts:150` guards with `if (indexOfFirstColon)`, a TRUTHINESS test rather than
-			 * an `!== undefined` test. An exception beginning with ':' yields index `0`, which
-			 * is falsy, so the colon-slice step never runs even though a colon is plainly
-			 * present and resolution drops to path 4. The bare `message` therefore wins. */
 			const result = getErrorMessages(
 				makeLeadingColonExceptionError('Leading colon message')
 			)
@@ -457,9 +346,6 @@ describe('getErrorMessages', () => {
 		})
 
 		it('QUIRK 4: returns a colon-less exception WHOLE, because -1 is truthy', () => {
-			/* `indexOf(':')` returns `-1` for a string with no colon; `-1` is truthy, so the
-			 * guard passes and `slice(-1 + 1)` is `slice(0)` — the entire exception survives
-			 * with nothing removed, and with no leading space to strip either. */
 			const result = getErrorMessages(makeColonlessExceptionError('NoColonHere'))
 
 			expect(result).toStrictEqual([{ message: 'NoColonHere', title: 'Error' }])
@@ -468,10 +354,6 @@ describe('getErrorMessages', () => {
 
 	describe('path 4 — the bare message fallback', () => {
 		it('falls back to message when the exception is empty, and marks it red', () => {
-			/* An empty `exception` takes the long way round: `''.indexOf(':')` is `-1` (truthy,
-			 * so the guard passes), `''.slice(0)` is `''` (falsy, so `frappe.ts:152` skips the
-			 * assignment), and the array is still empty when `frappe.ts:160` is reached. This is
-			 * the shape a transport failure has — no server messages and no traceback. */
 			const result = getErrorMessages(makeMessageOnlyError('Network Error'))
 
 			expect(result).toStrictEqual([
@@ -497,8 +379,6 @@ describe('getErrorMessages', () => {
 
 describe('getErrorMessage', () => {
 	it('joins every parsed message with a newline, in the order the server sent them', () => {
-		/* `frappe.ts:12`. The separator is a literal `\n`, not a space and not a bullet, which
-		 * is what lets a multi-message refusal read as separate lines in a toast. */
 		expect(getErrorMessage(makeFrappeError({ _server_messages: TWO_MESSAGE_ENVELOPE })))
 			.toBe(`${FIRST_SERVER_MESSAGE}\n${SECOND_SERVER_MESSAGE}`)
 	})
@@ -513,10 +393,6 @@ describe('getErrorMessage', () => {
 	})
 
 	it('yields readable text for every shape that carries text in a DIFFERENT field', () => {
-		/* The property that matters at every toast call site: an error object that carries text
-		 * somewhere always yields something to read. Each shape below reaches a different branch —
-		 * appended fallback field, exception-only, message-only — and none of them may resolve to
-		 * nothing. */
 		expect(getErrorMessage(makeErrorMessageError('Not permitted'))).toBe('Not permitted')
 		expect(getErrorMessage(makeExceptionError('Voucher is over-allocated')).trim())
 			.toBe('Voucher is over-allocated')
@@ -538,8 +414,6 @@ describe('slug', () => {
 	})
 
 	it('replaces SPACES ONLY — an underscore in the name survives untouched', () => {
-		/* Pinned so nobody later "improves" this into a general slugifier: the regex is `/ /g`,
-		 * so every other character, punctuation included, is passed through lowercased. */
 		expect(slug('Bank_Transaction Rule')).toBe('bank_transaction-rule')
 	})
 })
@@ -571,8 +445,6 @@ describe('unscrub', () => {
 	})
 
 	it('lowercases the tail of an already upper-cased token', () => {
-		/* `frappe.ts:181-183` upper-cases `charAt(0)` and lower-cases `substring(1)` for each
-		 * `\w*` run, so this is a normalising title-case rather than a first-letter capitalise. */
 		expect(unscrub('BANK_TRANSACTION')).toBe('Bank Transaction')
 	})
 
@@ -582,11 +454,6 @@ describe('unscrub', () => {
 	})
 })
 
-/*
- * Expected values below are the ones `src/test/setup.ts` installs, which is the authority for what a
- * hit returns. The three constants are keys a real site defines but the harness deliberately leaves
- * out, so the fallback branch is reached without mutating any global.
- */
 
 const UNSTUBBED_SYSTEM_DEFAULT = 'fiscal_year'
 const UNSTUBBED_USER_DEFAULT = 'cost_center'
@@ -603,10 +470,6 @@ describe('getSystemDefault', () => {
 	})
 
 	it('resolves link_field_results_limit, the page size LinkFieldCombobox searches with', () => {
-		/* `LinkFieldCombobox.tsx:125` reads `limit || getSystemDefault('link_field_results_limit')
-		 * || 20`. Asserted as a STRING because every `sysdefaults` value arrives as a string,
-		 * numeric-looking ones included — the reason the consumer funnels it through a numeric
-		 * coercion downstream. */
 		expect(getSystemDefault('link_field_results_limit')).toBe('10')
 	})
 
@@ -615,9 +478,6 @@ describe('getSystemDefault', () => {
 	})
 
 	it('returns undefined for an unknown key when no fallback is supplied', () => {
-		/* The `fallback` parameter is optional, so `?? undefined` is the honest result — not an
-		 * empty string. Callers such as `LinkFieldCombobox.tsx:125` rely on that being falsy so
-		 * their own `||` default takes over. */
 		expect(getSystemDefault(UNSTUBBED_SYSTEM_DEFAULT)).toBeUndefined()
 	})
 })

@@ -63,7 +63,7 @@ const BankStatementImporter = () => {
             fieldname: 'file'
         })).then((file) => {
             return createDoc("Bank Statement Import Log",
-                // @ts-expect-error - not filling everything else
+                // @ts-expect-error createDoc's generated type requires fields populated by the server.
                 {
                     name: id,
                     file: file.file_url,
@@ -155,9 +155,8 @@ const BankStatementImporter = () => {
                 {selectedBankAccount && <StatementImportLog />}
             </div>
 
-            {/* FM2/FM1: the shared dismissible error dialog. Mounted here as well as inside the
-                reconciliation workbench because this page sits in a different route tree; both mounts
-                read the one bankRecErrorDialogAtom, so they cannot show conflicting error state. */}
+            {/* Mounted here as well as inside the reconciliation workbench because this page sits in a
+                different route tree; both mounts read the one atom. */}
             <BankRecErrorDialog />
         </div>
     )
@@ -239,14 +238,10 @@ const StatementImportLog = () => {
     const navigate = useNavigate()
 
     /*
-     * FM2: the per-file failure markers the statement-import step records when the backend refuses an
-     * import, keyed by `Bank Statement Import Log` name.
-     *
-     * They cannot come from the row itself: the DocType carries no error field and offers only two
-     * status values, `Not Started` and `Completed`, and because the import runs synchronously and rolls
-     * back on failure a refused import simply stays at `Not Started` - indistinguishable from one merely
-     * waiting to be imported. The marker is therefore the only signal that can drive a per-file failure
-     * indicator, which is what the third badge state below renders.
+     * The per-file failure markers the statement-import step records, keyed by `Bank Statement Import
+     * Log` name. They cannot come from the row itself: the DocType carries no error field and offers
+     * only `Not Started` and `Completed`, and a failed import rolls back, so the row reads exactly as
+     * one nobody has tried yet. The third badge state below renders from these markers.
      */
     const importFailures = useAtomValue(bankRecImportFailuresAtom)
 

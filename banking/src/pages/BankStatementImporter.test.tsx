@@ -1,56 +1,12 @@
 /*
- * Colocated suite for the statement-importer page.
+ * Covers the import-log list, the upload flow, the per-log failure badge, the query scope, and this
+ * page's mount of the shared error dialog.
  *
- * WHAT IT PROVES.
- *   • TC1 — a statement import produces the expected list. This page's slice of that scenario is
- *     the "Previous Imports" table: every cell the row projects, in the order the SERVER returned
- *     the rows, plus the click-through to one log's detail view.
- *   • FM2 — the per-file failure indicator, in BOTH of the forms this page carries:
- *       – the status chip on a SERVER ROW, driven by a log-keyed marker, for an import that was
- *         refused after its log existed; and
- *       – a SYNTHETIC ROW, driven by an account-and-file-keyed map, for a refusal that happened
- *         BEFORE any log existed and therefore has no server row to attach to. Every server-owned
- *         cell on it reads "-", because there is no document to read one from.
- *     Both are read-only renderings of what the client observed; neither creates a transaction and
- *     neither overrides the document. The authoritative server `status` is asserted to WIN over a
- *     stale marker, and a stale marker is asserted to be RETIRED once the server reports the
- *     import as completed — so a failure that was later fixed does not stay red for the session.
- *   • The SCOPE and the CONTRACT of what this page sends, which no rendering assertion can reach:
- *       – the import-log list query asks only about the SELECTED account, with the exact projection
- *         the row needs and the server's own ordering. A list that lost that filter would show one
- *         account's statement history — file names, closing balances, transaction counts — on
- *         another's screen, and every rendering assertion here would still pass;
- *       – the detail-view route is asserted by the `:id` it was reached WITH, not merely by having
- *         been reached, so a hard-coded, stale or `undefined` destination cannot satisfy it;
- *       – the three writes of the upload chain are asserted argument by argument: the statement
- *         passphrase goes to the selected Bank Account and nowhere else, the file is uploaded
- *         PRIVATELY and attached to NO document, and the log is created WITHOUT a name, pointing at
- *         the URL the server returned, for the selected account. The last two are one requirement
- *         seen from both ends: this DocType is hash-autonamed, so the server owns the identity and
- *         the client must neither invent one nor recover by one;
- *       – the chain STOPS at the step that was refused, and runs at most ONCE per click, including
- *         while a passphrase save is still pending — the window in which a second chain used to
- *         create a second import log for the same statement.
- *
- * WHAT IT DELIBERATELY DOES NOT DO.
- *   • It does not assert client-side de-duplication of re-imported rows: FM4 mandates that as a
- *     NON-change, so there is no behaviour to assert. Rows render exactly as the endpoint returns
- *     them, which is why the ordering assertion below reads the server's order back unchanged.
- *   • It does not assert client-side transaction creation. Only the server creates transactions.
- *   • It does not reach into component state. Every assertion is on rendered output, on the
- *     disabled state of a control, or on the ARGUMENTS handed to an SDK seam. The `store.get(...)`
- *     reads are of a SHARED, exported application atom — the same public contract the import step
- *     writes — not of anything private to a component.
- *   • It does not duplicate FM1, FM3 or FM5, which belong to the reconciliation surface and are
- *     covered by that folder's suites, nor the error dialog's own internals, which
- *     `BankRecErrorDialog.test.tsx` covers. What is asserted here is only this page's MOUNT of
- *     that shared dialog: inert while its atom is empty, present once it is not.
- *
- * TWO THINGS THAT SILENTLY EMPTY THE TREE IF GOT WRONG.
- *   1. The list is gated on a selected bank account (`{selectedBankAccount && <StatementImportLog
- *      />}`), so every scenario that expects a table, an empty state or a list error seeds
- *      `selectedBankAccountAtom`. One test deliberately does not, to prove the gate.
- *   2. `StatementImportLog` destructures only `{ data, error }` — there is NO loading state and no
+ * Two things silently empty the tree if got wrong:
+ *   1. The list is gated on a selected bank account, so every scenario expecting a table, an empty
+ *      state or a list error seeds `selectedBankAccountAtom`. One test deliberately does not, to prove
+ *      the gate.
+ *   2. `StatementImportLog` destructures only `{ data, error }` - there is no loading state and no
  *      skeleton, so `data: []` and `data: undefined` reach the SAME empty branch.
  */
 
@@ -77,17 +33,9 @@ import {
 	makeWarningServerMessagesError
 } from '@/test/factories'
 
-/*
- * The warning raised when the private statement cannot be linked to its import log (SEC-09).
- *
- * `vi.hoisted` because the `vi.mock` factory below is hoisted above every ordinary declaration and
- * would otherwise close over an uninitialised binding. All three members `sonner` is asked for across
- * this page's module graph are stubbed - the page itself only raises `warning`, but
- * `BankReconciliation/utils.ts` (reached through `BankPicker`) imports `toast` and calls `error` and
- * `success`, and a missing member would throw from inside a handler rather than fail visibly here.
- * The toaster is mounted in `App.tsx`, which this suite never renders, so the CALL is the only
- * observable.
- */
+// `vi.hoisted` because the `vi.mock` factory below is lifted above every ordinary declaration and
+// would otherwise close over an uninitialised binding. The stub covers every `toast` member this
+// page's module graph can reach, since a missing one would throw from inside a handler.
 const { toastError, toastSuccess, toastWarning } = vi.hoisted(() => ({
 	toastError: vi.fn<(message: string, options?: unknown) => void>(),
 	toastSuccess: vi.fn<(message: string, options?: unknown) => void>(),
@@ -98,7 +46,7 @@ vi.mock('sonner', () => ({ toast: { error: toastError, success: toastSuccess, wa
 
 // The page imports five SDK hooks at module scope and its subtree reaches `useSWRConfig` through
 // `BankPicker -> utils.ts`, so the package is replaced wholesale to keep every one of those seams
-// resolvable and unable to reach a real transport.
+// resolvable.
 vi.mock('frappe-react-sdk', () => createFrappeSDKMock())
 
 import BankStatementImporter from './BankStatementImporter'
@@ -124,15 +72,10 @@ const IMPORT_LOG_DOCTYPE = 'Bank Statement Import Log'
 const IMPORTER_ROUTE = '/statement-importer'
 
 /**
- * Stands in for `ViewBankStatementImportLog` at the `:id` child route. Proving navigation with a
- * sentinel ROUTE rather than a mocked `useNavigate` keeps the assertion about observable
- * behaviour — the detail view is reached — instead of about which function was called.
- *
- * It renders the `:id` it was reached WITH, because "a detail view opened" is a materially weaker
- * claim than "the detail view of THIS log opened". A constant sentinel is satisfied by navigating
- * to a hard-coded name, to the wrong row's name, or to `/statement-importer/undefined` — and the
- * last of those is a real possibility here, since the destination is read off a document the
- * server returns. Every navigation assertion below therefore reads the parameter back.
+ * Stands in for the detail view at the `:id` child route. A sentinel ROUTE rather than a mocked
+ * `useNavigate` keeps the assertion about observable behaviour, and it renders the `:id` it was reached
+ * WITH, because "a detail view opened" is materially weaker than "the detail view of THIS log opened" -
+ * a constant sentinel would also be satisfied by `/statement-importer/undefined`.
  */
 const DETAIL_SENTINEL = 'import-log-detail-reached'
 
@@ -142,7 +85,6 @@ const ImportLogDetailProbe = () => {
 	return <div>{DETAIL_SENTINEL}:{id}</div>
 }
 
-/** The exact text the probe renders for one log — nothing else can satisfy it. */
 const detailViewFor = (logName: string): string => `${DETAIL_SENTINEL}:${logName}`
 const SELECTED_BANK = makeSelectedBank()
 
@@ -196,10 +138,6 @@ const INDETERMINATE_LOG = makeBankStatementImportLog({
 	closing_balance: 0
 })
 
-/**
- * The endpoint orders by `creation desc`, so the fixture list is newest-first. Supplying it in the
- * server's own order is what lets the ordering assertion read it back unchanged.
- */
 const ALL_LOGS: BankStatementImportLog[] = [
 	INDETERMINATE_LOG,
 	FAILED_LOG,
@@ -210,36 +148,23 @@ const ALL_LOGS: BankStatementImportLog[] = [
 const FAILED_LOG_MESSAGE = 'No tables found in the PDF file'
 const SECOND_FAILED_LOG_MESSAGE = 'The bank account is disabled. Please enable it'
 
-/**
- * Markers for two of those four logs, keyed by import-log name exactly as the atom is. Built by
- * merging the shared factory's output rather than by hand, so a fixture cannot key the map
- * differently from the page that reads it.
- */
 const ATTEMPT_MARKERS: Record<string, FrappeError> = {
 	...makeImportFailures(FAILED_LOG, FAILED_LOG_MESSAGE),
 	...makeImportFailures(INDETERMINATE_LOG, SECOND_FAILED_LOG_MESSAGE)
 }
 
 interface ImporterScenario {
-	/** What the list query answers with. `undefined` is the pre-arrival state, not a loading state. */
 	logs?: BankStatementImportLog[]
 	listError?: FrappeErrorFixture
-	/** Per-file failure markers, keyed by import-log name, exactly as the atom is. */
 	markers?: Record<string, FrappeError>
-	/**
-	 * Refusals observed BEFORE any import log existed, keyed by account-and-file identity exactly as
-	 * the atom is. These are what produce the synthetic rows (F-03).
-	 */
 	dialogError?: FrappeErrorFixture
 	uploadError?: FrappeErrorFixture
 	/**
 	 * Answer the list query with ONLY the fields it asked for, as the server does. Used where the
-	 * assertion is about whether a field is actually PROJECTED, rather than about what is rendered
-	 * once it is.
+	 * assertion is about whether a field is actually PROJECTED rather than about what is rendered.
 	 */
 	projectQueriedFieldsOnly?: boolean
 	withSelectedBank?: boolean
-	/** The account to select. Overridden only to prove the query scope is DERIVED from it. */
 	selectedBank?: ReturnType<typeof makeSelectedBank>
 }
 
@@ -251,11 +176,6 @@ const listQueryResponse = (logs?: BankStatementImportLog[], listError?: FrappeEr
 	mutate: frappeHookMutate
 })
 
-/**
- * Installs the list answer for THIS doctype only, leaving any other list query on the shared
- * mock's own empty default. Installed per test rather than once, because the harness's shared
- * teardown discards per-test implementations.
- */
 const installImportLogQuery = (logs?: BankStatementImportLog[], listError?: FrappeErrorFixture) => {
 	frappeSDKMock.useFrappeGetDocList.mockImplementation((doctype) =>
 		doctype === IMPORT_LOG_DOCTYPE ? listQueryResponse(logs, listError) : listQueryResponse()
@@ -264,10 +184,9 @@ const installImportLogQuery = (logs?: BankStatementImportLog[], listError?: Frap
 
 /**
  * Installs the list answer PROJECTED DOWN to exactly the fields the page asked for, which is what the
- * server does: a `get_doc_list` response carries the projection and nothing else. A fixture that
- * hands back a complete document lets a component read a field it never requested and pass anyway -
- * so a row rendering `currency` would go green whether or not the query fetched it. Deriving the
- * projection from the query's own `fields` argument makes the two inseparable.
+ * server does. A fixture handing back a complete document would let a component read a field it never
+ * requested and pass anyway; deriving the projection from the query's own `fields` argument makes the
+ * two inseparable.
  */
 const installProjectedImportLogQuery = (logs: BankStatementImportLog[]) => {
 	frappeSDKMock.useFrappeGetDocList.mockImplementation((doctype, args) => {
@@ -304,10 +223,9 @@ const installFileUploadError = (uploadError: FrappeErrorFixture) => {
 }
 
 /**
- * Seeds the error state the CREATE hook exposes after a refusal, which is the state the page reads to
- * render its inline banner. Seeded rather than provoked by rejecting the spy, because `onUpload`
- * carries no rejection handler — original, unchanged behaviour — so rejecting it would leave an
- * unhandled rejection behind and prove nothing the hook's own state does not.
+ * Seeds the error state the CREATE hook exposes after a refusal, which is what the page reads to render
+ * its inline banner. Seeded rather than provoked by rejecting the spy, because `onUpload` carries no
+ * rejection handler, so rejecting it would leave an unhandled rejection behind.
  */
 const installCreateDocError = (createError: FrappeErrorFixture) => {
 	frappeSDKMock.useFrappeCreateDoc.mockImplementation(() => ({
@@ -319,7 +237,6 @@ const installCreateDocError = (createError: FrappeErrorFixture) => {
 	}))
 }
 
-/** The same, for the passphrase step's hook. */
 const installUpdateDocError = (updateError: FrappeErrorFixture) => {
 	frappeSDKMock.useFrappeUpdateDoc.mockImplementation(() => ({
 		updateDoc: frappeUpdateDoc,
@@ -400,21 +317,13 @@ const rowFor = (log: BankStatementImportLog): HTMLElement => {
 }
 
 /**
- * The status chip inside a row. The chip's theme is asserted through `data-theme`, never through a
- * class string: `tailwind-merge` is free to reorder and collapse classes, so a class assertion
- * would be brittle in a way that says nothing about the component's intent.
+ * The status chip inside a row. Its theme is asserted through `data-theme`, never through a class
+ * string: `tailwind-merge` is free to reorder and collapse classes.
  */
 const statusBadgeIn = (row: HTMLElement): HTMLElement => {
 	/*
-	 * Located by Badge's own variant attributes rather than by `data-slot="badge"`, because that one
-	 * attribute is NOT stable across the three states. The `Failed` chip is wrapped in a
-	 * `TooltipTrigger asChild` so it can carry the server's own reason; Radix merges the trigger's props
-	 * into the element it clones - `data-slot="tooltip-trigger"` among them - and Badge spreads
-	 * `...props` AFTER its own `data-slot`, so for that state alone the slot reads `tooltip-trigger`
-	 * and a slot-only lookup finds nothing at all. `data-variant`, `data-size` and `data-theme` are
-	 * set by Badge and by nothing Radix passes down, and this row renders no other variant-bearing
-	 * primitive (its remaining cells are plain text and one anchor), so the three of them together
-	 * identify the chip in every state.
+	 * Located by Badge's own variant attributes: `data-variant`, `data-size` and `data-theme` are set by
+	 * Badge and by nothing else in this row, whose remaining cells are plain text and one anchor.
 	 */
 	const badge = row.querySelector<HTMLElement>('[data-variant][data-size][data-theme]')
 
@@ -440,11 +349,6 @@ const chooseStatementFile = async (container: HTMLElement, file: File): Promise<
 	await userEvent.upload(input, file)
 }
 
-/*
- * `rows` is parameterised so two statements can differ in CONTENT and SIZE as well as in name. A
- * retry that re-uploaded the previous month's statement under the new one's name would otherwise be
- * indistinguishable from one that uploaded the file the reviewer actually chose.
- */
 const csvStatementFile = (
 	name = 'hdfc-statement-jan-2024.csv',
 	rows = '2024-01-15,NEFT credit,12500'
@@ -476,8 +380,6 @@ describe('BankStatementImporter', () => {
 
 			expect(table.getAllByRole('row')).toHaveLength(ALL_LOGS.length + 1)
 
-			// The endpoint orders by `creation desc` and the list is rendered as produced — no
-			// client-side re-ordering, no client-side de-duplication (FM4 mandates that absence).
 			const renderedFileNames = table.getAllByRole('link').map((link) => link.textContent)
 
 			expect(renderedFileNames).toEqual(ALL_LOGS.map(displayedFileName))
@@ -529,11 +431,6 @@ describe('BankStatementImporter', () => {
 
 			await userEvent.click(rowFor(FAILED_LOG))
 
-			// Reaching the `:id` child route is the observable outcome of
-			// `navigate(`/statement-importer/${item.name}`)` — and the parameter it was reached with
-			// is what makes this THAT log's detail view rather than merely a detail view. Every row
-			// on screen has a distinct name, so a handler that closed over the wrong one, or over a
-			// constant, cannot satisfy this.
 			expect(await screen.findByText(detailViewFor(FAILED_LOG.name))).toBeInTheDocument()
 			expect(screen.queryByText('Previous Imports')).not.toBeInTheDocument()
 		})
@@ -547,8 +444,6 @@ describe('BankStatementImporter', () => {
 				await userEvent.click(rowFor(log))
 
 				expect(await screen.findByText(detailViewFor(log.name))).toBeInTheDocument()
-				// Not a stale or hard-coded destination, and not the `undefined` a missing name
-				// would produce.
 				ALL_LOGS.filter((other) => other.name !== log.name).forEach((other) => {
 					expect(screen.queryByText(detailViewFor(other.name))).not.toBeInTheDocument()
 				})
@@ -562,20 +457,14 @@ describe('BankStatementImporter', () => {
 	/* ── The list query itself: scope, projection and ordering ───────────────────────── */
 
 	/**
-	 * WHAT THE QUERY ASKS FOR IS PART OF THE BEHAVIOUR.
-	 *
-	 * The rows above are asserted from a mocked answer, so nothing in them can tell whether the
-	 * question was scoped. `Bank Statement Import Log` is readable by System Manager, and a statement
-	 * import log names the file, the closing balance and the transaction count of a bank account — so
-	 * a list that lost its `bank_account` filter would show one company's statement history on
-	 * another account's screen, and every rendering assertion in this suite would still pass.
-	 *
-	 * These assertions are on the ARGUMENTS the page hands the SDK, for the same reason the
-	 * reconciliation suite pins its endpoint parameters: it is the only place the scope exists.
+	 * What the query asks for is part of the behaviour. The rows above are asserted from a mocked answer,
+	 * so nothing in them can tell whether the question was scoped - and a list that lost its
+	 * `bank_account` filter would show one account's statement history on another account's screen while
+	 * every rendering assertion here still passed. These assertions are on the ARGUMENTS the page hands
+	 * the SDK, the only place that scope exists.
 	 */
 	describe('import-log query scope', () => {
 
-		/** The call the page makes for THIS doctype, with the arguments it made it with. */
 		const importLogQueryCall = () => {
 			const call = frappeSDKMock.useFrappeGetDocList.mock.calls
 				.find(([doctype]) => doctype === IMPORT_LOG_DOCTYPE)
@@ -592,7 +481,6 @@ describe('BankStatementImporter', () => {
 
 			const [, args] = importLogQueryCall()
 
-			// The filter is the whole of the data-isolation boundary on this screen.
 			expect(args?.filters).toEqual([['bank_account', '=', SELECTED_BANK.name]])
 			// Exactly the eight fields the row renders — no `password`-bearing or unrelated field is
 			// fetched "just in case".
@@ -606,15 +494,11 @@ describe('BankStatementImporter', () => {
 				'closing_balance',
 				'creation'
 			])
-			// The server orders the rows; the client renders them as produced (FM4).
 			expect(args?.orderBy).toEqual({ field: 'creation', order: 'desc' })
 			expect(args?.limit).toBe(10)
 		})
 
 		it('scopes the query to whichever account is selected, not to a fixed one', () => {
-			// Derivation, proven by changing the input: the same page against a second account must
-			// ask about that account. A hard-coded or stale filter passes the test above and fails
-			// this one.
 			const secondBank = makeSelectedBank({
 				name: 'Second Bank - Test Company',
 				account_name: 'Second Bank Savings'
@@ -629,9 +513,6 @@ describe('BankStatementImporter', () => {
 		})
 
 		it('asks nothing at all until an account has been selected', () => {
-			// The list lives behind `{selectedBankAccount && <StatementImportLog />}`, so with no
-			// account there is no account whose logs could be listed and the query is never issued —
-			// which is the stronger form of the `null`-key guard the component also passes for it.
 			renderImporter({ logs: ALL_LOGS, withSelectedBank: false })
 
 			expect(
@@ -641,8 +522,6 @@ describe('BankStatementImporter', () => {
 		})
 
 		it('does not revalidate the list on window focus', () => {
-			// Pinned because the per-file failure indicator is read from session state rather than from
-			// the document: when this list re-fetches is therefore when a marked row can change back.
 			renderImporter({ logs: ALL_LOGS })
 
 			const [, , , options] = importLogQueryCall()
@@ -654,13 +533,10 @@ describe('BankStatementImporter', () => {
 	describe('per-row status chip (FM2)', () => {
 
 		/*
-		 * The chip has exactly THREE states, and only two of them come from the document.
-		 *
-		 * `Bank Statement Import Log.status` offers exactly `Not Started` and `Completed`, and the
-		 * DocType carries no error field at all - so a refused import, which rolls back, leaves the row
-		 * saying `Not Started`: indistinguishable from a statement merely waiting to be imported. The
-		 * third state is therefore driven from the failure the import step OBSERVED, keyed by import-log
-		 * name in a shared session-scoped atom. That is the only failure signal that exists here.
+		 * The chip has three states and only two of them come from the document: `status` offers exactly
+		 * `Not Started` and `Completed` and the DocType carries no error field, so a failed import - which
+		 * rolls back - leaves the row indistinguishable from one merely waiting. The third state is driven
+		 * from the failure the import step observed, keyed by import-log name in a shared session atom.
 		 */
 
 		it("renders the server's own status when the import completed", () => {
@@ -689,15 +565,9 @@ describe('BankStatementImporter', () => {
 
 			expect(badge).toHaveAttribute('data-theme', 'red')
 			expect(badge).toHaveTextContent('Failed')
-			// The stored status is `Not Started`, and the marker deliberately takes precedence over it.
 			expect(badge).not.toHaveTextContent('Not Started')
 		})
 
-		/*
-		 * Every marked row is marked from its OWN entry, so two files refused for different reasons do
-		 * not collapse into one indicator. A single shared flag would have passed the test above and
-		 * failed this one.
-		 */
 		it('marks each refused log from its own entry', () => {
 			renderImporter({ logs: ALL_LOGS, markers: ATTEMPT_MARKERS })
 
@@ -722,12 +592,6 @@ describe('BankStatementImporter', () => {
 		})
 
 
-		/*
-		 * The map is keyed by import-log NAME - the primary key of a hash-autonamed DocType - so a
-		 * marker recorded for one log cannot reach another. This is asserted with a name that is not
-		 * in the list at all, which is the shape a marker from a previously selected bank account
-		 * takes: the list only ever renders the logs of the account it queried.
-		 */
 		it('ignores a marker recorded against a log this list did not return', () => {
 			renderImporter({
 				logs: [NOT_STARTED_LOG],
@@ -745,11 +609,6 @@ describe('BankStatementImporter', () => {
 		})
 
 
-		/*
-		 * The map is plain in-memory state, deliberately NOT persisted: an observation of one attempt
-		 * must not outlive the session that made it. Reading it back after a render proves the page
-		 * only READS it - the frozen badge edit retires nothing and writes nothing.
-		 */
 		it('only reads the failure map, never rewrites it', async () => {
 			const markers = makeImportFailures(FAILED_LOG, FAILED_LOG_MESSAGE)
 			const { store } = renderImporter({ logs: ALL_LOGS, markers })
@@ -772,11 +631,6 @@ describe('BankStatementImporter', () => {
 			expect(screen.queryByRole('table')).not.toBeInTheDocument()
 		})
 
-		/**
-		 * There is deliberately NO loading state: the component destructures only `{ data, error }`,
-		 * so an un-arrived list reaches the same branch as an empty one. Asserting a skeleton here
-		 * would assert a component that does not exist.
-		 */
 		it('reaches the same branch before the list has arrived', () => {
 			renderImporter({ logs: undefined })
 
@@ -787,11 +641,6 @@ describe('BankStatementImporter', () => {
 
 	describe('list query rejection', () => {
 
-		/**
-		 * PATH 1 — `_server_messages`, the double-encoded envelope a `frappe.throw` produces. The
-		 * banner collapses Frappe's placeholder title into its friendly heading, and the server's
-		 * own sentence reaches the user verbatim.
-		 */
 		it("renders the server's message from a _server_messages envelope", () => {
 			const message = 'You are not permitted to read Bank Statement Import Log.'
 
@@ -802,7 +651,6 @@ describe('BankStatementImporter', () => {
 			expect(screen.getByText('There was an error.')).toBeInTheDocument()
 		})
 
-		/** PATH 2 — text arriving in `_error_message` instead, which the parser appends. */
 		it("renders the server's message from an _error_message envelope", () => {
 			const message = 'The linked bank account has been disabled.'
 
@@ -878,16 +726,6 @@ describe('BankStatementImporter', () => {
 		})
 	})
 
-	/*
-	 * THE PAGE'S OWN UPLOAD HANDLER.
-	 *
-	 * `onUpload` chains three writes and then navigates. It carries NO rejection handler of its own -
-	 * that is original, unchanged behaviour (AAP §0.6.1.5 freezes this file's edit to the per-file
-	 * badge state and the shared dialog mount), and it is how the page has always reported a refusal:
-	 * each of the three SDK hooks exposes its own `error`, and the page renders each one as an inline
-	 * `ErrorBanner` above the form. Those three branches are asserted below by seeding the hook state
-	 * the page reads, which is exactly what the SDK does after a refusal.
-	 */
 	describe('statement upload', () => {
 
 		it('enables upload once a statement has been chosen', async () => {
@@ -912,25 +750,10 @@ describe('BankStatementImporter', () => {
 			await chooseStatementFile(container, csvStatementFile())
 			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
 
-			// The destination is the name the SERVER gave the document it created — read back off the
-			// route, so navigating to a client-minted id, to the previous row's id, or to
-			// `/statement-importer/undefined` cannot satisfy it.
 			expect(await screen.findByText(detailViewFor('BSIL-2024-00009'))).toBeInTheDocument()
 			expect(screen.queryByText(detailViewFor('undefined'))).not.toBeInTheDocument()
 		})
 
-		/**
-		 * The INLINE banner, which is a different thing from the per-file record below.
-		 *
-		 * This case seeds the upload hook's own `error` state without any attempt having been observed —
-		 * the state a reviewer returns to a page in, or lands in after a re-render. Nothing was watched
-		 * being refused, so nothing may be recorded per file: no synthetic row, no transaction, no
-		 * hand-off to a log that does not exist. The banner reports what the hook holds and that is all.
-		 *
-		 * The per-file record is written only from an OBSERVED rejection, which the F-03 block below
-		 * drives for real. Keeping the two apart is deliberate: it is what stops a rendered error state
-		 * from manufacturing failure history.
-		 */
 		it("repeats the server's refusal of the upload, in its own words", () => {
 			const message = 'The uploaded statement contains no transactions.'
 
@@ -939,18 +762,12 @@ describe('BankStatementImporter', () => {
 			expect(screen.getByRole('alert')).toBeInTheDocument()
 			expect(screen.getByText(message)).toBeInTheDocument()
 
-			// Nothing was invented on the strength of a refusal.
 			expect(screen.getByText('No bank statements imported yet')).toBeInTheDocument()
 			expect(screen.queryByRole('table')).not.toBeInTheDocument()
 			expect(frappeCreateDoc).not.toHaveBeenCalled()
 			expect(screen.queryByText(new RegExp(DETAIL_SENTINEL))).not.toBeInTheDocument()
 		})
 
-		/**
-		 * A refusal of the LAST step is the one with something already on the server: the file is
-		 * stored and only the log is missing. It is reported from the create hook's own error, and the
-		 * reviewer is still not handed to a document that was never created.
-		 */
 		it("repeats the server's refusal to create the log", () => {
 			const message = 'Not permitted to create Bank Statement Import Log.'
 
@@ -962,10 +779,6 @@ describe('BankStatementImporter', () => {
 			expect(screen.queryByText(new RegExp(DETAIL_SENTINEL))).not.toBeInTheDocument()
 		})
 
-		/**
-		 * The passphrase step has no surface of its own, so without this branch a refusal there would
-		 * be silent: the reviewer would press Upload, watch nothing happen and be told nothing.
-		 */
 		it("repeats the server's refusal to store the statement passphrase", () => {
 			const message = 'Not permitted to update Bank Account.'
 
@@ -976,10 +789,6 @@ describe('BankStatementImporter', () => {
 			expect(screen.getByText(message)).toBeInTheDocument()
 		})
 
-		/*
-		 * Severity is the SERVER'S decision on this surface too — the inline banner themes on the
-		 * indicator the server sent, and the page makes no judgement of its own.
-		 */
 		it("takes the upload banner's severity from the server's own indicator", () => {
 			renderImporter({
 				logs: [],
@@ -1026,10 +835,6 @@ describe('BankStatementImporter', () => {
 			expect(within(instructions).getByText('Maps To')).toBeInTheDocument()
 		})
 
-		/**
-		 * The render gate. Without a selected account there is no account whose logs could be
-		 * listed, so neither the list nor the dropzone is offered — and upload stays unavailable.
-		 */
 		it('withholds the list and the dropzone until an account is selected', () => {
 			renderImporter({ logs: ALL_LOGS, withSelectedBank: false })
 
@@ -1041,40 +846,20 @@ describe('BankStatementImporter', () => {
 	})
 
 	/*
-	 * ════════════════════════════════════════════════════════════════════════════════════════════════
-	 * NEGATIVE AUTHORISATION
+	 * This page carries NO client-side role gate, and that is correct rather than a gap: authorisation
+	 * belongs to the server, and a UI that hid a control would be a convenience rather than a control.
 	 *
-	 * ⚠️ READ THIS BEFORE ADDING TO THIS BLOCK. This page carries NO client-side role gate, and that
-	 * is correct rather than a gap: authorisation belongs to the server, and a UI that hid a control
-	 * would be a convenience, not a control. `Bank Statement Import Log` grants permissions to System
-	 * Manager ONLY, and it is the SERVER that enforces that on every read, insert and document-method
-	 * call this page makes.
+	 * So a frontend suite can prove exactly two things here. First, that a narrowed profile really is
+	 * denied by `src/lib/permissions.ts` rather than uniformly granted - without which every other
+	 * suite's privileged profile would be an unexamined assumption. The narrowing is written directly
+	 * onto `window.frappe.boot.user`, the only thing those helpers read, and this block restores it after
+	 * every test. Second, that this page is FAIL-CLOSED when the server refuses under such a profile.
 	 *
-	 * So what a frontend suite can prove here is precisely two things, and it must not be read as
-	 * proving more:
-	 *
-	 *   1. That a narrowed profile really is denied by `src/lib/permissions.ts` rather than uniformly
-	 *      granted. Without this, every other suite's privileged profile would be an unexamined
-	 *      assumption. The narrowing is written directly onto `window.frappe.boot.user` here, which
-	 *      is the only thing those helpers read, and this block restores it after every test.
-	 *   2. That this page is FAIL-CLOSED when the server refuses under such a profile: the refusal is
-	 *      surfaced in the server's own words, the per-file record is written, and nothing is created,
-	 *      navigated to, or presented as having succeeded.
-	 *
-	 * What it CANNOT prove is that the server refuses. That is the endpoint's own obligation and is
-	 * exercised by the Python suites; the SDK is mocked here, so a refusal is something these tests
-	 * INSTALL rather than something they discover.
-	 * ════════════════════════════════════════════════════════════════════════════════════════════════ */
+	 * What it cannot prove is that the server refuses: the SDK is mocked here, so a refusal is something
+	 * these tests INSTALL rather than discover.
+	 */
 	describe('negative authorisation', () => {
 
-		/**
-		 * Narrows the authorisation profile the SPA reads.
-		 *
-		 * `src/lib/permissions.ts` asks nothing more than whether a DocType appears in one of the eight
-		 * `can_*` arrays on `boot.user`, so overwriting the arrays IS the narrowing - no permission
-		 * derivation has to be reproduced anywhere. Whatever is not named is left as the harness
-		 * installed it.
-		 */
 		const narrowProfileTo = (rights: Partial<Record<'can_read' | 'can_write' | 'can_create' | 'can_delete' | 'can_cancel', string[]>>) => {
 			Object.assign(window.frappe.boot.user, rights)
 		}
@@ -1100,7 +885,6 @@ describe('BankStatementImporter', () => {
 			Object.assign(window.frappe.boot.user, installedRights)
 		})
 
-		/** Everything an accounting-only profile holds here, with the System-Manager-only rows withheld. */
 		const ACCOUNTS_ONLY = {
 			can_read: ['Bank Transaction', 'Bank Account', 'Payment Entry', 'Journal Entry'],
 			can_write: ['Bank Transaction', 'Bank Account', 'Payment Entry', 'Journal Entry'],
@@ -1109,9 +893,6 @@ describe('BankStatementImporter', () => {
 		}
 
 		it('denies the import log to an accounting-only profile that still holds its own rights', () => {
-			// The premise every other suite rests on. `Bank Statement Import Log` has permission rows for
-			// System Manager only, so an accounting-only profile must come back denied on all four rights
-			// while still holding the transaction rights its own role really does grant.
 			narrowProfileTo(ACCOUNTS_ONLY)
 
 			expect(canReadDocument(IMPORT_LOG_DOCTYPE)).toBe(false)
@@ -1140,8 +921,6 @@ describe('BankStatementImporter', () => {
 		})
 
 		it('is FAIL-CLOSED when the server refuses the log LIST under a narrowed profile', async () => {
-			// The read is refused before any row exists, so the page must show the server's refusal and no
-			// table at all - never an empty list, which would read as "this account has no imports".
 			narrowProfileTo(ACCOUNTS_ONLY)
 
 			renderImporter({ logs: [], listError: makeServerMessagesError('Insufficient Permission for Bank Statement Import Log') })

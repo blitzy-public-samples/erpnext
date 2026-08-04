@@ -67,10 +67,8 @@ const MatchAndReconcile = ({ contentHeight }: { contentHeight: number }) => {
         <TransferModal />
         <BankEntryModal />
         <RecordPaymentModal />
-        {/* FM1/FM3: the shared dismissible dialog for a refused confirm/post. It renders null unless
-            bankRecErrorDialogAtom is set, and the same atom is mounted on the statement-importer
-            surfaces, which live in a different route tree - one atom, so no two surfaces can ever show
-            conflicting error state. */}
+        {/* The same atom drives the mounts on the statement-importer surfaces, which sit in a different
+            route tree, so no two surfaces can report different errors at once. */}
         <BankRecErrorDialog />
     </>
 }
@@ -209,7 +207,6 @@ const UnreconciledTransactions = ({ contentHeight }: { contentHeight: number }) 
                 </InputGroupAddon>
                 <Input
                     placeholder={_("Search")}
-                    // type='search'
                     variant='outline'
                     onChange={onSearchChange}
                     defaultValue={search}
@@ -231,10 +228,8 @@ const UnreconciledTransactions = ({ contentHeight }: { contentHeight: number }) 
                     decimalScale={2}
                     prefix={currencySymbol}
                     onValueChange={(v, _n, values) => {
-                        // If the input ends with a decimal or a decimal with trailing zeroes, store the string since we need the user to be able to type the decimals.
-                        // When the user eventually types the decimals or blurs out, the value is formatted anyway.
-                        // Otherwise store the float value
-                        // Check if the value ends with a decimal or a decimal with trailing zeroes
+                        // Keep the raw string while the user is mid-decimal, so the decimals stay typeable;
+                        // it is formatted on blur anyway.
                         const isDecimal = v?.endsWith(decimalSeparator) || v?.endsWith(decimalSeparator + '0')
                         const newValue = isDecimal ? v : values?.float ?? ''
                         const nextAmountFilter = {
@@ -342,19 +337,17 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
     const currency = transaction.currency ?? selectedBank?.account_currency ?? getCompanyCurrency(selectedBank?.company ?? '')
 
     /*
-     * FM5: the advisory currency-mismatch predicate. It is DERIVED from the server rather than
-     * designed - `validate_currency` on Bank Transaction resolves
-     * `Bank Account.account` -> `Account.account_currency`, and `bank_account.get_list` attaches
-     * `account_currency` to each row through that identical lookup, so the two sides cannot disagree.
+     * The advisory currency-mismatch predicate, derived from the server rather than designed:
+     * `validate_currency` on Bank Transaction resolves `Bank Account.account` ->
+     * `Account.account_currency`, and `bank_account.get_list` attaches `account_currency` to each row
+     * through that identical lookup, so the two sides cannot disagree.
      *
-     * Either side may legitimately be unknown (`currency` is optional on the transaction and
-     * `account_currency` is attached at query time rather than being a native Bank Account field), and
-     * unknown means "nothing to compare", never "mismatch".
+     * Either side may legitimately be unknown, and unknown means "nothing to compare", never
+     * "mismatch".
      */
     const isCurrencyMismatch = Boolean(transaction.currency && selectedBank?.account_currency && transaction.currency !== selectedBank.account_currency)
 
     const handleSelectTransaction = (event: React.MouseEvent<HTMLDivElement>) => {
-        // If the user is pressing the shift key, add/remove the transaction from the selected transactions
         if (event.shiftKey) {
             setSelectedTransaction(isSelected ? selectedTransaction.filter((t) => t.name !== transaction.name) : [...selectedTransaction, transaction])
         } else {
@@ -386,14 +379,11 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
                             title={_("Matched by rule")}>
                             <ZapIcon className="w-4 h-4" /> {transaction.matched_transaction_rule}</Badge>}
 
-                        {/* FM5: ADVISORY ONLY - Reconcile is deliberately left enabled, because the
-                            server and not this badge decides whether a post is allowed. `theme="orange"`
-                            is used because Badge declares no `amber` theme, and `subtle` + `orange` is
-                            what resolves to the amber ink and surface tokens this warning calls for.
-                            `TooltipTrigger asChild` keeps the indicator non-interactive: the row is
-                            itself a focusable role="button", and a bare trigger would render its own
-                            button and add a second tab stop. The local TooltipProvider matches every
-                            other tooltip in this file, so the subtree stays independently mountable. */}
+                        {/* Advisory only: Reconcile stays enabled, because the server and not this badge
+                            decides whether a post is allowed. `theme="orange"` resolves to the amber ink
+                            and surface tokens, since Badge declares no `amber` theme. `TooltipTrigger
+                            asChild` keeps the indicator non-interactive - the row is itself a focusable
+                            role="button", and a bare trigger would add a second tab stop. */}
                         {isCurrencyMismatch && <TooltipProvider>
                             <Tooltip>
                                 <TooltipTrigger asChild>
@@ -452,7 +442,6 @@ const useKeyboardShortcuts = () => {
     const setRecordJournalEntryModalOpen = useSetAtom(bankRecRecordJournalEntryModalAtom)
 
     useHotkeys('meta+p', () => {
-        // 
         setRecordPaymentModalOpen(true)
     }, {
         enabled: true,
@@ -461,7 +450,6 @@ const useKeyboardShortcuts = () => {
     })
 
     useHotkeys('meta+b', () => {
-        // 
         setRecordJournalEntryModalOpen(true)
     }, {
         enabled: true,
@@ -470,7 +458,6 @@ const useKeyboardShortcuts = () => {
     })
 
     useHotkeys('meta+i', () => {
-        // 
         setTransferModalOpen(true)
     }, {
         enabled: true,
@@ -875,12 +862,6 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
 
         const transaction = selectedTransaction?.[0]
 
-        // We need to check if the following details match:
-        // Amount
-        // Date
-        // Reference/Description: Full or partial
-        // Whether this is suggested or not - depends on the above scores
-
         const amountMatches = voucher.paid_amount === transaction?.unallocated_amount
         const postingDateMatches = voucher.posting_date === transaction?.date
         const referenceDateMatches = voucher.reference_date === transaction?.date
@@ -898,16 +879,13 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
     const { reconcileTransaction, loading } = useReconcileTransaction()
 
     /*
-     * FM3/TC5: the already-reconciled guard, mirroring the server's own predicate rather than inventing
-     * one. `add_payment_entries` refuses outright when `unallocated_amount <= 0` - the first statement
-     * of the first method the posting endpoint calls - and `set_status` derives the status field from
-     * that same quantity, so `status === 'Reconciled'` holds exactly when `unallocated_amount <= 0`.
-     * Both fields already arrive in the `get_bank_transactions` payload, so no extra read and no
-     * backend change are needed.
+     * The already-reconciled guard mirrors the server's own predicate rather than inventing one:
+     * `add_payment_entries` refuses when `unallocated_amount <= 0`, and `set_status` derives the status
+     * field from that same quantity, so the two signals agree. Both arrive in the
+     * `get_bank_transactions` payload, so the guard needs no extra read.
      *
-     * A UX AFFORDANCE ONLY: the server check remains authoritative, and a stale-client attempt that
-     * slips through surfaces the server's own throw in the shared BankRecErrorDialog and revalidates
-     * the transaction reads. Nothing is marked reconciled locally.
+     * It is a UX affordance only - the server check stays authoritative, and an attempt that slips
+     * through a stale client surfaces the server's own throw in the shared dialog.
      */
     const transactionUnderReview = selectedTransaction?.[0]
     const isAlreadyReconciled = transactionUnderReview
@@ -986,12 +964,10 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
                     </TooltipProvider>
                 </div>
                 <div>
-                    {/* A disabled control emits no pointer or focus events, so the reason is anchored to
-                        a focusable wrapper span rather than to the Button itself, keeping it discoverable
-                        by mouse and keyboard alike. The Tooltip is mounted only when the guard fires, so
-                        the enabled path is byte-for-byte the control it always was. Its own
-                        TooltipProvider matches every other tooltip in this file - the provider that wraps
-                        the match badges above closes before this point. */}
+                    {/* A disabled control emits no pointer or focus events, so the reason is anchored to a
+                        focusable wrapper span rather than to the Button, keeping it discoverable by mouse
+                        and keyboard alike. The provider that wraps the match badges above has already
+                        closed, so this subtree needs its own. */}
                     {isAlreadyReconciled
                         ? <TooltipProvider>
                             <Tooltip>
@@ -1031,7 +1007,6 @@ const MatchBadge = ({ matchType, label }: { matchType: 'full' | 'partial' | 'non
 
 const OlderUnreconciledTransactionsBanner = () => {
 
-    // A banner to show when there are unreconciled transactions for the given bank account before the current selected date
     const [dates, setDates] = useAtom(bankRecDateAtom)
     const selectedBank = useAtomValue(selectedBankAccountAtom)
 
