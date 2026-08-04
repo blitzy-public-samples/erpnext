@@ -340,26 +340,30 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
 
     const isSelected = selectedTransaction?.some((t) => t.name === transaction.name)
 
-    const currency = transaction.currency ?? selectedBank?.account_currency ?? getCompanyCurrency(selectedBank?.company ?? '')
-
     /*
-     * FM5: the non-blocking currency advisory.
+     * FM5, and the ONE authoritative currency value this row uses for BOTH purposes.
      *
-     * The account side of the comparison is read from the LIVE `bank_account.get_list` response, NOT
-     * from `selectedBank` above. That distinction is the entire correctness of this indicator:
-     * `selectedBankAccountAtom` is persisted to localStorage and `BankPicker` leaves the stored row
-     * untouched while the account it names still exists, so its `account_currency` can be arbitrarily
-     * old. Comparing against it could warn about a mismatch that has since been corrected, or stay
-     * silent about one that has since been introduced - either way contradicting the server, whose
-     * own view is exactly what `useSelectedBankAccountCurrency` returns (same endpoint, same
-     * `Bank Account.account` -> `Account.account_currency` path, same SWR entry, no extra request).
+     * `useSelectedBankAccountCurrency` reads the live `bank_account.get_list` response. Everything
+     * here resolves through it - the mismatch comparison AND the fallback used to format the amount -
+     * because those two must not be able to disagree. They previously could: the comparison read the
+     * live value while the formatting fell back to `selectedBank.account_currency`, the persisted
+     * localStorage snapshot, so a row could simultaneously be told "these currencies match" and be
+     * rendered under a stale symbol. `useGetBankAccounts` now rehydrates that snapshot from the same
+     * response, and reading the live value here as well removes the second source outright.
      *
-     * Either side may legitimately be unknown - `currency` is optional on the transaction, and the
-     * hook returns `undefined` while the list is loading, after a failed read, or when the selected
-     * account is absent from it. Unknown means "nothing to compare", never "mismatch": a warning that
-     * is wrong in either direction is worse than no warning.
+     * `selectedBank?.account_currency` is kept as the NEXT fallback rather than deleted: it is the only
+     * value available in the first render after a cold start, before the list has answered, and a
+     * momentarily stale symbol is better than none. The company default remains the last resort.
+     *
+     * Either side of the COMPARISON may legitimately be unknown - `currency` is optional on the
+     * transaction, and the hook returns `undefined` while the list is loading, after a failed read, or
+     * when the selected account is absent from it. Unknown means "nothing to compare", never
+     * "mismatch": a warning that is wrong in either direction is worse than no warning.
      */
     const accountCurrency = useSelectedBankAccountCurrency()
+
+    const currency = transaction.currency ?? accountCurrency ?? selectedBank?.account_currency ?? getCompanyCurrency(selectedBank?.company ?? '')
+
     const isCurrencyMismatch = Boolean(transaction.currency && accountCurrency && transaction.currency !== accountCurrency)
 
     /*
@@ -971,7 +975,7 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
 
     }, [voucher, selectedTransaction, index])
 
-    const { reconcileTransaction, loading } = useReconcileTransaction()
+    const { reconcileTransaction, loading, isReconcileInFlight } = useReconcileTransaction()
 
     /*
      * FM3: the already-reconciled guard, mirroring the server's own predicate rather than inventing
@@ -981,10 +985,15 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
      * `get_bank_transactions` payload. No extra read and no backend change are needed.
      *
      * The server stays the authority; this only stops the affordance offering an action that cannot
-     * succeed. It matters in two real cases: the "Bank Transactions" tab requests the unfiltered set
-     * with `all_transactions: true`, so reconciled rows genuinely render there, and a client whose
-     * list has gone stale (the unreconciled query deliberately revalidates neither on focus nor when
-     * stale) can still be holding a row the server has since settled.
+     * succeed. The case it exists for is the STALE CLIENT, and that case is real rather than
+     * theoretical: `useGetUnreconciledTransactions` revalidates neither on focus nor when stale, and
+     * the selection itself is persisted, so this surface can be holding a row the server has since
+     * settled - either because the list was fetched before the reconciliation or because a stored
+     * selection outlived it.
+     *
+     * It is NOT reachable from the unfiltered "Bank Transactions" tab, contrary to what this comment
+     * used to claim: that tab is `BankTransactionList`, which renders no Reconcile control at all, and
+     * the endpoint behind THIS surface filters `unallocated_amount > 0` server-side.
      *
      * Read off the SELECTION, which the reconcile hook empties on rejection - so a refused attempt
      * withdraws this control rather than leaving it pointed at a snapshot the server has contradicted.
@@ -1007,10 +1016,21 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
         reconcileTransaction(transactionUnderReview, voucher)
     }
 
+    /*
+     * FM1/TC6: disabled while ANY reconcile post is open, not merely while THIS row's is.
+     *
+     * `loading` belongs to this row's own hook instance, and every candidate row instantiates the hook
+     * for itself - so a control gated on `loading` alone stayed live while a SIBLING row's post was
+     * unanswered, and a reviewer could dispatch a second `reconcile_vouchers` for the same transaction
+     * before the first had returned. `isReconcileInFlight` is shared state, so one open post closes
+     * every candidate at once. The spinner still follows `loading`, so only the row that started the
+     * request says "Reconciling" - the others simply become unavailable, which is what the reviewer
+     * needs to be told.
+     */
     const reconcileButton = <Button
         variant={isSuggested || amountMatches ? "solid" : "outline"}
         theme={isSuggested || amountMatches ? "green" : "gray"}
-        onClick={onClick} disabled={loading || isAlreadyReconciled}>{loading ? <><Loader2 className="w-4 h-4 animate-spin" /> {_("Reconciling")}...</> : `${_("Reconcile")}`}</Button>
+        onClick={onClick} disabled={loading || isReconcileInFlight || isAlreadyReconciled}>{loading ? <><Loader2 className="w-4 h-4 animate-spin" /> {_("Reconciling")}...</> : `${_("Reconcile")}`}</Button>
 
     return <div className="py-1 px-1">
         <div
@@ -1132,7 +1152,11 @@ const OlderUnreconciledTransactionsBanner = () => {
     const { data } = useFrappeGetCall<{
         message: {
             count: number,
-            oldest_date: string
+            // REQUIRED and NULLABLE: `get_older_unreconciled_transactions` returns
+            // `{"count": 0, "oldest_date": None}` when nothing is older, so the key is always present
+            // and `null` is a value it really carries. It was typed `string`, which promised callers a
+            // date that need not exist - and the jump control below consumed it unguarded.
+            oldest_date: string | null
         }
     }>("erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.get_older_unreconciled_transactions", {
         bank_account: selectedBank?.name,
@@ -1156,17 +1180,24 @@ const OlderUnreconciledTransactionsBanner = () => {
                         {_("The opening balance might not match your bank statement. Would you like to reconcile them?")}
                     </AlertDescription>
                 </div>
-                <div>
+                {/* The jump control is rendered only when the server actually named a date. `count > 0`
+                    and a non-null `oldest_date` normally arrive together, but they are two separate
+                    fields on one payload and this control writes the date straight into the shared date
+                    range: without the guard a `null` would be persisted as `fromDate`, and every query
+                    keyed on that range - transactions, both balances, the candidate lists - would be
+                    re-issued with a null boundary. The banner's own text stands on `count` alone, so the
+                    reviewer is still told what exists either way. */}
+                {data.message.oldest_date && <div>
                     <Button
                         size='sm'
                         type='button'
                         theme='gray'
                         variant='outline'
-                        onClick={() => setDates({ fromDate: data.message.oldest_date, toDate: dates.toDate })}>
+                        onClick={() => setDates({ fromDate: data.message.oldest_date as string, toDate: dates.toDate })}>
                         <span>{data.message.count > 1 ? _("View older transactions") : _("View older transaction")}</span>
                         <ArrowRightIcon />
                     </Button>
-                </div>
+                </div>}
             </div>
         </Alert>
     }

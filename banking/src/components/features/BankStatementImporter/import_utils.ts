@@ -120,7 +120,21 @@ export interface GetStatementDetailsResponse {
     }>,
     date_format: string,
     raw_data: Array<Array<string>>,
-    currency: string,
+    /*
+     * There is deliberately NO top-level `currency` here.
+     *
+     * `get_statement_details` returns exactly `doc`, `date_format`, `conflicting_transactions`,
+     * `final_transactions`, `raw_data` and - for a PDF - `pdf_tables`
+     * (bank_statement_import_log.py:get_statement_details). It has never returned a top-level
+     * `currency`. This interface used to declare one anyway, and that declaration was the reason
+     * `formatCurrency(..., data.currency)` type-checked in StatementDetails.tsx while resolving to
+     * `undefined` at runtime, silently formatting every statement figure in the system default
+     * currency instead of the statement's own.
+     *
+     * The currency of a statement lives on the log itself - `doc.currency`, a Link to Currency on
+     * `Bank Statement Import Log` - so read it from there. Re-adding a top-level field would restore
+     * the hole rather than the data: the compiler is what now guarantees no such read exists.
+     */
     pdf_tables?: PDFTable[],
 }
 

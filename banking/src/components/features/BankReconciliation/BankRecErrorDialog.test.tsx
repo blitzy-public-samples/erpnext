@@ -251,7 +251,27 @@ describe('BankRecErrorDialog', () => {
 				const description = getBanner().querySelector('[data-slot="alert-description"]')
 				expect(description?.textContent).toContain('Reconciliation refused')
 				expect(description?.textContent).toContain('Bank Transaction is already fully reconciled')
-				expect(description?.querySelectorAll('p')).toHaveLength(2)
+				// TWO rendered messages, counted as the banner's own direct children rather than as
+				// `<p>` elements. The element the renderer emits per message is an implementation
+				// detail of the sanitisation wrapper (`sanitizeServerMarkup` hands the shared renderer
+				// an HTML block so that no markdown, and therefore no markdown-authored `<img>` or
+				// off-origin link, can be interpreted inside a server message); the COUNT is the
+				// contract, and it must not change with it.
+				expect(description?.children).toHaveLength(2)
+			})
+
+			/**
+			 * The re-encoding {@link sanitizeServerMarkup} performs must not double the appended
+			 * `_error_message`. The shared parser APPENDS that field to whatever `_server_messages`
+			 * yielded, so handing the banner a re-encoded envelope that still carried the original
+			 * field would make it append a second copy — the message would be reported twice.
+			 */
+			it('does not report the appended `_error_message` twice after re-encoding', () => {
+				renderDialog(makeErrorMessageError('The linked voucher is over-allocated'))
+
+				const description = getBanner().querySelector('[data-slot="alert-description"]')
+				expect(description?.children).toHaveLength(1)
+				expect(getBannerMessageText()).toBe('The linked voucher is over-allocated')
 			})
 
 			it('encodes an envelope exactly as the shared factory does', () => {
@@ -305,6 +325,335 @@ describe('BankRecErrorDialog', () => {
 			expect(banner.querySelector('b')).not.toBeNull()
 			expect(banner).toHaveTextContent('Transaction currency: USD cannot be different')
 			expect(banner.textContent).not.toContain('<b>')
+		})
+	})
+
+	/*
+	 * ================================================================================================
+	 * SANITISATION OF SERVER MARKUP  (CWE-79 / CWE-451)
+	 *
+	 * `_server_messages` is HTML and the shared renderer puts it on the page as REAL DOM: it runs
+	 * `rehypeRaw` with no sanitiser after it. Anything that can reach a server error message - a party
+	 * name, a document field interpolated into a validation string - can therefore reach this dialog as
+	 * markup. Every case below is asserted on the RENDERED tree, not on the sanitiser's return value,
+	 * because what matters is what survives the whole shared pipeline.
+	 *
+	 * TEXT is never sacrificed to achieve this: each case that removes an element also asserts the
+	 * words the server wrote are still readable.
+	 * ============================================================================================== */
+	describe('sanitises server-controlled markup before the shared renderer sees it', () => {
+		/** Every message body the banner rendered, as markup, so element-level absence can be asserted. */
+		const getBannerMarkup = (): string =>
+			getBanner().querySelector('[data-slot="alert-description"]')?.innerHTML ?? ''
+
+		describe('script and active content', () => {
+			it('drops a <script> subtree outright and executes nothing', () => {
+				renderDialog(
+					makeServerMessagesError(
+						'Import refused<script>window.__pwned = true</script> — fix the file'
+					)
+				)
+
+				expect(getBannerMarkup()).not.toContain('<script')
+				expect(getBanner().querySelector('script')).toBeNull()
+				// The script's own SOURCE goes with it: it is code, not text a reader should see.
+				expect(getBannerMessageText()).not.toContain('window.__pwned')
+				expect((window as unknown as Record<string, unknown>).__pwned).toBeUndefined()
+
+				// ...and the server's actual words survive on both sides of it.
+				expect(getBannerMessageText()).toContain('Import refused')
+				expect(getBannerMessageText()).toContain('fix the file')
+			})
+
+			it('strips every event-handler attribute while keeping the element and its text', () => {
+				renderDialog(
+					makeServerMessagesError(
+						'<b onclick="window.__pwned = true" onmouseover="window.__pwned = true">Row 1</b>: invalid'
+					)
+				)
+
+				const bold = getBanner().querySelector('b')
+				expect(bold).not.toBeNull()
+				expect(bold?.getAttribute('onclick')).toBeNull()
+				expect(bold?.getAttribute('onmouseover')).toBeNull()
+				expect(getBannerMessageText()).toContain('Row 1')
+				expect((window as unknown as Record<string, unknown>).__pwned).toBeUndefined()
+			})
+
+			it('drops <style>, <iframe> and <object> subtrees', () => {
+				renderDialog(
+					makeServerMessagesError(
+						'Refused<style>body{display:none}</style><iframe src="/app"></iframe><object data="/x"></object>'
+					)
+				)
+
+				const banner = getBanner()
+				expect(banner.querySelector('style')).toBeNull()
+				expect(banner.querySelector('iframe')).toBeNull()
+				expect(banner.querySelector('object')).toBeNull()
+				expect(getBannerMessageText()).toContain('Refused')
+			})
+		})
+
+		describe('off-origin resources', () => {
+			it('drops an <img> even when its source is same-origin, because no message needs one', () => {
+				renderDialog(makeServerMessagesError('Refused <img src="/assets/erpnext/x.png"> here'))
+
+				expect(getBanner().querySelector('img')).toBeNull()
+				expect(getBannerMessageText()).toContain('Refused')
+			})
+
+			it('drops an off-origin <img>, so opening the dialog issues no outbound request', () => {
+				renderDialog(
+					makeServerMessagesError('Refused <img src="https://tracker.example/pixel.png"> here')
+				)
+
+				expect(getBanner().querySelector('img')).toBeNull()
+				expect(getBannerMarkup()).not.toContain('tracker.example')
+			})
+
+			/**
+			 * The markdown-authored spellings matter independently of the HTML ones: this sanitiser
+			 * necessarily runs BEFORE the shared renderer's markdown parser, so `![x](url)` is not
+			 * HTML and no HTML filter can see it. The `<div>` wrapper is what closes that hole, by
+			 * making the whole message a CommonMark HTML block that remark passes through verbatim.
+			 */
+			it('renders no <img> for a markdown image, and keeps its text visible', () => {
+				renderDialog(makeServerMessagesError('Refused ![pixel](https://tracker.example/p.png) here'))
+
+				expect(getBanner().querySelector('img')).toBeNull()
+				expect(getBannerMessageText()).toContain('Refused')
+				// Not silently deleted either - the reviewer still sees what the server wrote.
+				expect(getBannerMessageText()).toContain('tracker.example')
+			})
+
+			it('renders no anchor for a markdown link to another origin', () => {
+				renderDialog(makeServerMessagesError('Refused [click here](https://phish.example/login) now'))
+
+				expect(getBanner().querySelector('a')).toBeNull()
+				expect(getBannerMessageText()).toContain('click here')
+			})
+
+			it('renders no anchor for a bare GFM autolink literal', () => {
+				renderDialog(makeServerMessagesError('Refused, see https://phish.example/login for details'))
+
+				expect(getBanner().querySelector('a')).toBeNull()
+				expect(getBannerMessageText()).toContain('https://phish.example/login')
+			})
+		})
+
+		describe('the same-origin link boundary', () => {
+			it("keeps Frappe's own root-relative document link, with rel stamped on it", () => {
+				renderDialog(
+					makeServerMessagesError(
+						`Please cancel <a href="/app/bank-transaction/${TEST_BANK_ACCOUNT}">this transaction</a> first`
+					)
+				)
+
+				const anchor = getBanner().querySelector('a')
+				expect(anchor).not.toBeNull()
+				expect(anchor?.getAttribute('href')).toBe(`/app/bank-transaction/${TEST_BANK_ACCOUNT}`)
+				expect(anchor?.getAttribute('rel')).toBe('noreferrer noopener')
+				expect(anchor?.getAttribute('target')).toBeNull()
+			})
+
+			it('keeps a fragment and a plain relative reference', () => {
+				renderDialog(
+					makeServerMessagesError('See <a href="#details">details</a> or <a href="rules">rules</a>')
+				)
+
+				const hrefs = Array.from(getBanner().querySelectorAll('a')).map((a) => a.getAttribute('href'))
+				expect(hrefs).toEqual(['#details', 'rules'])
+			})
+
+			/*
+			 * The BACKSLASH spellings are the subtle ones. WHATWG URL parsing - what every browser and
+			 * jsdom implement - folds `\` into `/` inside an http(s) URL, so each of these resolves to
+			 * an entirely different origin while carrying neither an explicit scheme nor a leading `//`
+			 * for a purely syntactic test to catch.
+			 */
+			it.each([
+				['an absolute URL', 'https://phish.example/login'],
+				['a scheme-relative network path', '//phish.example/login'],
+				['a double-backslash network path', '\\\\phish.example/login'],
+				['a slash-backslash network path', '/\\phish.example/login'],
+				['a backslash-slash network path', '\\/phish.example/login'],
+				['a javascript: URL', 'javascript:window.__pwned=true'],
+				['a data: URL', 'data:text/html,<script>window.__pwned=true</script>'],
+				['a scheme split by a control character', 'java\nscript:window.__pwned=true'],
+				['an unparseable reference', '////'],
+				['an empty destination', '']
+			])('unwraps an anchor whose destination is %s, keeping the text', (_label, href) => {
+				renderDialog(makeServerMessagesError(`Open <a href="${href}">the record</a> to continue`))
+
+				expect(getBanner().querySelector('a')).toBeNull()
+				expect(getBannerMessageText()).toContain('the record')
+				expect(getBannerMessageText()).toContain('to continue')
+				expect((window as unknown as Record<string, unknown>).__pwned).toBeUndefined()
+			})
+
+			it('proves the backslash spellings really do resolve off this origin', () => {
+				// Non-vacuous companion to the table above: if jsdom ever stopped folding backslashes
+				// these would resolve to this origin and the refusals above would be testing nothing.
+				for (const href of ['\\\\phish.example/login', '/\\phish.example/login', '\\/phish.example/login']) {
+					expect(new URL(href, window.location.href).origin).not.toBe(window.location.origin)
+				}
+			})
+		})
+
+		describe('UI-redress attributes', () => {
+			it('removes class and id, the two attributes that can cover or re-label the dialog', () => {
+				renderDialog(
+					makeServerMessagesError(
+						'<span class="fixed inset-0 z-50 bg-surface-white" id="radix-title">Refused</span>'
+					)
+				)
+
+				const span = getBanner().querySelector('span')
+				expect(span).not.toBeNull()
+				expect(span?.getAttribute('class')).toBeNull()
+				expect(span?.getAttribute('id')).toBeNull()
+				expect(getBannerMessageText()).toContain('Refused')
+			})
+
+			it('removes inline style', () => {
+				renderDialog(
+					makeServerMessagesError('<span style="position:fixed;inset:0">Refused</span>')
+				)
+
+				expect(getBanner().querySelector('span')?.getAttribute('style')).toBeNull()
+			})
+
+			it('keeps a distinctive server title as TEXT, with any markup in it stripped', () => {
+				renderDialog(
+					makeFrappeError({
+						_server_messages: encodeServerMessages({
+							message: 'Allocated amount exceeds the unallocated amount',
+							title: 'Over-<script>window.__pwned=true</script>allocation',
+							indicator: 'red'
+						})
+					})
+				)
+
+				expect(getBannerHeading()).toBe('Over-allocation')
+				expect(getBanner().querySelector('[data-slot="alert-title"] script')).toBeNull()
+				expect((window as unknown as Record<string, unknown>).__pwned).toBeUndefined()
+			})
+		})
+
+		it('discards an HTML comment, which carries nothing renderable', () => {
+			renderDialog(
+				makeServerMessagesError('Refused<!-- internal: retry queue 7 --> — check the file')
+			)
+
+			expect(getBannerMarkup()).not.toContain('<!--')
+			expect(getBannerMessageText()).not.toContain('retry queue 7')
+			expect(getBannerMessageText()).toContain('Refused')
+			expect(getBannerMessageText()).toContain('check the file')
+		})
+
+		it('unwraps an unknown-but-harmless tag, keeping every word inside it', () => {
+			// Unwrapped rather than dropped: the tag is not on the allow-list, but its CONTENT is text
+			// the server wrote and losing it would tell the reviewer less than the server did.
+			renderDialog(
+				makeServerMessagesError('Refused: <frappe-widget>the bank account is disabled</frappe-widget>')
+			)
+
+			expect(getBanner().querySelector('frappe-widget')).toBeNull()
+			expect(getBannerMessageText()).toContain('the bank account is disabled')
+		})
+
+		it('keeps the structural markup a validation summary legitimately uses', () => {
+			renderDialog(
+				makeServerMessagesError(
+					'Fix the following:<ul><li>Row <b>1</b>: no date</li><li>Row 2: no amount</li></ul>'
+				)
+			)
+
+			const banner = getBanner()
+			expect(banner.querySelectorAll('li')).toHaveLength(2)
+			expect(banner.querySelector('b')).not.toBeNull()
+			expect(getBannerMessageText()).toContain('Row 2: no amount')
+		})
+	})
+
+	/*
+	 * ================================================================================================
+	 * MALFORMED ENVELOPES (FM1)
+	 *
+	 * `_server_messages` is server-controlled and only CONVENTIONALLY well formed. The shared parser
+	 * used to call `JSON.parse` on it unguarded, and that expression sat in front of every safety
+	 * action the failure paths perform - so a truncated or rewritten body did not garble the message,
+	 * it threw out of the handler and abandoned the dialog, the per-file failure marker, the cleared
+	 * selection and the revalidations. These cases pin the parser as TOTAL: the dialog must still
+	 * open, and must still say something the reviewer can act on.
+	 * ============================================================================================== */
+	describe('survives a malformed `_server_messages` envelope', () => {
+		it('falls through to `exception` when the envelope is not valid JSON at all', () => {
+			expect(() =>
+				renderDialog(
+					makeFrappeError({
+						_server_messages: '[{"message":"Reconciliation refu',
+						exception: 'frappe.exceptions.ValidationError: Bank Account is disabled'
+					})
+				)
+			).not.toThrow()
+
+			expect(getDialogContent()).toBeInTheDocument()
+			expect(getBannerMessageText()).toContain('Bank Account is disabled')
+		})
+
+		it('falls through to `message` when the envelope is valid JSON but not an array', () => {
+			renderDialog(
+				makeFrappeError({
+					_server_messages: '{"message":"Reconciliation refused"}',
+					exception: '',
+					message: 'Internal Server Error'
+				})
+			)
+
+			expect(getDialogContent()).toBeInTheDocument()
+			expect(getBannerMessageText()).toBe('Internal Server Error')
+		})
+
+		it('normalises a SINGLY encoded element instead of rendering an empty banner', () => {
+			// Frappe's convention is double encoding, so the inner parse is what turns an element into
+			// an object. A bare string has no `message` property and used to render as `undefined`.
+			renderDialog(
+				makeFrappeError({
+					_server_messages: JSON.stringify(['Bank Transaction is already fully reconciled'])
+				})
+			)
+
+			expect(getBannerMessageText()).toBe('Bank Transaction is already fully reconciled')
+			expect(getBannerHeading()).toBe(COLLAPSED_HEADING)
+		})
+
+		it('ignores an entry carrying no `message` and uses the text available elsewhere', () => {
+			renderDialog(
+				makeFrappeError({
+					_server_messages: JSON.stringify([JSON.stringify({ title: 'Message', indicator: 'red' })]),
+					exception: 'frappe.exceptions.ValidationError: The bank account is disabled'
+				})
+			)
+
+			expect(getDialogContent()).toBeInTheDocument()
+			expect(getBannerMessageText()).toContain('The bank account is disabled')
+		})
+
+		it('still opens, with an honest heading, when no field carries any text at all', () => {
+			renderDialog(
+				makeFrappeError({
+					_server_messages: 'not json',
+					exception: '',
+					message: ''
+				})
+			)
+
+			expect(getDialogContent()).toBeInTheDocument()
+			expect(screen.getByText(DIALOG_TITLE)).toBeInTheDocument()
+			expect(getBannerMessageText()).toBe('No further details were returned.')
+			expect(screen.getByRole('button', { name: DISMISS_LABEL })).toBeInTheDocument()
 		})
 	})
 

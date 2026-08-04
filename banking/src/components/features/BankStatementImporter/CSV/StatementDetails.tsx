@@ -11,7 +11,7 @@ import { Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, Tabl
 import { Separator } from '@/components/ui/separator'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { useFrappeEventListener, useFrappePostCall, type FrappeError } from 'frappe-react-sdk'
+import { useFrappeEventListener, useFrappePostCall, useSWRConfig, type FrappeError } from 'frappe-react-sdk'
 import { toast } from 'sonner'
 import ErrorBanner from '@/components/ui/error-banner'
 import { Link, useNavigate } from 'react-router'
@@ -69,22 +69,141 @@ const StatementDetails = ({ data }: Props) => {
 
     const direction = useDirection()
 
+    /*
+     * TC1: the caches the workbench will read the imported rows out of.
+     *
+     * `useGetUnreconciledTransactions` is configured with `revalidateIfStale: false` and
+     * `revalidateOnFocus: false`, so when an entry already exists for a (bank, from, to) triple SWR
+     * serves it and issues NO request. Navigating to the workbench straight after an import therefore
+     * showed whatever had last been fetched for that range - which, for the very common case of
+     * importing a statement covering a range the reviewer had already been looking at, is a list
+     * WITHOUT any of the rows just imported. The import appeared to have done nothing.
+     */
+    const { mutate: revalidate } = useSWRConfig()
+
+    /*
+     * TC2: the rule evaluator, called AFTER the import response.
+     *
+     * `insert_transactions` already calls `run_rule_evaluation()` itself - but that function only
+     * checks permission and then `frappe.enqueue`s the work, and it is invoked BEFORE the method sets
+     * `status = "Completed"` and saves. The enqueued job can therefore begin while the importing
+     * request's transaction is still open, see none of the new Bank Transactions, and stamp nothing:
+     * the reviewer's first look at the list shows no suggested matches at all, and nothing will
+     * re-trigger evaluation until the nightly scheduler runs.
+     *
+     * Calling the SAME existing whitelisted endpoint once the response is in hand removes that race,
+     * because by then the rows are committed. It is idempotent by construction - `_run_rule_evaluation`
+     * filters on `is_rule_evaluated = 0` unless forced - so a redundant call costs one no-op job. No
+     * endpoint is added and no backend change is made.
+     */
+    const { call: runRuleEvaluation } = useFrappePostCall(
+        'erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule.run_rule_evaluation'
+    )
+
+    /**
+     * Evicts every cache entry the workbench will read for the range the server reported, then waits
+     * for those reads to be re-issued.
+     *
+     * The key strings are constructed exactly as `utils.ts` constructs them and must stay
+     * character-identical to it; no new cache-key family is introduced. Rejections are swallowed
+     * individually: a refresh that fails leaves SWR to fetch on mount as it normally would, and must
+     * not stop the reviewer being taken to the workbench.
+     */
+    const refreshImportedRange = (bankAccount: string, fromDate: string, toDate: string) =>
+        Promise.all([
+            revalidate(`bank-reconciliation-unreconciled-transactions-${bankAccount}-${fromDate}-${toDate}`),
+            revalidate(`bank-reconciliation-bank-transactions-${bankAccount}-${fromDate}-${toDate}`),
+            revalidate(`bank-reconciliation-account-closing-balance-${bankAccount}-${toDate}`),
+            revalidate(`bank-reconciliation-account-closing-balance-as-per-statement-${bankAccount}-${toDate}`)
+        ].map((refresh) => refresh.catch(() => undefined)))
+
     const onImport = () => {
+
+        /*
+         * FM2: a RETRY starts by retiring the previous verdict about this file. The marker records one
+         * observation of one refusal, so leaving it in place while a fresh attempt is in flight would
+         * let the importer list keep asserting a failure that is being actively re-tested.
+         */
+        setImportFailures((previous) => {
+            if (!previous.has(data.doc.name)) return previous
+            const next = new Map(previous)
+            next.delete(data.doc.name)
+            return next
+        })
 
         call({
             docs: data.doc,
             method: 'insert_transactions'
-        }).then((response) => {
+        }).then(async (response) => {
             const doc = response.docs ? response.docs[0] : undefined
-            if (doc && doc.start_date && doc.end_date) {
+
+            /*
+             * THE SERVER'S OWN VERDICT, and nothing weaker.
+             *
+             * A fulfilled promise used to be treated as success outright, which is not what it means:
+             * `run_doc_method` appends the document to `frappe.response.docs` AFTER running the method,
+             * and `insert_transactions` sets `status = "Completed"` and saves as its last act - so a
+             * response carrying a `Completed` doc is the server SAYING the import committed, while a
+             * response with no doc, or a doc still at `Not Started`, is a response that says nothing of
+             * the kind. Navigating on the latter announced an import that may not have happened and
+             * sent the reviewer to a list that would not contain it.
+             *
+             * An unconfirmed outcome is reported as an UNKNOWN, deliberately not as a failure: no
+             * refusal was observed, so nothing here may claim one. No per-file failure marker is
+             * written, and the reviewer is kept on this page - where the statement's own status badge
+             * is the server's answer - rather than being moved somewhere the answer is not visible.
+             */
+            if (doc?.status !== 'Completed') {
+                toast.warning(_("The import could not be confirmed."))
+                setErrorDialog({
+                    httpStatus: 200,
+                    httpStatusText: 'OK',
+                    message: _("The import could not be confirmed."),
+                    exception: '',
+                    _server_messages: JSON.stringify([JSON.stringify({
+                        message: _("The server accepted the request but did not report this statement as imported. Reload this page to see its current status before trying again - transactions may or may not have been created."),
+                        title: _("Import not confirmed"),
+                        indicator: 'yellow'
+                    })])
+                })
+                return
+            }
+
+            if (doc.start_date && doc.end_date) {
                 setDates({
                     fromDate: doc.start_date,
                     toDate: doc.end_date,
                 })
             }
+
+            /*
+             * TC2 then TC1, in that order and both awaited before navigating. Evaluation is triggered
+             * first so the stamping is under way before the list is re-read, and the refresh is awaited
+             * so the workbench mounts against rows that were fetched after the import rather than
+             * against a cache that predates it.
+             *
+             * Neither step is allowed to withhold the reviewer's navigation: evaluation is a background
+             * job whose completion cannot be awaited anyway, and a failed refresh leaves SWR to fetch on
+             * mount as it normally would. The rule stamp arriving a moment later shows up on the next
+             * read of the list, which the workbench performs for its own reasons.
+             */
+            await runRuleEvaluation({}).catch(() => undefined)
+
+            if (doc.start_date && doc.end_date) {
+                await refreshImportedRange(data.doc.bank_account, doc.start_date, doc.end_date)
+            }
+
             toast.success(_("Bank statement imported."))
             navigate(`/`)
-        }).catch((error: FrappeError) => {
+        }, (error: FrappeError) => {
+            /*
+             * Attached as the SECOND argument of `.then` rather than as a trailing `.catch`, and that
+             * distinction is load-bearing: a trailing `.catch` also catches anything the success handler
+             * above throws, so a client-side fault AFTER a confirmed import would be reported here as a
+             * server refusal and would write a per-file `Failed` marker for a statement the server had
+             * in fact imported. This handler now sees rejections of the SERVER CALL and nothing else,
+             * which is what makes the marker below mean what it says.
+             */
             toast.error(_("There was an error while importing the bank statement."))
 
             /*
@@ -122,13 +241,48 @@ const StatementDetails = ({ data }: Props) => {
 
     }
 
+    /*
+     * FM2/TC1 realtime progress. `progress` is a PERCENTAGE and `total` is a row count, and they are
+     * two different quantities: `insert_transactions` publishes
+     * `{"progress": round(processed / total * 100)}` after each row and one final
+     * `{"progress": 100, "total": <rows>}`. The percentage was previously rendered as
+     * "Importing {progress} transactions", so a 30-row statement announced "Importing 3 transactions"
+     * at the first row and "Importing 100 transactions" at the last - a number that was neither the
+     * count nor recognisable as a percentage.
+     *
+     * The payload is typed here rather than taken as `any` so the two can no longer be confused, and
+     * `total` is kept because it is the only authoritative row count the channel carries.
+     */
     const [progress, setProgress] = useState(0)
+    const [totalTransactions, setTotalTransactions] = useState<number | undefined>(undefined)
 
-    useFrappeEventListener("bank-rec-statement-import-progress", (event) => {
+    useFrappeEventListener("bank-rec-statement-import-progress", (event: { progress: number, total?: number }) => {
         setProgress(event.progress)
+        if (event.total !== undefined) {
+            setTotalTransactions(event.total)
+        }
     })
 
     const file_name = data.doc.file.split("/").pop() ?? ""
+
+    /*
+     * The currency every figure on this page is formatted in, read from `data.doc.currency`.
+     *
+     * It used to be read from `data.currency` — a TOP-LEVEL field of the response that the backend
+     * never sends. `get_statement_details` returns exactly `doc`, `date_format`,
+     * `conflicting_transactions`, `final_transactions`, `raw_data` and (for PDFs) `pdf_tables`; there
+     * is no top-level `currency` in either return branch. So the value was always `undefined`, and
+     * every amount here — total debits, total credits, closing balance and every previewed row — was
+     * formatted in the SYSTEM DEFAULT currency instead of the statement's own. For a foreign-currency
+     * account the preview showed the right numbers under the wrong symbol, immediately before the
+     * reviewer committed them.
+     *
+     * `Bank Statement Import Log.currency` is a real (read-only) field, set from the linked GL
+     * account's `account_currency` when the statement was analysed, and it is the same value
+     * `insert_transactions` stamps on every Bank Transaction it creates - so formatting from it is
+     * what makes this preview agree with what the import will actually record.
+     */
+    const statementCurrency = data.doc.currency
 
     const { banks } = useGetBankAccounts()
 
@@ -172,7 +326,9 @@ const StatementDetails = ({ data }: Props) => {
                 </div>
 
                 {progress > 0 && <div className='flex flex-col gap-2'><Progress value={progress} max={100} size="lg" />
-                    <span className='text-sm'>{_("Importing {0} transactions", [progress.toString()])}
+                    <span className='text-sm'>{totalTransactions === undefined
+                        ? _("Importing transactions... {0}% complete", [progress.toString()])
+                        : _("Imported {0} transactions ({1}% complete)", [totalTransactions.toString(), progress.toString()])}
                     </span>
                 </div>}
 
@@ -218,15 +374,15 @@ const StatementDetails = ({ data }: Props) => {
                         </TableRow>
                         <TableRow>
                             <TableHead>{_("Total Debits")}</TableHead>
-                            <TableCell><span className='font-numeric'>{formatCurrency(flt(data.doc.total_debits, 2), data.currency)}</span> <span className='text-ink-gray-5 font-sans'>({data.doc.total_debit_transactions} {data.doc.total_debit_transactions === 1 ? _("transaction") : _("transactions")})</span></TableCell>
+                            <TableCell><span className='font-numeric'>{formatCurrency(flt(data.doc.total_debits, 2), statementCurrency)}</span> <span className='text-ink-gray-5 font-sans'>({data.doc.total_debit_transactions} {data.doc.total_debit_transactions === 1 ? _("transaction") : _("transactions")})</span></TableCell>
                         </TableRow>
                         <TableRow>
                             <TableHead>{_("Total Credits")}</TableHead>
-                            <TableCell><span className='font-numeric'>{formatCurrency(flt(data.doc.total_credits, 2), data.currency)}</span> <span className='text-ink-gray-5 font-sans'>({data.doc.total_credit_transactions} {data.doc.total_credit_transactions === 1 ? _("transaction") : _("transactions")})</span></TableCell>
+                            <TableCell><span className='font-numeric'>{formatCurrency(flt(data.doc.total_credits, 2), statementCurrency)}</span> <span className='text-ink-gray-5 font-sans'>({data.doc.total_credit_transactions} {data.doc.total_credit_transactions === 1 ? _("transaction") : _("transactions")})</span></TableCell>
                         </TableRow>
                         <TableRow>
                             <TableHead>{_("Closing Balance as of {}", [formatDate(data.doc.end_date, "Do MMMM YYYY")])}</TableHead>
-                            <TableCell className='font-numeric'>{formatCurrency(flt(data.doc.closing_balance, 2), data.currency)}</TableCell>
+                            <TableCell className='font-numeric'>{formatCurrency(flt(data.doc.closing_balance, 2), statementCurrency)}</TableCell>
                         </TableRow>
                         <TableRow>
                             <TableHead>
@@ -297,8 +453,8 @@ const StatementDetails = ({ data }: Props) => {
                                         <TableCell>{formatDate(transaction.date)}</TableCell>
                                         <TableCell className='max-w-[200px] w-fit overflow-hidden text-ellipsis'>{transaction.description}</TableCell>
                                         <TableCell className='max-w-[100px] w-fit overflow-hidden text-ellipsis'>{transaction.reference}</TableCell>
-                                        <TableCell className='text-end font-numeric'>{formatCurrency(transaction.withdrawal, data.currency)}</TableCell>
-                                        <TableCell className='text-end font-numeric'>{formatCurrency(transaction.deposit, data.currency)}</TableCell>
+                                        <TableCell className='text-end font-numeric'>{formatCurrency(transaction.withdrawal, statementCurrency)}</TableCell>
+                                        <TableCell className='text-end font-numeric'>{formatCurrency(transaction.deposit, statementCurrency)}</TableCell>
                                     </TableRow>
                                 ))}
                             </TableBody>

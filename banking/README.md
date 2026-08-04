@@ -127,14 +127,15 @@ yarn build                       # requires ../../../sites/common_site_config.js
 | --- | --- | --- |
 | `dev` | `vite` | Dev server on host `0.0.0.0`, port `8080`, proxying `^/(app\|api\|assets\|files\|private)` to the local Frappe webserver. **Requires the bench config file** — see [below](#the-bench-config-prerequisite--and-why-test-does-not-share-it). |
 | `build` | `vite build --base=/assets/erpnext/banking/ && yarn copy-html-entry` | **Does not type-check** — run `typecheck` for that. **Requires the bench config file.** |
-| `lint` | `eslint .` | Flat config; lints every `**/*.{ts,tsx}`; ignores `dist` and `coverage`. |
+| `lint` | `eslint .` | Flat config; lints every `**/*.{ts,tsx}`; ignores `dist` **only** — `coverage` is *not* ignored, which is the whole of the [three-warning caveat](#coverage-gate). |
 | `preview` | `vite preview` | Serves a previously produced build. **Requires the bench config file** (it loads `vite.config.ts` too) **and a prior `build`** — without one it starts and answers 404. |
 | `copy-html-entry` | `cp ../erpnext/public/banking/index.html ../erpnext/www/banking.html` | Internal helper, invoked by `build`. |
 | `test` | `vitest run` | **Non-watch by construction** — a bare `vitest` enters watch mode, which is unusable in CI or any non-interactive context. **Does not require the bench config file.** |
 | `test:coverage` | `vitest run --coverage` | V8 provider; emits `text` + `json-summary` + `lcov`; **fails the process** below the configured line thresholds. |
-| `typecheck` | `tsc -b` | Builds the TypeScript solution. It exists because **`build` never invokes the compiler**, so without this script a type error would not be observable from this package's scripts at all. |
+| `typecheck` | `tsc -b && yarn typecheck:vitest-config` | The whole type gate. It exists because **`build` never invokes the compiler**, so without this script a type error would not be observable from this package's scripts at all. The second command is what makes the gate complete — see the row below and [TypeScript project layout](#typescript-project-layout). |
+| `typecheck:vitest-config` | `tsc --noEmit … vitest.config.ts` | Type-checks `vitest.config.ts`, which belongs to **neither** `tsconfig.*.json` program. Invoked by `typecheck`; you should not need to run it directly. |
 
-Those eight are the whole script set — there is deliberately no aggregate `verify` or `ci` script.
+Those nine are the whole script set — there is deliberately no aggregate `verify` or `ci` script.
 The acceptance gate is the three of them that need no bench config, run in order:
 
 ```bash
@@ -236,9 +237,10 @@ suite hand-rolls its own module mock.
 | `src/components/features/BankReconciliation/MatchAndReconcile.test.tsx` | The workbench: transaction list, suggested match, manual override, confirm, the already-reconciled guard, the currency advisory |
 | `src/components/features/BankReconciliation/utils.test.ts` | The typed API-client hook layer, its cache keys, and the post-rejection revalidation |
 | `src/components/features/BankReconciliation/BankRecErrorDialog.test.tsx` | The dismissible error dialog — server text rendered verbatim, severity, dismissal |
-| `src/components/features/BankStatementImporter/CSV/StatementDetails.test.tsx` | The import step, including backend-error surfacing and the realtime progress listener |
-| `src/pages/BankStatementImporter.test.tsx` | The importer surface and its per-file status badge |
-| `src/lib/frappe.test.ts` | Frappe error parsing, including the nested JSON-string case and the fallback path |
+| `src/components/features/BankStatementImporter/CSV/StatementDetails.test.tsx` | The import step: the `Completed`-doc outcome requirement, backend-error surfacing, the cache eviction and rule hand-off before review, and the realtime progress listener |
+| `src/pages/BankStatementImporter.test.tsx` | The importer surface: the single-flight upload chain, server-owned log identity, per-file status for failures with and without a log, and the log's own currency |
+| `src/pages/ViewBankStatementImportLog.test.tsx` | The import-log detail route's render-branch order — a refused read shows the server's message and a way back, never a blank page |
+| `src/lib/frappe.test.ts` | Frappe error parsing: the nested JSON-string case, the fallback chain, and the malformed/non-array/message-less envelopes that must not throw |
 | `src/lib/company.test.ts` | The `locals[':Company']` readers |
 | `src/lib/currency.test.ts` | The currency readers and formatters |
 
@@ -269,20 +271,21 @@ patterns", and the gate passes on a file nothing measured. Generating both from 
 makes that impossible. Whatever the `All files` row of the text reporter prints is therefore exactly
 what is enforced.
 
-The nine gated units, and their measured line coverage:
+The ten gated units, and their measured line coverage:
 
 | Unit | Lines |
 | --- | --- |
-| `src/components/features/BankReconciliation/utils.ts` | 98.73% |
-| `src/components/features/BankReconciliation/bankRecAtoms.ts` | 94.44% |
+| `src/components/features/BankReconciliation/utils.ts` | 98.87% |
+| `src/components/features/BankReconciliation/bankRecAtoms.ts` | 95.45% |
 | `src/components/features/BankReconciliation/BankRecErrorDialog.tsx` | 100% |
 | `src/components/features/BankReconciliation/MatchAndReconcile.tsx` | 98.01% |
 | `src/components/features/BankStatementImporter/CSV/StatementDetails.tsx` | 100% |
-| `src/pages/BankStatementImporter.tsx` | 97.14% |
-| `src/lib/frappe.ts` | 97.05% |
+| `src/pages/BankStatementImporter.tsx` | 98.64% |
+| `src/pages/ViewBankStatementImportLog.tsx` | 100% |
+| `src/lib/frappe.ts` | 100% |
 | `src/lib/company.ts` | 100% |
 | `src/lib/currency.ts` | 100% |
-| **Aggregate** | **98.36%** |
+| **Aggregate** | **98.89%** |
 
 `coverage.exclude` is retained as a guard so that broadening `include` back to a directory glob can
 never silently re-admit generated DocType declarations (`src/types/**`), the harness itself
@@ -359,15 +362,28 @@ Three configuration files, all of them intentionally unchanged:
 | `tsconfig.app.json` | The application program: `include: ["src"]`, `target` `ES2020`, `lib` `["ES2020", "DOM", "DOM.Iterable"]`, `moduleResolution` `bundler`, `jsx` `react-jsx`, and `strict`, `noUnusedLocals`, `noUnusedParameters`, `noFallthroughCasesInSwitch`, `noUncheckedSideEffectImports` all enabled. It declares **no `types` array.** |
 | `tsconfig.node.json` | The tooling program: `include: ["vite.config.ts"]`, `types: ["node"]`, `target`/`lib` `ES2023`, with `verbatimModuleSyntax` and `erasableSyntaxOnly` enabled — which is why `proxyOptions.ts` imports its Node HTTP request type with `import type` |
 
-`yarn typecheck` (`tsc -b`) builds both programs, so the whole of `src/` — application code and
-colocated suites alike — plus `vite.config.ts` and the `proxyOptions.ts` it imports are
-type-checked.
+`tsc -b` builds both programs, so the whole of `src/` — application code and colocated suites
+alike — plus `vite.config.ts` and the `proxyOptions.ts` it imports are type-checked.
 
-> **`vitest.config.ts` is not part of either program.** The tooling program's `include` names
-> `vite.config.ts` only, and all three `tsconfig.*.json` files are frozen here, so `tsc -b` never
-> reads the runner's own configuration. ESLint does (`eslint .` covers `**/*.{ts,tsx}` at the package
-> root), and a mistake in it fails the very next `yarn test` at config load — but do not expect
-> `yarn typecheck` to catch one.
+**`vitest.config.ts` is not part of either program, and is type-checked separately.** The tooling
+program's `include` names `vite.config.ts` only, and all three `tsconfig.*.json` files are frozen in
+this change set, so `tsc -b` alone never reads the runner's own configuration — a type error in the
+file that owns the coverage gate would compile clean and be discovered only when `yarn test` next
+failed at config load. `yarn typecheck` therefore runs a second, file-scoped compilation after
+`tsc -b`:
+
+```bash
+tsc --noEmit --strict --target ES2023 --lib ES2023 --module ESNext --moduleResolution bundler \
+    --types node --skipLibCheck --verbatimModuleSyntax --moduleDetection force \
+    --noUnusedLocals --noUnusedParameters --erasableSyntaxOnly \
+    --noFallthroughCasesInSwitch --noUncheckedSideEffectImports vitest.config.ts
+```
+
+Passing a file on the command line makes `tsc` ignore every `tsconfig.json`, so each option has to
+be named explicitly. **Those flags are a copy of `tsconfig.node.json`'s `compilerOptions`** — the
+runner config is tooling code that runs under Node, so it is checked under exactly the settings the
+other tooling file is checked under. Keep the two in step: if `tsconfig.node.json` ever changes, the
+honest fix is to move `vitest.config.ts` into its `include` and delete this script.
 
 ### What that means if you are writing a test
 
@@ -502,27 +518,31 @@ above rather than fixed in place:
 | --- | --- |
 | `.gitignore` | Does not list `coverage`, so a coverage run leaves an untracked directory — [delete it](#coverage-gate) instead of ignoring it. |
 | `eslint.config.js` | Does not ignore `coverage` either, so `eslint .` after a coverage run reports [3 warnings from generated files](#coverage-gate). |
-| `tsconfig.node.json` | Includes `vite.config.ts` only, so [`vitest.config.ts` is not type-checked](#typescript-project-layout) by `tsc -b`. |
+| `tsconfig.node.json` | Includes `vite.config.ts` only, so `tsc -b` does not see `vitest.config.ts`. The gate is completed by the [separate file-scoped compilation](#typescript-project-layout) `yarn typecheck` runs afterwards, rather than by editing this file. |
 
 ### What this work did change
 
-Sixteen files under this workspace, plus one additive backend test module. The source edits are
-small and each has a comment at its site explaining itself:
+Twenty-five files under this workspace — sixteen of source, configuration and documentation plus the
+nine test suites — and one additive backend test module. The source edits are small and each has a
+comment at its site explaining itself:
 
 | File | The change |
 | --- | --- |
-| `package.json` | Three scripts (`test`, `test:coverage`, `typecheck`), seven exactly-pinned test dependencies, and the [`resolutions` override](#the-resolutions-override--do-not-remove-it). |
+| `package.json` | Four scripts (`test`, `test:coverage`, `typecheck`, `typecheck:vitest-config`), seven exactly-pinned test dependencies, and the [`resolutions` override](#the-resolutions-override--do-not-remove-it). |
 | `yarn.lock` | Regenerated by the install that added those seven packages. It is committed deliberately: `yarn install --frozen-lockfile` is the documented install command, and it cannot resolve the new dependencies from a lockfile that predates them. |
 | `proxyOptions.ts` | Two lines: an `import type` for the Node HTTP request type, and the parameter annotation that removes the one implicit-`any` error in the package. |
 | `vitest.config.ts`, `src/test/setup.ts`, `src/test/factories.ts` | New — the runner configuration, the Desk-runtime harness and the fixtures. |
-| `BankRecErrorDialog.tsx` | New — the dismissible dialog, composed from the existing `AlertDialog` and `ErrorBanner`. |
-| `bankRecAtoms.ts` | Two plain in-memory atoms appended to the sixteen already there. |
-| `utils.ts` | The reconcile rejection handler (dialog + fail-closed selection clear + revalidation), and `useSelectedBankAccountCurrency()`. |
-| `MatchAndReconcile.tsx` | Three sites: the dialog mount, the currency advisory, the already-reconciled guard on the confirm control. |
-| `CSV/StatementDetails.tsx` | The import rejection callback now *takes* the error, records the per-file failure and opens the dialog. The call shape, the success path and the realtime subscription are byte-identical to before. |
-| `pages/BankStatementImporter.tsx` | The third per-file badge state, and the dialog mount. |
+| `BankRecErrorDialog.tsx` | New — the dismissible dialog, composed from the existing `AlertDialog` and `ErrorBanner`, with server markup reduced to an element/attribute allow-list before it is rendered. |
+| `bankRecAtoms.ts` | Three plain in-memory atoms appended to the sixteen already there: the dialog payload, the per-log failure markers, and the reconcile single-flight guard — plus the account-and-file map behind pre-log import failures. |
+| `src/lib/frappe.ts` | The server-message parser made **total**: a malformed `_server_messages` can no longer throw out of it and abort the caller's error path, and an entry with no readable message no longer suppresses the fallback chain. Every `ErrorBanner` in the SPA reads through it. |
+| `utils.ts` | The reconcile rejection handler (dialog + fail-closed selection clear + revalidation), the single-flight guard, the authoritative-currency rehydration, and `useSelectedBankAccountCurrency()`. |
+| `MatchAndReconcile.tsx` | Four sites: the dialog mount, the currency advisory, the already-reconciled guard on the confirm control, and the shared in-flight guard on every candidate row. |
+| `CSV/StatementDetails.tsx` | The import outcome now requires a `Completed` doc from the server; the rejection callback *takes* the error, records the per-file failure and opens the dialog; the imported range's caches are evicted and the rule evaluator re-triggered before the hand-off to review; progress renders as a percentage. |
+| `BankStatementImporter/import_utils.ts` | One removal: the top-level `currency` that `get_statement_details` never returns. It is why `data.currency` type-checked while resolving to `undefined`, and the compiler is now what guarantees no such read exists. |
+| `pages/BankStatementImporter.tsx` | The single-flight upload chain, server-owned log identity with a private-file relink, pre-log failure rows, the third per-file badge state with `Completed` outranking a stale marker, the statement's own currency on the closing balance, and the dialog mount. |
+| `pages/ViewBankStatementImportLog.tsx` | Three lines reordered: `loading → error → no data`. The no-data guard ran first, and `useFrappeGetCall` reports no data on a *failed* read too — so every refusal rendered a blank page with no message and no way back. |
 | `README.md` | This file, replacing the stock Vite scaffold text. |
-| Eight `*.test.{ts,tsx}` files | The suites listed under [Testing](#suites). |
+| Nine `*.test.{ts,tsx}` files | The suites listed under [Testing](#suites). |
 
 The same care as the frozen list applies to `vitest.config.ts`'s independence from
 `vite.config.ts` and to the `resolutions` field: both look like tidy-up candidates and both are

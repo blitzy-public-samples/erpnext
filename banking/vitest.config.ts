@@ -22,6 +22,9 @@ const COVERED_UNITS = [
 	'src/components/features/BankStatementImporter/CSV/StatementDetails.tsx',
 	// The importer surface: upload chain, per-file failure indicator, import log list.
 	'src/pages/BankStatementImporter.tsx',
+	// The import-log detail route, whose render-branch order decides whether FM2 surfaces the
+	// backend's refusal or a blank page.
+	'src/pages/ViewBankStatementImportLog.tsx',
 	// The shared helpers those surfaces resolve errors, companies and currencies through.
 	'src/lib/frappe.ts',
 	'src/lib/company.ts',
@@ -83,8 +86,9 @@ export default defineConfig({
 			 *
 			 * Every entry below is a unit this work created or edited: the dismissible error dialog, the
 			 * reconciliation API-client layer and its state store, the workbench, the statement import
-			 * step, the importer surface, and the three shared helpers those surfaces resolve errors,
-			 * companies and currencies through. The remaining ~107 modules of the SPA - the 500-1200
+			 * step, the importer surface, the import-log detail route, and the three shared helpers those
+			 * surfaces resolve errors, companies and currencies through. The remaining ~106 modules of
+			 * the SPA - the 500-1200
 			 * line modal bodies, the PDF table editor, the 43 design-system primitives and the other
 			 * pre-existing pages - are untouched by this work, carry no suite of their own, and are
 			 * therefore neither measured nor gated here.

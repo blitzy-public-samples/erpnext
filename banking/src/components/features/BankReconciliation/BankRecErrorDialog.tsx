@@ -8,10 +8,318 @@ import {
 	AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import ErrorBanner from "@/components/ui/error-banner"
+import type { FrappeError } from "frappe-react-sdk"
 import { useAtom } from "jotai"
-import { useEffect, useRef } from "react"
+import { useEffect, useMemo, useRef } from "react"
 import { bankRecErrorDialogAtom } from "./bankRecAtoms"
+import { getErrorMessages } from "@/lib/frappe"
 import _ from "@/lib/translate"
+
+/* ================================================================================================
+ * SERVER-MARKUP SANITISATION (CWE-79 / CWE-451)
+ *
+ * `_server_messages` is HTML, and the shared renderer this dialog composes puts it on the page as
+ * REAL DOM: `ErrorBanner` hands each parsed message to `ui/markdown.tsx`, which runs `rehypeRaw`
+ * with no sanitiser after it. Anything that reaches a server error message - a party name, a
+ * document field interpolated into a validation string - therefore reaches this dialog as markup:
+ * `<script>`, an `<img src>` pointing at a host of the author's choosing, an `on*` handler, or a
+ * single `class` attribute, which in a codebase whose Tailwind utilities are already compiled into
+ * the shipped stylesheet is enough to paint an opaque full-viewport overlay over the very dialog
+ * reporting the failure.
+ *
+ * The sanitiser lives HERE, at this dialog's own boundary, rather than in the shared renderer. That
+ * renderer is one of the 43 design-system primitives the Agent Action Plan freezes as reference-only
+ * (AAP section 0.8.1.6, "must not appear in the diff"), so this new consumer is where the guard can
+ * legitimately be placed. The consequence worth stating plainly: this closes the vector for the
+ * surface FM1 introduced, and the pre-existing inline `ErrorBanner` call sites keep the shared
+ * renderer's baseline behaviour.
+ *
+ * The result is handed to `ErrorBanner` as a re-encoded `_server_messages` envelope, so the parser,
+ * the severity rule, the heading rule and the markdown rendering all remain the single shared
+ * implementation - only the CONTENT is filtered. Nothing is paraphrased: text is preserved
+ * character for character, and only markup is removed.
+ * ============================================================================================== */
+
+/**
+ * Elements this dialog is allowed to emit. Covers everything Frappe's own message helpers produce -
+ * `frappe.bold()` emits `<b>`, `get_link_to_form()` emits `<a>`, multi-line throws use `<br>`, and
+ * validation summaries use lists and tables.
+ *
+ * `img` is deliberately absent, and dropped rather than unwrapped: no Frappe message legitimately
+ * carries one, while permitting it would let server-controlled text trigger an outbound request to a
+ * host of its choosing the moment this dialog opens. `input` is absent for the same reason - a form
+ * control rendered from text this dialog does not control is a credential-harvesting surface.
+ */
+const ALLOWED_ELEMENTS = new Set([
+	'a', 'b', 'blockquote', 'br', 'code', 'del', 'div', 'em', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+	'hr', 'i', 'li', 'ol', 'p', 'pre', 's', 'section', 'small', 'span', 'strong',
+	'sub', 'sup', 'table', 'tbody', 'td', 'th', 'thead', 'tr', 'u', 'ul'
+])
+
+/**
+ * Disallowed elements whose CHILDREN go with them, because the content is script, styling or
+ * embedded-document data rather than text a reader should see - or, for media and form controls,
+ * because the element IS the payload and has no text to preserve. Every OTHER disallowed element is
+ * unwrapped instead, so no legitimate text is ever lost.
+ */
+const DROPPED_SUBTREES = new Set([
+	'applet', 'area', 'audio', 'base', 'button', 'canvas', 'dialog', 'embed', 'form', 'frame',
+	'frameset', 'iframe', 'img', 'input', 'link', 'map', 'marquee', 'math', 'meta', 'noscript',
+	'object', 'option', 'portal', 'script', 'select', 'slot', 'source', 'style', 'svg',
+	'template', 'textarea', 'title', 'track', 'video'
+])
+
+/**
+ * Attributes permitted on any allowed element. Note the absence of `style`, of every `on*` handler,
+ * and - deliberately - of `class` and `id`.
+ *
+ * `class` and `id` are excluded for CWE-451 (UI redress), not tidiness: this application's Tailwind
+ * utilities are compiled into the shipped stylesheet, so one server-controlled `class` is enough to
+ * position arbitrary text anywhere or cover the dialog entirely, and a duplicated `id` silently
+ * steals the target of an existing `aria-describedby` / `aria-labelledby` and rewrites what
+ * assistive technology announces for a real control.
+ */
+const ALLOWED_GLOBAL_ATTRIBUTES = new Set(['align', 'dir', 'lang', 'title'])
+
+/** Additional attributes permitted only on specific elements. DOM attribute names are lower-case. */
+const ALLOWED_ELEMENT_ATTRIBUTES: Record<string, Set<string>> = {
+	a: new Set(['href']),
+	ol: new Set(['start']),
+	td: new Set(['colspan', 'rowspan']),
+	th: new Set(['colspan', 'rowspan', 'scope'])
+}
+
+/** Attributes carrying a URL, which is additionally restricted by {@link isSameOriginUrl}. */
+const URL_ATTRIBUTES = new Set(['href', 'src'])
+
+/** Any leading `scheme:`, matched only once whitespace and control characters are gone. */
+const URL_SCHEME = /^[a-z][a-z0-9+.-]*:/i
+
+/**
+ * A URL survives only when it points back at this application: an in-page fragment, a root-relative
+ * path such as Frappe's own `/app/bank-transaction/…` document links, or a plain relative path.
+ *
+ * Whitespace and control characters are stripped FIRST, because browsers ignore them inside a scheme
+ * and `java\nscript:` would otherwise slip past the scheme test.
+ *
+ * The survivor is then CANONICALISED with the platform URL parser and its resolved origin required
+ * to equal this document's, so the predicate asks the same question the browser answers when the
+ * link is clicked. Character comparison alone is not enough: WHATWG parsing folds `\` into `/`
+ * inside an http(s) URL, so `\\host/path`, `/\host/path` and `\/host/path` are network-path
+ * references resolving to another origin while carrying neither a scheme nor a leading `//`. A
+ * reference the parser cannot resolve at all is refused HERE rather than allowed to throw out of the
+ * sanitiser and take down the dialog that is reporting the failure.
+ *
+ * Three syntactic refusals are kept ON TOP of the origin check because each is STRICTER than it:
+ * a backslash, because the destination the reader sees and the one the browser computes disagree;
+ * the scheme-relative `//host/path` form, which reads as off-site whoever it names; and any explicit
+ * scheme, which is what keeps `javascript:` and `data:` out even in a document whose own origin is
+ * opaque - there `location.origin` is the string `"null"` and so is a `javascript:` URL's origin.
+ */
+const isSameOriginUrl = (value: string): boolean => {
+	// eslint-disable-next-line no-control-regex
+	const normalized = value.replace(/[\u0000-\u0020]/g, '')
+	if (normalized.length === 0) return false
+
+	try {
+		if (new URL(normalized, window.location.href).origin !== window.location.origin) return false
+	} catch {
+		// Unparseable, so it cannot be shown to point back at this application.
+		return false
+	}
+
+	if (normalized.includes('\\')) return false
+	if (normalized.startsWith('//')) return false
+	return !URL_SCHEME.test(normalized)
+}
+
+/**
+ * Rebuilds one element's attributes from the allow-lists above. Removing rather than filtering into
+ * a copy is what makes this an allow-list: `style`, every `on*`, `srcset`, `formaction`, `class` and
+ * `id` are simply never named, so they never survive.
+ */
+const sanitizeAttributes = (element: Element) => {
+	const tagName = element.tagName.toLowerCase()
+	const allowedForElement = ALLOWED_ELEMENT_ATTRIBUTES[tagName]
+
+	for (const attribute of Array.from(element.attributes)) {
+		const name = attribute.name.toLowerCase()
+
+		if (!ALLOWED_GLOBAL_ATTRIBUTES.has(name) && !allowedForElement?.has(name)) {
+			element.removeAttribute(attribute.name)
+			continue
+		}
+
+		if (URL_ATTRIBUTES.has(name) && !isSameOriginUrl(attribute.value)) {
+			element.removeAttribute(attribute.name)
+		}
+	}
+
+	// A surviving link is same-origin by construction and `target` is not on its allow-list, so it
+	// always opens in this tab. `rel` is stamped anyway: it costs nothing and keeps the guarantee
+	// local to this function rather than resting on the allow-list above.
+	if (tagName === 'a' && element.hasAttribute('href')) {
+		element.setAttribute('rel', 'noreferrer noopener')
+	}
+}
+
+/** Replaces an element with its own children, so the text survives and the wrapper does not. */
+const unwrap = (element: Element) => {
+	element.replaceWith(...Array.from(element.childNodes))
+}
+
+/**
+ * Collapses BLANK lines, which matter for a reason that is not obvious: the sanitised markup is
+ * handed to the renderer as a single HTML BLOCK (see {@link sanitizeServerMarkup}), and a CommonMark
+ * HTML block ENDS at the first blank line. A blank line inside a server message would therefore
+ * close the block early and hand the remainder back to the markdown parser - the one thing the
+ * wrapper exists to prevent. Frappe writes line breaks as `<br>`, which is preserved untouched, so
+ * this costs no real formatting.
+ */
+const collapseBlankLines = (value: string): string => value.replace(/(\r?\n)(?:[ \t]*\r?\n)+/g, '$1')
+
+/** Depth-first sanitisation of a parsed fragment, in place. */
+const sanitizeChildNodes = (parent: Node) => {
+	for (const child of Array.from(parent.childNodes)) {
+		if (child.nodeType === Node.TEXT_NODE) {
+			child.textContent = collapseBlankLines(child.textContent ?? '')
+			continue
+		}
+
+		if (child.nodeType !== Node.ELEMENT_NODE) {
+			// Comments, CDATA and processing instructions carry nothing renderable.
+			child.parentNode?.removeChild(child)
+			continue
+		}
+
+		const element = child as Element
+		const tagName = element.tagName.toLowerCase()
+
+		if (DROPPED_SUBTREES.has(tagName)) {
+			element.remove()
+			continue
+		}
+
+		sanitizeChildNodes(element)
+
+		if (!ALLOWED_ELEMENTS.has(tagName)) {
+			// Unknown but harmless tag: keep the text, drop the wrapper.
+			unwrap(element)
+			continue
+		}
+
+		sanitizeAttributes(element)
+
+		// An anchor whose destination did not survive `isSameOriginUrl` is unwrapped rather than
+		// emitted href-less. The reader still sees exactly what the server wrote, including the URL
+		// if it was written out, while no anchor remains to look like something this application is
+		// offering to navigate to.
+		if (tagName === 'a' && !element.hasAttribute('href')) {
+			unwrap(element)
+		}
+	}
+}
+
+/**
+ * Filters one server message down to markup this dialog is prepared to render, and returns it
+ * wrapped in a single `<div>`.
+ *
+ * TWO mechanisms, and both are load-bearing:
+ *
+ * 1. The ALLOW-LIST walk above, applied to the message parsed as an inert document. `DOMParser`
+ *    documents execute nothing and fetch nothing, so parsing is safe even before filtering, and the
+ *    walk is what guarantees only allow-listed elements and attributes are re-serialised.
+ *
+ * 2. The `<div>` WRAPPER, which suppresses markdown interpretation entirely. Without it the walk
+ *    would still leave a hole, because the sanitiser necessarily runs BEFORE the markdown parser
+ *    the shared renderer owns: `![x](http://elsewhere/x.png)` is not HTML, so no HTML filter can
+ *    see it, yet remark turns it into an `<img>` with an off-origin `src`, and a GFM autolink
+ *    literal turns bare text into an anchor. A line beginning with `<div` is a CommonMark HTML
+ *    block, which remark passes through VERBATIM to `rehypeRaw` with no markdown parsing inside it -
+ *    so after this wrap the only markup that can reach the DOM is markup this function emitted.
+ *    `div` is itself allow-listed, and `AlertDescription` is a grid whose children are laid out
+ *    identically whether they are `<div>` or `<p>`, so the wrapper is invisible.
+ */
+const sanitizeServerMessage = (markup: string): { markup: string, text: string } => {
+	const parsed = new DOMParser().parseFromString(markup, 'text/html')
+	sanitizeChildNodes(parsed.body)
+	return { markup: `<div>${parsed.body.innerHTML}</div>`, text: parsed.body.textContent ?? '' }
+}
+
+/**
+ * The readable text of a server-supplied string, for the places that render it as a plain React
+ * child rather than as markup - the banner heading, today.
+ *
+ * It goes through the SAME walk rather than through a bare `textContent`, because `textContent`
+ * includes the source of a `<script>` element: a title of
+ * `Over-<script>window.__pwned=true</script>allocation` would otherwise be shown to the reviewer as
+ * `Over-window.__pwned=trueallocation`. The walk drops that subtree with its contents, so only text
+ * a reader was meant to see survives.
+ */
+const sanitizeToText = (value: string): string => sanitizeServerMessage(value).text
+
+/** Encodes messages the way Frappe transmits them: a JSON array of JSON strings. */
+const encodeServerMessages = (messages: { message: string, title?: string, indicator?: string }[]): string =>
+	JSON.stringify(messages.map((message) => JSON.stringify(message)))
+
+/**
+ * The rejection to render: the same object the atom holds, with every message body filtered through
+ * {@link sanitizeServerMarkup} and re-encoded into a `_server_messages` envelope.
+ *
+ * `title` is sanitised to TEXT rather than markup because `AlertTitle` renders it as a plain React
+ * child, so markup there would be shown literally rather than executed - stripping tags is what
+ * keeps the heading readable.
+ *
+ * `_error_message`, `exception` and `exc` are cleared on the object handed onward. They are not
+ * discarded information: `getErrorMessages` has already folded them into the message list being
+ * re-encoded here, and leaving them in place would make the shared parser append `_error_message` a
+ * SECOND time. Clearing `exc` additionally keeps the server traceback out of the rendered tree.
+ */
+const useSanitizedError = (error: FrappeError | null): FrappeError | null => useMemo(() => {
+	if (!error) return null
+
+	const messages = getErrorMessages(error)
+		.map((message) => ({
+			sanitized: sanitizeServerMessage(message.message ?? ''),
+			title: message.title === undefined ? undefined : sanitizeToText(message.title),
+			indicator: message.indicator
+		}))
+		/*
+		 * An entry with no READABLE text is dropped, and the test is the text rather than the markup
+		 * because the two differ: a rejection whose only content was an `<img>` or an empty `message`
+		 * survives sanitisation as a non-empty `<div></div>` while saying nothing at all. Dropping it
+		 * here is what lets the honest fallback below run instead of opening a blank dialog.
+		 */
+		.filter((message) => message.sanitized.text.trim().length > 0)
+		.map((message) => ({
+			message: message.sanitized.markup,
+			title: message.title,
+			indicator: message.indicator
+		}))
+
+	// `getErrorMessages` is total and always resolves at least one entry for a non-null error, but a
+	// transport failure or an envelope carrying no readable text anywhere leaves nothing after the
+	// filter above - and a dialog that opens saying nothing is worse than one that admits it has no
+	// detail. The reviewer still gets the chrome, the heading and the Dismiss control.
+	const resolved = messages.length > 0
+		? messages
+		: [{
+			message: sanitizeServerMessage(_("No further details were returned.")).markup,
+			title: undefined,
+			indicator: 'red'
+		}]
+
+	const sanitized: FrappeError = {
+		...error,
+		exception: '',
+		exc: undefined,
+		_server_messages: encodeServerMessages(resolved)
+	}
+
+	delete (sanitized as unknown as Record<string, unknown>)._error_message
+
+	return sanitized
+}, [error])
 
 /**
  * Tab-reachable controls a restored focus target may legitimately be. The `:not([disabled])`
@@ -40,17 +348,19 @@ const canTakeFocus = (element: HTMLElement | null): element is HTMLElement =>
  * surfaces. Takes no props: one shared atom drives every mount site across both route trees, so
  * the two surfaces can never show conflicting error state.
  *
- * The error itself is rendered by the SHARED `ErrorBanner`, passed the atom's value COMPLETELY
- * UNMODIFIED and with `overrideHeading` left unset, so the parser (`getErrorMessages`), the
- * severity rule (`indicator === 'yellow'` -> amber, else red), the heading rule and the message
- * rendering are the same single implementation the ~20 inline banner call sites use. Composing
- * rather than restating is what guarantees this dialog and an inline banner can never disagree
- * about the same rejection, and it means the server's own words - for example
- * `"Bank Transaction {0} is already fully reconciled"` - reach the user verbatim.
+ * The error itself is rendered by the SHARED `ErrorBanner`, with `overrideHeading` left unset, so
+ * the parser (`getErrorMessages`), the severity rule (`indicator === 'yellow'` -> amber, else red),
+ * the heading rule and the message rendering are the same single implementation the ~20 inline
+ * banner call sites use. Composing rather than restating is what guarantees this dialog and an
+ * inline banner can never disagree about the same rejection, and it means the server's own words -
+ * for example `"Bank Transaction {0} is already fully reconciled"` - reach the user verbatim.
  *
- * Rendering is likewise the shared path: `ErrorBanner` hands each parsed message to
- * `ui/markdown.tsx`, exactly as it does at every inline call site, so this dialog introduces no
- * rendering behaviour of its own and inherits whatever that component does.
+ * The one thing that is NOT passed through untouched is the MARKUP. `ErrorBanner` hands each parsed
+ * message to `ui/markdown.tsx`, which runs `rehypeRaw` with no sanitiser after it, so a server
+ * message reaches the page as real DOM. {@link useSanitizedError} therefore filters every message
+ * body through an element/attribute allow-list with a same-origin URL boundary first. TEXT is
+ * preserved character for character - nothing is paraphrased, summarised or truncated - and only
+ * markup is removed.
  *
  * Dismissing clears the dialog atom and nothing else - it issues no request, triggers no
  * revalidation and raises no notification, because the calling hook owns revalidation. Atomicity
@@ -59,6 +369,7 @@ const canTakeFocus = (element: HTMLElement | null): element is HTMLElement =>
  */
 const BankRecErrorDialog = () => {
 	const [error, setError] = useAtom(bankRecErrorDialogAtom)
+	const sanitizedError = useSanitizedError(error)
 	const dismissRef = useRef<HTMLButtonElement>(null)
 	// The most recent control to hold focus outside this dialog, then the control that was focused
 	// when the failure surfaced and the region it belonged to. The first is tracked continuously,
@@ -199,13 +510,14 @@ const BankRecErrorDialog = () => {
 						{_("Review the details below, then dismiss this message to continue. The server remains the authority on what was recorded.")}
 					</AlertDialogDescription>
 				</AlertDialogHeader>
-				{/* The SHARED banner, handed the server's envelope untouched; `overrideHeading` is
-					deliberately unset so the server's own title survives. `min-h-0` lets this grid item
-					shrink inside the `minmax(0,1fr)` track above - a grid item's automatic minimum size
-					would otherwise still be its content - and `overflow-y-auto` gives the surplus
-					somewhere to go, so only the message scrolls and Dismiss always stays on screen. */}
+				{/* The SHARED banner, handed the server's envelope with its TEXT intact and only its
+					MARKUP filtered (see `useSanitizedError`); `overrideHeading` is deliberately unset so
+					the server's own title survives. `min-h-0` lets this grid item shrink inside the
+					`minmax(0,1fr)` track above - a grid item's automatic minimum size would otherwise
+					still be its content - and `overflow-y-auto` gives the surplus somewhere to go, so
+					only the message scrolls and Dismiss always stays on screen. */}
 				<div className="min-h-0 overflow-y-auto">
-					<ErrorBanner error={error} />
+					<ErrorBanner error={sanitizedError} />
 				</div>
 				<AlertDialogFooter>
 					<AlertDialogAction ref={dismissRef} onClick={dismiss}>

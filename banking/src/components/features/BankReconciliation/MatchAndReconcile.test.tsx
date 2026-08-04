@@ -94,6 +94,7 @@ import {
 	bankRecAmountFilter,
 	bankRecDateAtom,
 	bankRecErrorDialogAtom,
+	bankRecReconcileInFlightAtom,
 	bankRecSelectedTransactionAtom,
 	selectedBankAccountAtom
 } from './bankRecAtoms'
@@ -1502,6 +1503,206 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			expect(screen.queryByRole('button', { name: 'Reconcile' })).not.toBeInTheDocument()
 			expect(frappePostCall).toHaveBeenCalledTimes(1)
 		})
+
+		/*
+		 * ══════════════════════════════════════════════════════════════════════════════════════════
+		 * AT MOST ONE POST IS EVER OPEN  (FM1 / TC4 / TC6)
+		 *
+		 * The gap these tests close could not be seen by a single-candidate test, which is why one had
+		 * to be written that renders TWO. `useReconcileTransaction` exposes `loading` from
+		 * `useFrappePostCall`, and EVERY candidate row instantiates that hook for itself - so `loading`
+		 * describes one row's own request and nothing about any sibling's. A control gated on `loading`
+		 * alone therefore stayed live while another candidate's post was unanswered, and a reviewer
+		 * could dispatch a second `reconcile_vouchers` for the SAME transaction. The server allocates
+		 * against whatever the transaction still has unallocated when each request arrives, so the
+		 * outcome would have depended on interleaving rather than on what was chosen.
+		 *
+		 * The first request is held PENDING throughout - a promise that never settles - because the
+		 * whole question is what the client permits while the server has not yet answered.
+		 * ══════════════════════════════════════════════════════════════════════════════════════════ */
+		describe('while one post is unanswered', () => {
+			const alternate = makeAlternateLinkedPayment()
+			const twoCandidates = sortLinkedPaymentsAsEndpoint([alternate, suggested])
+
+			/** A `reconcile_vouchers` call that never settles, so the in-flight window stays open. */
+			const holdTheFirstPost = () => {
+				frappePostCall.mockReturnValue(new Promise(() => { /* deliberately never settles */ }))
+			}
+
+			const renderTwoCandidates = async () => {
+				const rendered = renderWorkbench({
+					transactions: [DEPOSIT_ROW],
+					selected: [DEPOSIT_ROW],
+					vouchers: twoCandidates
+				})
+
+				await waitFor(() => {
+					expect(screen.getByRole('link', { name: alternate.name })).toBeInTheDocument()
+				})
+				expect(screen.getByRole('link', { name: suggested.name })).toBeInTheDocument()
+
+				return rendered
+			}
+
+			it('renders both candidates with their own independent controls to begin with', async () => {
+				// The premise, asserted rather than assumed: without two live controls there is nothing
+				// for the guard below to be tested against.
+				await renderTwoCandidates()
+
+				expect(confirmControlFor(suggested)).toBeEnabled()
+				expect(confirmControlFor(alternate)).toBeEnabled()
+			})
+
+			it('disables the OTHER candidate the moment the first post is dispatched', async () => {
+				const user = userEvent.setup()
+				holdTheFirstPost()
+
+				await renderTwoCandidates()
+				await user.click(confirmControlFor(suggested))
+
+				await waitFor(() => {
+					expect(confirmControlFor(alternate)).toBeDisabled()
+				})
+				expect(frappePostCall).toHaveBeenCalledTimes(1)
+			})
+
+			it('disables the initiating control as well, so neither candidate can post again', async () => {
+				const user = userEvent.setup()
+				holdTheFirstPost()
+
+				await renderTwoCandidates()
+				await user.click(confirmControlFor(suggested))
+
+				await waitFor(() => {
+					expect(confirmControlFor(alternate)).toBeDisabled()
+				})
+				// EVERY candidate closes, the initiator included. The shared flag is what achieves that
+				// here: under the real SDK the initiator would also be held by its own `loading`, but
+				// this harness answers `useFrappePostCall` with one fixed object for every instance, so
+				// `loading` is uniform and cannot distinguish the rows - which is precisely why the
+				// pre-existing `loading`-only gate could not close a sibling in production.
+				expect(confirmControlFor(suggested)).toBeDisabled()
+			})
+
+			it('dispatches nothing when the other candidate is clicked anyway', async () => {
+				holdTheFirstPost()
+
+				await renderTwoCandidates()
+
+				const first = confirmControlFor(suggested)
+				await act(async () => {
+					first.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+				})
+
+				const second = confirmControlFor(alternate)
+				expect(second).toBeDisabled()
+
+				// `fireEvent` rather than `user-event`: a synthetic click bypasses the pointer-events
+				// check a real one performs, so this asserts the GUARD refuses the request rather than
+				// merely that the browser would not deliver the click.
+				await act(async () => {
+					second.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+				})
+
+				expect(frappePostCall).toHaveBeenCalledTimes(1)
+				expect(String(capturedReconcileRequest().vouchers)).toContain(suggested.name)
+				expect(String(capturedReconcileRequest().vouchers)).not.toContain(alternate.name)
+			})
+
+			/*
+			 * The SYNCHRONOUS half of the guard, and the reason it is read from the jotai store rather
+			 * than from a subscribed value. Both clicks are dispatched inside ONE `act` block, so React
+			 * batches them and the handler runs twice with NO re-render in between: a guard derived from
+			 * rendered state would see `null` both times and post twice.
+			 */
+			it('dispatches once for two clicks delivered in the same tick', async () => {
+				holdTheFirstPost()
+
+				await renderTwoCandidates()
+
+				const control = confirmControlFor(suggested)
+				await act(async () => {
+					control.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+					control.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+				})
+
+				expect(frappePostCall).toHaveBeenCalledTimes(1)
+			})
+
+			it('reopens every candidate once an ACCEPTED post has settled', async () => {
+				const user = userEvent.setup()
+				let acceptThePost!: () => void
+				frappePostCall.mockReturnValue(
+					new Promise((resolve) => {
+						acceptThePost = () => resolve(makeReconcileSuccessResponse({ unallocated_amount: 2500 }))
+					})
+				)
+
+				await renderTwoCandidates()
+				await user.click(confirmControlFor(suggested))
+
+				await waitFor(() => {
+					expect(confirmControlFor(alternate)).toBeDisabled()
+				})
+
+				await act(async () => {
+					acceptThePost()
+					await Promise.resolve()
+				})
+
+				// A PARTIAL allocation keeps the reviewer on this transaction, so the affordance has to
+				// come back - a guard released only on rejection, or not at all, would lock the reviewer
+				// out of the remaining allocation entirely.
+				await waitFor(() => {
+					expect(confirmControlFor(alternate)).toBeEnabled()
+				})
+			})
+
+			it('reopens the affordance after a REFUSED post, once the selection is restored', async () => {
+				const user = userEvent.setup()
+				let refuseThePost!: () => void
+				frappePostCall.mockReturnValue(
+					new Promise((_resolve, reject) => {
+						refuseThePost = () => reject(makeAlreadyReconciledError(DEPOSIT_ROW.name))
+					})
+				)
+
+				const { store } = await renderTwoCandidates()
+				await user.click(confirmControlFor(suggested))
+
+				await waitFor(() => {
+					expect(confirmControlFor(alternate)).toBeDisabled()
+				})
+
+				await act(async () => {
+					refuseThePost()
+					await Promise.resolve()
+				})
+
+				// FM3 empties the selection, which withdraws the voucher panel outright — so the guard's
+				// release is asserted on the SHARED FLAG rather than on a control that no longer exists.
+				// Leaving the flag set would permanently disable reconciliation for the rest of the
+				// session, which is why releasing on both outcomes is the contract.
+				await waitFor(() => {
+					expect(store.get(bankRecReconcileInFlightAtom)).toBeNull()
+				})
+				expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([])
+			})
+
+			it('records the transaction the open post belongs to, not merely that one is open', async () => {
+				const user = userEvent.setup()
+				holdTheFirstPost()
+
+				const { store } = await renderTwoCandidates()
+				expect(store.get(bankRecReconcileInFlightAtom)).toBeNull()
+
+				await user.click(confirmControlFor(suggested))
+
+				await waitFor(() => {
+					expect(store.get(bankRecReconcileInFlightAtom)).toBe(DEPOSIT_ROW.name)
+				})
+			})
+		})
 	})
 
 	describe('TC5 and FM3 - an already-reconciled transaction cannot be reconciled again', () => {
@@ -1511,9 +1712,18 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 		 * `unallocated_amount <= 0` - so setting only one would model a state the server can never
 		 * produce, and the guard would be tested against a fiction.
 		 *
-		 * Such rows do reach this surface: the "Bank Transactions" tab requests the unfiltered set,
-		 * bypassing the server-side filter that would otherwise exclude them, and a stored selection
-		 * can also outlive the reconciliation it was made before.
+		 * HOW SUCH A ROW REACHES THIS SURFACE, precisely. It does NOT arrive in this tab's list:
+		 * `useGetUnreconciledTransactions` calls `get_bank_transactions` WITHOUT `all_transactions`,
+		 * and the endpoint filters `unallocated_amount > 0` server-side, so a reconciled row is never
+		 * among the rows rendered here. The unfiltered set is requested by a DIFFERENT tab
+		 * (`BankTransactionList`), which renders no Reconcile control at all.
+		 *
+		 * It reaches this surface through the SELECTION, which is where the guard reads it from:
+		 * `bankRecSelectedTransactionAtom` holds a row captured earlier, and this tab's list
+		 * revalidates neither on focus nor when stale - so a selection made before a reconciliation
+		 * (performed here in another tab, in the Desk, or by a rule) outlives it. Every case below
+		 * therefore seeds the SELECTION with the settled row while the list answers with rows the
+		 * endpoint could really return.
 		 */
 		const reconciled = makeReconciledTransaction({ description: 'Already reconciled wire' })
 		const stillUnreconciled = makeUnreconciledTransaction({
@@ -1525,7 +1735,9 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 
 		it('disables the confirm control', async () => {
 			renderWorkbench({
-				transactions: [reconciled],
+				// The endpoint's own answer, which cannot contain the settled row.
+				transactions: [stillUnreconciled],
+				// ...while the persisted selection still names it.
 				selected: [reconciled],
 				vouchers: [makeSuggestedLinkedPayment(reconciled)]
 			})
@@ -1590,7 +1802,7 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			const user = userEvent.setup()
 
 			renderWorkbench({
-				transactions: [reconciled],
+				transactions: [stillUnreconciled],
 				selected: [reconciled],
 				vouchers: [makeSuggestedLinkedPayment(reconciled)]
 			})
@@ -1603,7 +1815,7 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 
 		it('keeps the reason discoverable, since a disabled control fires no events of its own', async () => {
 			renderWorkbench({
-				transactions: [reconciled],
+				transactions: [stillUnreconciled],
 				selected: [reconciled],
 				vouchers: [makeSuggestedLinkedPayment(reconciled)]
 			})
@@ -1631,16 +1843,33 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			expect(control.parentElement).not.toHaveAttribute('data-slot', 'tooltip-trigger')
 		})
 
-		it('still lists the reconciled transaction, exactly as the server reported it', async () => {
-			renderWorkbench({ transactions: [reconciled, stillUnreconciled] })
-
-			await waitFor(() => {
-				expect(transactionRow(reconciled)).toBeInTheDocument()
+		/*
+		 * The guard governs the ACTION, never the VISIBILITY, and this is asserted on rows the
+		 * endpoint can really return.
+		 *
+		 * It previously handed the workbench list a RECONCILED row and asserted that it rendered - a
+		 * premise this endpoint cannot satisfy, because `useGetUnreconciledTransactions` omits
+		 * `all_transactions` and the server filters `unallocated_amount > 0`. Passing an impossible
+		 * response made the test unfalsifiable in the direction that mattered: it would have gone on
+		 * passing if the client had started filtering by status itself, since the fixture guaranteed
+		 * a row the client would then have hidden. Rendering exactly what the endpoint returns is the
+		 * contract, so the fixture is now exactly what it returns.
+		 */
+		it('renders every row the endpoint returns, filtering none of them client-side', async () => {
+			const secondOpenRow = makeUnreconciledTransaction({
+				name: 'ACC-BTN-2024-05005',
+				description: 'Second open wire',
+				status: 'Unreconciled',
+				unallocated_amount: TEST_TRANSACTION_AMOUNT
 			})
 
-			// Nothing is hidden client-side. Which rows are returned is the endpoint's decision, and
-			// the guard governs the ACTION rather than the visibility.
-			expect(transactionRow(stillUnreconciled)).toBeInTheDocument()
+			renderWorkbench({ transactions: [stillUnreconciled, secondOpenRow] })
+
+			await waitFor(() => {
+				expect(transactionRow(stillUnreconciled)).toBeInTheDocument()
+			})
+
+			expect(transactionRow(secondOpenRow)).toBeInTheDocument()
 			expect(screen.getByText('2 results')).toBeInTheDocument()
 		})
 
@@ -1901,6 +2130,71 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			})
 
 			expect(currencyAdvisoryChip(transactionRow(mismatched))).toBeNull()
+		})
+
+		/*
+		 * ─── ONE AUTHORITATIVE CURRENCY, FOR COMPARING *AND* FOR FORMATTING ─────────────────────
+		 *
+		 * The advisory reading the server's answer is only half the requirement. The row also FORMATS
+		 * its amount, and that fell back to `selectedBank.account_currency` — the persisted snapshot —
+		 * while the comparison read the live response. Two sources for one fact means they can
+		 * disagree, and they did: a row could simultaneously be told "these currencies match" and be
+		 * rendered under a stale symbol.
+		 *
+		 * A transaction with NO `currency` of its own is what exposes the fallback, since a
+		 * transaction that carries one never reaches it.
+		 */
+		describe('the amount is formatted from the same authoritative value the advisory compares', () => {
+			const withoutOwnCurrency = makeUnreconciledTransaction({
+				name: 'ACC-BTN-2024-07001',
+				description: 'Wire with no currency of its own',
+				currency: undefined
+			})
+
+			it('formats from the CURRENT account currency, not the persisted snapshot', async () => {
+				renderWorkbench({
+					transactions: [withoutOwnCurrency],
+					accountCurrency: TEST_CURRENCY,
+					persistedAccountCurrency: TEST_ALTERNATE_CURRENCY
+				})
+
+				const row = await waitFor(() => transactionRow(withoutOwnCurrency))
+
+				// `TEST_CURRENCY` is INR and `TEST_ALTERNATE_CURRENCY` is USD, so the two format to
+				// different symbols and the assertion can tell the sources apart.
+				expect(row.textContent).toContain('₹')
+				expect(row.textContent).not.toContain('$')
+			})
+
+			it('rehydrates the persisted snapshot, so no OTHER screen is left on the stale value', async () => {
+				// The reason the refresh lives in `useGetBankAccounts` rather than in this component:
+				// every consumer of the selection is corrected at once, including the ones this suite
+				// does not render.
+				const { store } = renderWorkbench({
+					transactions: [withoutOwnCurrency],
+					accountCurrency: TEST_CURRENCY,
+					persistedAccountCurrency: TEST_ALTERNATE_CURRENCY
+				})
+
+				await waitFor(() => {
+					expect(store.get(selectedBankAccountAtom)?.account_currency).toBe(TEST_CURRENCY)
+				})
+			})
+
+			it('falls back to the persisted value only while the current one is unknown', async () => {
+				// A cold start: the list has not answered, so there is no authoritative value yet. A
+				// momentarily stale symbol beats no symbol, and the advisory still stays silent (proved
+				// by the loading case above).
+				renderWorkbench({
+					transactions: [withoutOwnCurrency],
+					bankListState: 'loading',
+					persistedAccountCurrency: TEST_ALTERNATE_CURRENCY
+				})
+
+				const row = await waitFor(() => transactionRow(withoutOwnCurrency))
+
+				expect(row.textContent).toContain('$')
+			})
 		})
 	})
 

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, renderHook } from '@testing-library/react'
+import { act, renderHook, waitFor } from '@testing-library/react'
 import { Provider, createStore } from 'jotai'
 import { createElement, type PropsWithChildren } from 'react'
 import Fuse from 'fuse.js'
@@ -8,6 +8,7 @@ import {
 	TEST_BANK,
 	TEST_ALTERNATE_CURRENCY,
 	TEST_BANK_ACCOUNT,
+	TEST_BANK_LEDGER_ACCOUNT,
 	TEST_COMPANY,
 	TEST_CURRENCY,
 	TEST_REFERENCE_NUMBER,
@@ -69,12 +70,14 @@ import {
 	bankRecDateAtom,
 	bankRecErrorDialogAtom,
 	bankRecMatchFilters,
+	bankRecReconcileInFlightAtom,
 	bankRecSearchText,
 	bankRecSelectedTransactionAtom,
 	bankRecTransactionTypeFilter,
 	bankRecUnreconcileModalAtom,
 	selectedBankAccountAtom,
-	type ActionLog
+	type ActionLog,
+	type SelectedBank
 } from './bankRecAtoms'
 import { selectedCompanyAtom } from '@/hooks/useCurrentCompany'
 
@@ -589,9 +592,11 @@ describe('the cache-key surface is closed at five families', () => {
 
 /*
  * `account_currency` is NOT a `Bank Account` field: the endpoint derives it per row by following
- * `Bank Account.account` to `Account.account_currency` after the query. That is why it is optional
- * here, and why the currency advisory treats its absence as "nothing to compare" rather than as a
- * mismatch.
+ * `Bank Account.account` to `Account.account_currency` after the query, in an unconditional loop
+ * (`bank_account.py:173-176`). So on an ENDPOINT row the key is always PRESENT and its value is
+ * NULLABLE - required-nullable, not optional - and the currency advisory treats a null as "nothing to
+ * compare" rather than as a mismatch. The persisted selection is the shape where the key genuinely can
+ * be absent, because a localStorage snapshot may predate it.
  */
 describe('useGetBankAccounts', () => {
 
@@ -630,15 +635,16 @@ describe('useGetBankAccounts', () => {
 		expect(result.current.error).toBeUndefined()
 	})
 
-	// A row whose GL account has no currency must come back as `undefined`, not as a default:
-	// inventing one here is what would let the advisory claim a mismatch that does not exist.
-	it('leaves the currency undefined when the endpoint could not derive one', () => {
+	// A row whose GL account has no currency arrives as a literal `null` - the endpoint attaches the
+	// key regardless - and must be passed through as such rather than defaulted: inventing a currency
+	// here is what would let the advisory claim a mismatch that does not exist.
+	it('passes through the literal null the endpoint sends when it could not derive a currency', () => {
 		const store = createSeededStore()
-		answerGetCall(BANK_ACCOUNT_GET_LIST, { message: [makeBankAccountListRow({ account_currency: undefined })] })
+		answerGetCall(BANK_ACCOUNT_GET_LIST, { message: [makeBankAccountListRow({ account_currency: null })] })
 
 		const { result } = renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
 
-		expect(result.current.banks[0].account_currency).toBeUndefined()
+		expect(result.current.banks[0].account_currency).toBeNull()
 	})
 
 	it('reports an empty list rather than undefined before any answer has arrived', () => {
@@ -691,6 +697,215 @@ describe('useGetBankAccounts', () => {
 		})
 
 		expect(result.current.banks.map((bank) => bank.name)).toEqual(['Card - TC'])
+	})
+
+	/*
+	 * ══════════════════════════════════════════════════════════════════════════════════════════════
+	 * REHYDRATION OF THE PERSISTED SELECTION
+	 *
+	 * The defect this closes is a LIFECYCLE one, and it cannot be seen by a test that seeds both
+	 * sources with the same value. `selectedBankAccountAtom` is `atomWithStorage` over localStorage
+	 * with `getOnInit: true`, and `BankPicker` deliberately leaves the stored row ALONE whenever the
+	 * account it names is still present in a response - it writes only when it has to CHOOSE an
+	 * account. So the stored row's fields were written once and then never refreshed for the life of
+	 * that account: repointing the bank account at a GL account in another currency, or editing
+	 * `Account.account_currency`, changed the server's answer and not the snapshot, and every consumer
+	 * reading the snapshot kept the old value indefinitely.
+	 *
+	 * Each test below seeds a snapshot that DISAGREES with the endpoint's answer, which is the only
+	 * arrangement that can tell an implementation which refreshes from one which does not.
+	 * ══════════════════════════════════════════════════════════════════════════════════════════════ */
+	describe('rehydrating the persisted selection from the endpoint', () => {
+
+		const storeWithStaleSelection = (overrides: Partial<SelectedBank> = {}) => {
+			const store = createStore()
+			store.set(selectedCompanyAtom, TEST_COMPANY)
+			store.set(selectedBankAccountAtom, makeSelectedBank({
+				account_currency: TEST_ALTERNATE_CURRENCY,
+				...overrides
+			}))
+			return store
+		}
+
+		it('refreshes the stored account currency from the authoritative row', async () => {
+			const store = storeWithStaleSelection()
+			answerGetCall(BANK_ACCOUNT_GET_LIST, {
+				message: [makeBankAccountListRow({ name: TEST_BANK_ACCOUNT, account_currency: TEST_CURRENCY })]
+			})
+
+			renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
+
+			await waitFor(() => {
+				expect(store.get(selectedBankAccountAtom)?.account_currency).toBe(TEST_CURRENCY)
+			})
+			expect(store.get(selectedBankAccountAtom)?.account_currency).not.toBe(TEST_ALTERNATE_CURRENCY)
+		})
+
+		it('refreshes every other projected field too, not only the currency', async () => {
+			const store = storeWithStaleSelection({ account_name: 'Renamed since', account: 'Old GL - TC' })
+			answerGetCall(BANK_ACCOUNT_GET_LIST, {
+				message: [makeBankAccountListRow({
+					name: TEST_BANK_ACCOUNT,
+					account_currency: TEST_CURRENCY,
+					account_name: 'Test Bank Current Account',
+					account: TEST_BANK_LEDGER_ACCOUNT
+				})]
+			})
+
+			renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
+
+			await waitFor(() => {
+				expect(store.get(selectedBankAccountAtom)?.account_name).toBe('Test Bank Current Account')
+			})
+			expect(store.get(selectedBankAccountAtom)?.account).toBe(TEST_BANK_LEDGER_ACCOUNT)
+		})
+
+		it('preserves the members the endpoint does NOT project', async () => {
+			// `integration_id` is on the persisted shape and is not projected by this endpoint, and the
+			// logo members are resolved client-side. Overwriting the row wholesale would erase all of
+			// them, so the refresh MERGES onto the snapshot rather than replacing it.
+			const store = storeWithStaleSelection({ integration_id: 'plaid-abc-123', logo: 'HDFC.svg' })
+			answerGetCall(BANK_ACCOUNT_GET_LIST, {
+				message: [makeBankAccountListRow({ name: TEST_BANK_ACCOUNT, account_currency: TEST_CURRENCY })]
+			})
+
+			renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
+
+			await waitFor(() => {
+				expect(store.get(selectedBankAccountAtom)?.account_currency).toBe(TEST_CURRENCY)
+			})
+			expect(store.get(selectedBankAccountAtom)?.integration_id).toBe('plaid-abc-123')
+			expect(store.get(selectedBankAccountAtom)?.logo).toBe('HDFC.svg')
+		})
+
+		it('propagates a literal null, so a currency that was REMOVED is not remembered', async () => {
+			const store = storeWithStaleSelection({ account_currency: TEST_CURRENCY })
+			answerGetCall(BANK_ACCOUNT_GET_LIST, {
+				message: [makeBankAccountListRow({ name: TEST_BANK_ACCOUNT, account_currency: null })]
+			})
+
+			renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
+
+			await waitFor(() => {
+				expect(store.get(selectedBankAccountAtom)?.account_currency).toBeNull()
+			})
+		})
+
+		it('CONVERGES — it writes once and then stops, however often it re-renders', async () => {
+			/*
+			 * The identity guard, and it is load-bearing rather than an optimisation. This hook is
+			 * rendered by several consumers at once and its effect runs on each of them, so a write
+			 * that did not first check for a difference would set a NEW object every time, re-render
+			 * every consumer, and run the effect again - an unbounded loop rather than a refresh.
+			 *
+			 * Exactly ONE write is expected here — the refresh itself — and what must not happen is a
+			 * second, which is what is asserted.
+			 */
+			const store = storeWithStaleSelection()
+			answerGetCall(BANK_ACCOUNT_GET_LIST, {
+				message: [makeBankAccountListRow({ name: TEST_BANK_ACCOUNT, account_currency: TEST_CURRENCY })]
+			})
+
+			const { rerender } = renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
+			await waitFor(() => {
+				expect(store.get(selectedBankAccountAtom)?.account_currency).toBe(TEST_CURRENCY)
+			})
+
+			const converged = store.get(selectedBankAccountAtom)
+
+			// Counting starts only once the refresh has landed, so what is measured is exclusively
+			// whether the effect keeps going — the loop, not the fix.
+			const writesAfterConvergence: (SelectedBank | null)[] = []
+			const unsubscribe = store.sub(selectedBankAccountAtom, () => {
+				writesAfterConvergence.push(store.get(selectedBankAccountAtom))
+			})
+
+			// Re-render repeatedly, and mount a SECOND consumer of the same hook against the same
+			// store — the production arrangement, and the one an unguarded write would loop on.
+			rerender()
+			rerender()
+			renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
+			await act(async () => {
+				await Promise.resolve()
+			})
+
+			// Nothing after the refresh CHANGES the value. `atomWithStorage` re-emits its own
+			// localStorage sync, so a notification is not by itself evidence of a rewrite — the
+			// content is. An unguarded write would produce a materially different object on every
+			// effect run instead.
+			for (const value of writesAfterConvergence) {
+				expect(value).toEqual(converged)
+			}
+
+			// ...and it has STOPPED, which is the anti-loop property proper: an unguarded write
+			// re-renders every consumer, which runs the effect again, which writes again, without
+			// bound. Two further flushes must add nothing.
+			const settled = writesAfterConvergence.length
+			await act(async () => { await Promise.resolve() })
+			await act(async () => { await Promise.resolve() })
+			expect(writesAfterConvergence).toHaveLength(settled)
+
+			expect(store.get(selectedBankAccountAtom)).toEqual(converged)
+			expect(store.get(selectedBankAccountAtom)?.account_currency).toBe(TEST_CURRENCY)
+
+			unsubscribe()
+		})
+
+		it('leaves the snapshot alone when the selected account is absent from the response', async () => {
+			// Absence is not evidence about the selected account - the response may be for another
+			// company, or the account may be newly disabled. Overwriting or clearing the snapshot here
+			// would discard the reviewer's selection on a payload that says nothing about it; that
+			// decision belongs to the bank picker, which owns choosing an account.
+			const store = storeWithStaleSelection()
+			answerGetCall(BANK_ACCOUNT_GET_LIST, {
+				message: [makeBankAccountListRow({ name: 'Other Bank - Test Company', account_currency: TEST_CURRENCY })]
+			})
+
+			renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
+			await waitFor(() => {
+				expect(store.get(selectedBankAccountAtom)?.name).toBe(TEST_BANK_ACCOUNT)
+			})
+
+			expect(store.get(selectedBankAccountAtom)?.account_currency).toBe(TEST_ALTERNATE_CURRENCY)
+		})
+
+		it('writes nothing at all when no account is selected', async () => {
+			const store = createStore()
+			store.set(selectedCompanyAtom, TEST_COMPANY)
+			answerGetCall(BANK_ACCOUNT_GET_LIST, { message: [makeBankAccountListRow()] })
+
+			renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
+			await waitFor(() => {
+				expect(store.get(selectedBankAccountAtom)).toBeNull()
+			})
+		})
+
+		it('writes nothing before the endpoint has answered', () => {
+			const store = storeWithStaleSelection()
+
+			renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
+
+			// An unanswered read is not an authority. Clearing or defaulting the snapshot here would
+			// blank the selection on every cold start.
+			expect(store.get(selectedBankAccountAtom)?.account_currency).toBe(TEST_ALTERNATE_CURRENCY)
+		})
+
+		it('makes the currency reader agree with the refreshed snapshot, so no consumer can disagree', async () => {
+			// The point of centralising the refresh here: a consumer reading the live value and a
+			// consumer reading the snapshot must arrive at the same answer.
+			const store = storeWithStaleSelection()
+			answerGetCall(BANK_ACCOUNT_GET_LIST, {
+				message: [makeBankAccountListRow({ name: TEST_BANK_ACCOUNT, account_currency: TEST_CURRENCY })]
+			})
+
+			const { result } = renderHook(() => useSelectedBankAccountCurrency(), { wrapper: withStore(store) })
+
+			await waitFor(() => {
+				expect(store.get(selectedBankAccountAtom)?.account_currency).toBe(TEST_CURRENCY)
+			})
+			expect(result.current).toBe(TEST_CURRENCY)
+			expect(result.current).toBe(store.get(selectedBankAccountAtom)?.account_currency)
+		})
 	})
 })
 
@@ -894,6 +1109,150 @@ describe('useReconcileTransaction — the accepted post (TC4)', () => {
 
 		expect(frappeSDKMock.useFrappePostCall).toHaveBeenCalledWith(RECONCILE_VOUCHERS)
 		expect(frappePostCall).toHaveBeenCalledTimes(1)
+	})
+
+	/*
+	 * ══════════════════════════════════════════════════════════════════════════════════════════════
+	 * THE SINGLE-FLIGHT GUARD, at the hook's own boundary
+	 *
+	 * `loading` is per HOOK INSTANCE, and every candidate voucher row instantiates the hook for
+	 * itself, so it can never be the guard: it tells a row about its own request and nothing about a
+	 * sibling's. The guard is therefore SHARED STATE, and it is checked and set through the jotai
+	 * store rather than through a subscribed value, because a subscribed read is a snapshot of the
+	 * last render and two dispatches in one tick would both see it empty.
+	 *
+	 * The component-level consequence - two candidate rows, one held request, one dispatch - is
+	 * asserted in `MatchAndReconcile.test.tsx`. What is asserted here is the contract those rows
+	 * depend on.
+	 * ══════════════════════════════════════════════════════════════════════════════════════════════ */
+	describe('the shared single-flight guard', () => {
+
+		const seedForReconcile = () => {
+			const store = createSeededStore()
+			const transaction = makeUnreconciledTransaction()
+			store.set(SELECTED_TRANSACTION_ATOM, [transaction])
+			return { store, transaction, voucher: makeSuggestedLinkedPayment(transaction) }
+		}
+
+		it('starts idle, so a store nobody has posted from permits a post', () => {
+			expect(createStore().get(bankRecReconcileInFlightAtom)).toBeNull()
+		})
+
+		it('records the transaction under post and reports it to every consumer', async () => {
+			const { store, transaction, voucher } = seedForReconcile()
+			frappePostCall.mockReturnValue(new Promise(() => { /* never settles */ }))
+
+			const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+
+			expect(result.current.isReconcileInFlight).toBe(false)
+
+			await act(async () => {
+				result.current.reconcileTransaction(transaction, voucher)
+			})
+
+			expect(store.get(bankRecReconcileInFlightAtom)).toBe(transaction.name)
+			expect(result.current.isReconcileInFlight).toBe(true)
+			expect(result.current.inFlightTransaction).toBe(transaction.name)
+		})
+
+		it('refuses a second dispatch while the first is unanswered', async () => {
+			const { store, transaction, voucher } = seedForReconcile()
+			frappePostCall.mockReturnValue(new Promise(() => { /* never settles */ }))
+
+			const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+
+			await act(async () => {
+				result.current.reconcileTransaction(transaction, voucher)
+				result.current.reconcileTransaction(transaction, voucher)
+			})
+
+			// Both dispatches happen inside ONE act block, so React batches them and the handler runs
+			// twice with no re-render in between - which is exactly the case a guard derived from
+			// rendered state would miss.
+			expect(frappePostCall).toHaveBeenCalledTimes(1)
+		})
+
+		it('refuses a dispatch from a SEPARATE hook instance, which is the real defect', async () => {
+			// Two instances is what a voucher panel actually renders. Sharing the store is what makes
+			// the second instance see the first's open request.
+			const { store, transaction, voucher } = seedForReconcile()
+			const alternate = makeAlternateLinkedPayment()
+			frappePostCall.mockReturnValue(new Promise(() => { /* never settles */ }))
+
+			const first = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+			const second = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+
+			await act(async () => {
+				first.result.current.reconcileTransaction(transaction, voucher)
+			})
+			await act(async () => {
+				second.result.current.reconcileTransaction(transaction, alternate)
+			})
+
+			expect(frappePostCall).toHaveBeenCalledTimes(1)
+			expect(String(frappePostCall.mock.calls[0][0].vouchers)).toContain(voucher.name)
+			expect(second.result.current.isReconcileInFlight).toBe(true)
+		})
+
+		it('releases the guard once the post is ACCEPTED', async () => {
+			const { store, transaction, voucher } = seedForReconcile()
+			frappePostCall.mockResolvedValue(makeReconcileSuccessResponse({ unallocated_amount: 2500 }))
+
+			const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+			await act(async () => {
+				await result.current.reconcileTransaction(transaction, voucher)
+			})
+
+			await waitFor(() => {
+				expect(store.get(bankRecReconcileInFlightAtom)).toBeNull()
+			})
+
+			// ...and a further post is permitted, which is what a partial allocation requires.
+			await act(async () => {
+				result.current.reconcileTransaction(transaction, voucher)
+			})
+			expect(frappePostCall).toHaveBeenCalledTimes(2)
+		})
+
+		it('releases the guard once the post is REFUSED, so the reviewer is not locked out', async () => {
+			// Releasing only on success would leave the guard closed for the rest of the session after
+			// any refusal - a self-inflicted denial of the whole feature.
+			const { store, transaction, voucher } = seedForReconcile()
+			frappePostCall.mockRejectedValue(makeAlreadyReconciledError(transaction.name))
+			const errorToast = vi.spyOn(toast, 'error').mockReturnValue('toast-id')
+
+			const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+			await act(async () => {
+				await result.current.reconcileTransaction(transaction, voucher)
+			})
+
+			await waitFor(() => {
+				expect(store.get(bankRecReconcileInFlightAtom)).toBeNull()
+			})
+
+			errorToast.mockRestore()
+		})
+
+		it('releases only AFTER the refusal has been reported and the selection withdrawn', async () => {
+			// Ordering matters: reopening the affordance before the FM3 clear had run would leave it
+			// pointed at the very snapshot the server had just contradicted.
+			const { store, transaction, voucher } = seedForReconcile()
+			frappePostCall.mockRejectedValue(makeAlreadyReconciledError(transaction.name))
+			const errorToast = vi.spyOn(toast, 'error').mockReturnValue('toast-id')
+
+			const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+			await act(async () => {
+				await result.current.reconcileTransaction(transaction, voucher)
+			})
+
+			await waitFor(() => {
+				expect(store.get(bankRecReconcileInFlightAtom)).toBeNull()
+			})
+			expect(store.get(bankRecErrorDialogAtom)).not.toBeNull()
+			expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([])
+
+			errorToast.mockRestore()
+		})
 	})
 
 	/*

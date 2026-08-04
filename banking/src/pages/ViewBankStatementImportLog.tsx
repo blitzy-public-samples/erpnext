@@ -22,10 +22,19 @@ const ViewBankStatementImportLog = () => {
 
     const direction = useDirection()
 
-    if (!data || !data.message) {
-        return null
-    }
-
+    /*
+     * FM2: LOADING -> ERROR -> NO DATA, and the order is the whole of the fix.
+     *
+     * The no-data guard used to run FIRST, and `useFrappeGetCall` returns no data on a FAILED read as
+     * well as on a pending one - so every refusal of `get_statement_details` returned `null` from here
+     * and the two branches below became unreachable. A reviewer who followed an import log whose file
+     * had been deleted, whose bank account they lacked permission on, or whose PDF password was
+     * missing was shown a BLANK PAGE: no message, no explanation, and not even the Back control. The
+     * error banner and the Back link existed and were simply never rendered.
+     *
+     * Loading is tested first because SWR reports it while `data` and `error` are both absent, and a
+     * pending read must not be reported as a failure.
+     */
     if (isLoading) {
         return <div>Loading...</div>
     }
@@ -43,6 +52,11 @@ const ViewBankStatementImportLog = () => {
             <ErrorBanner error={error} />
         </div>
     }
+
+    if (!data || !data.message) {
+        return null
+    }
+
     const isPdf = data.message.doc.file?.toLowerCase().endsWith('.pdf')
 
     if (isPdf) {

@@ -1,6 +1,6 @@
-import { ActionLog, bankRecActionLog, bankRecAmountFilter, bankRecDateAtom, bankRecErrorDialogAtom, bankRecMatchFilters, bankRecSearchText, bankRecSelectedTransactionAtom, bankRecTransactionTypeFilter, bankRecUnreconcileModalAtom, SelectedBank, selectedBankAccountAtom } from './bankRecAtoms'
-import { useAtom, useAtomValue, useSetAtom } from 'jotai'
-import { useMemo } from 'react'
+import { ActionLog, bankRecActionLog, bankRecAmountFilter, bankRecDateAtom, bankRecErrorDialogAtom, bankRecMatchFilters, bankRecReconcileInFlightAtom, bankRecSearchText, bankRecSelectedTransactionAtom, bankRecTransactionTypeFilter, bankRecUnreconcileModalAtom, SelectedBank, selectedBankAccountAtom } from './bankRecAtoms'
+import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
+import { useEffect, useMemo } from 'react'
 import { SWRConfiguration, useFrappeGetCall, useFrappeGetDoc, useFrappePostCall, useSWRConfig } from 'frappe-react-sdk'
 import { BankTransaction } from '@/types/Accounts/BankTransaction'
 import { BankAccount } from '@/types/Accounts/BankAccount'
@@ -72,7 +72,12 @@ export const useGetAccountClosingBalanceAsPerStatement = (swrConfig: SWRConfigur
     const dates = useAtomValue(bankRecDateAtom)
     const bankAccount = useAtomValue(selectedBankAccountAtom)
 
-    return useFrappeGetCall<{ message: { balance: number, date?: string } }>("erpnext.accounts.doctype.bank_account.bank_account.get_closing_balance_as_per_statement", {
+    // `date` is REQUIRED and NULLABLE, exactly as the endpoint models it: `bank_account.py:194-196`
+    // returns `{"balance": …, "date": <Bank Account Balance.date>}` when a row exists and
+    // `{"balance": 0, "date": None}` when none does - the key is always present, and `null` is a
+    // value it really carries. Typing it `date?: string` told callers the opposite in both
+    // directions, so a `null` could be handed to code that had been promised only a string.
+    return useFrappeGetCall<{ message: { balance: number, date: string | null } }>("erpnext.accounts.doctype.bank_account.bank_account.get_closing_balance_as_per_statement", {
         bank_account: bankAccount?.name,
         date: dates.toDate
     }, `bank-reconciliation-account-closing-balance-as-per-statement-${bankAccount?.name}-${dates.toDate}`, {
@@ -260,7 +265,35 @@ export const useReconcileTransaction = () => {
     const setSelectedTransaction = useSetAtom(bankRecSelectedTransactionAtom(selectedBank?.name || ''))
     const { mutate } = useSWRConfig()
 
+    /*
+     * FM1/TC6: the SHARED single-flight guard, and the reason it is read from the jotai store rather
+     * than from a subscribed value.
+     *
+     * `loading` above belongs to THIS hook instance, and every candidate voucher row instantiates the
+     * hook for itself - so `loading` tells a row about its own request and nothing about any other
+     * row's. Two candidates for the same transaction could therefore each dispatch a
+     * `reconcile_vouchers` post while the other was still open, and the server would allocate against
+     * whatever the transaction had left when each arrived: the outcome would depend on interleaving
+     * rather than on what the reviewer chose.
+     *
+     * `inFlight` (subscribed) is what the ROWS render their disabled state from. `store.get`/`store.set`
+     * is what the guard itself uses, because a subscribed value is a snapshot of the last render and
+     * two dispatches in one tick would both read `null` from it. A jotai store write is synchronous
+     * and immediately visible to the next `store.get`, so the check-and-set below is genuinely atomic
+     * with respect to anything running on this thread.
+     */
+    const store = useStore()
+    const inFlight = useAtomValue(bankRecReconcileInFlightAtom)
+
     const reconcileTransaction = (transaction: UnreconciledTransaction, voucher: LinkedPayment) => {
+
+        // Refuse rather than queue. A second post is not a request the reviewer needs served later -
+        // it is a request made without knowing the outcome of the first, and the first's response is
+        // what re-reads the transaction's true remaining allocation.
+        if (store.get(bankRecReconcileInFlightAtom) !== null) {
+            return
+        }
+        store.set(bankRecReconcileInFlightAtom, transaction.name)
 
         call({
             bank_transaction_name: transaction.name,
@@ -306,7 +339,25 @@ export const useReconcileTransaction = () => {
                 }
             })
         }).catch((error) => {
-            console.error(error)
+            /*
+             * A FIXED, redacted diagnostic (CWE-532/CWE-209). This used to be `console.error(error)`,
+             * which dumped the whole `FrappeError` - including `exc`, the server's full Python
+             * traceback, and `exception`, which names the failing module and line. A browser console
+             * is readable by anything running in the page and is routinely captured by session
+             * recorders and error-reporting SDKs, so that turned every refusal into an unintended
+             * disclosure of server internals alongside the transaction identifier.
+             *
+             * Only the transaction name and the error's own type are logged, and only outside
+             * production: the reviewer's authoritative account of the failure is the dialog below,
+             * which carries the server's message and nothing else.
+             */
+            if (import.meta.env.DEV) {
+                console.error('[bank-rec] reconcile_vouchers refused', {
+                    bank_transaction: transaction.name,
+                    exc_type: error?.exc_type ?? 'unknown'
+                })
+            }
+
             toast.error(_("Error"), {
                 duration: 5000,
                 description: getErrorMessage(error)
@@ -349,20 +400,48 @@ export const useReconcileTransaction = () => {
                 .catch(() => { /* refresh failure changes nothing: the selection is already cleared */ })
             mutate(`bank-reconciliation-bank-transactions-${selectedBank?.name}-${dates.fromDate}-${dates.toDate}`)
                 .catch(() => { /* as above */ })
+        }).finally(() => {
+            /*
+             * Released on BOTH outcomes, and only here. Releasing in the success handler alone would
+             * strand the guard closed forever after a refusal - the reviewer could never reconcile
+             * anything again without a reload - and releasing before the handlers ran would reopen the
+             * affordance while the selection was still the contradicted snapshot the FM3 clear exists
+             * to withdraw. `finally` runs after both, so the ordering is: server answers -> state is
+             * brought in line with that answer -> the affordance reopens.
+             */
+            store.set(bankRecReconcileInFlightAtom, null)
         })
     }
 
-    return { reconcileTransaction, loading }
+    return {
+        reconcileTransaction,
+        /** This hook instance's own request, which is what draws the initiating row's spinner. */
+        loading,
+        /**
+         * Whether ANY reconcile post is open, for the transaction it is open for. Every candidate
+         * control must disable on this rather than on `loading`, or a second post can be dispatched
+         * from a different row while the first is still unanswered.
+         */
+        inFlightTransaction: inFlight,
+        isReconcileInFlight: inFlight !== null
+    }
 
 }
 
 interface BankAccountWithCurrency extends Pick<BankAccount, 'name' | 'bank' | 'account_name' | 'is_credit_card' | 'company' | 'account' | 'account_type' | 'account_subtype' | 'bank_account_no' | 'last_integration_date'> {
     /**
      * Derived, not stored: `bank_account.get_list` follows `Bank Account.account` to
-     * `Account.account_currency` and attaches the result to every row. The key is always present, and
-     * `Account.account_currency` is itself nullable, so a literal `null` is part of the contract.
+     * `Account.account_currency` and attaches the result to EVERY row (`bank_account.py:173-176`
+     * assigns it in an unconditional loop).
+     *
+     * REQUIRED and NULLABLE, therefore - not optional. The key is always present, and
+     * `Account.account_currency` is itself nullable, so a literal `null` is part of the contract while
+     * an absent key is not. Declaring it optional modelled the wrong two possibilities: it let a
+     * consumer treat a missing key as the normal case, and it let the persisted-selection shape (where
+     * the key genuinely can be absent, because an old localStorage snapshot predates it) pass for an
+     * endpoint row.
      */
-    account_currency?: string | null
+    account_currency: string | null
 }
 
 type BankLogoEntry = (typeof BANK_LOGOS)[number]
@@ -393,12 +472,60 @@ export const useGetBankAccounts = (onSuccess?: (data?: Omit<SelectedBank, 'logo'
     const { data, isLoading, error } = useFrappeGetCall<{ message: BankAccountWithCurrency[] }>('erpnext.accounts.doctype.bank_account.bank_account.get_list', {
         company: company
     }, undefined, {
+        // Deliberately left as-is. These two flags are what make the already-reconciled guard in
+        // `MatchAndReconcile` a real requirement rather than a theoretical one, and the plan this work
+        // implements preserves them; the staleness they introduce is compensated for by the
+        // rehydration below rather than by turning revalidation back on.
         revalidateOnFocus: false,
         revalidateIfStale: false,
         onSuccess: (data) => {
             onSuccess?.(data?.message)
         }
     })
+
+    /*
+     * REHYDRATION of the persisted selection, and the single authoritative reason this exists.
+     *
+     * `selectedBankAccountAtom` is an `atomWithStorage` over localStorage with `getOnInit: true`, and
+     * `BankPicker` deliberately leaves the stored row ALONE whenever the account it names is still
+     * present in a fresh response - it only ever writes when it has to choose an account. So the
+     * stored row's fields, `account_currency` among them, are written once and then never refreshed
+     * for as long as that account exists. If an administrator repoints the bank account at a GL
+     * account in a different currency, or changes `Account.account_currency`, every consumer reading
+     * the persisted row keeps the OLD code indefinitely - which for the FM5 advisory means warning
+     * about a mismatch that no longer exists, or staying silent about one that now does, and for
+     * amount formatting means rendering figures under the wrong currency symbol.
+     *
+     * Centralising the fix here rather than in `BankPicker` is what makes it complete: this hook is
+     * the single subscriber to `bank_account.get_list`, so every consumer of the selection - the
+     * workbench rows, the balance panels, the importer surfaces - is corrected at once, and no screen
+     * is left reading a value another screen has already refreshed.
+     *
+     * Written only when the authoritative row DIFFERS from the stored one, compared field by field
+     * through a stable serialisation. Without that test this would write on every render of every
+     * consumer and re-render all of them; with it, the write happens once per genuine change and then
+     * converges. The client-side logo members are preserved rather than recomputed, since they are not
+     * part of the endpoint's projection.
+     */
+    const setSelectedBank = useSetAtom(selectedBankAccountAtom)
+    const authoritativeRows = data?.message
+    const store = useStore()
+
+    useEffect(() => {
+        if (!authoritativeRows) return
+
+        const persisted = store.get(selectedBankAccountAtom)
+        if (!persisted) return
+
+        const authoritative = authoritativeRows.find((bank) => bank.name === persisted.name)
+        if (!authoritative) return
+
+        const refreshed: SelectedBank = { ...persisted, ...authoritative }
+
+        if (JSON.stringify(refreshed) === JSON.stringify(persisted)) return
+
+        setSelectedBank(refreshed)
+    }, [authoritativeRows, setSelectedBank, store])
 
     const banks = useMemo(() => {
         // Match the bank account to the logo
@@ -429,26 +556,21 @@ export const useGetBankAccounts = (onSuccess?: (data?: Omit<SelectedBank, 'logo'
 }
 
 /**
- * The account currency of the CURRENTLY SELECTED bank account, resolved from the live
- * `bank_account.get_list` response rather than from the persisted selection.
+ * The account currency of the CURRENTLY SELECTED bank account — the ONE authoritative value every
+ * consumer in this feature must resolve currency through, for both formatting and comparison.
  *
- * The distinction is the whole point of this hook. `selectedBankAccountAtom` is an `atomWithStorage`
- * over localStorage with `getOnInit: true`, and `BankPicker` deliberately leaves the stored row
- * alone whenever the account it names is still present in a fresh response - so the snapshot's
- * `account_currency` is written once and then never refreshed for as long as the account exists. If
- * an administrator repoints the bank account at an account in a different currency, or changes
- * `Account.account_currency`, the snapshot keeps the old code indefinitely. Any comparison made
- * against it can therefore contradict the server's own view, which for the FM5 currency advisory
- * means warning about a mismatch that no longer exists, or staying silent about one that does.
+ * It reads the live `bank_account.get_list` response rather than the persisted selection directly.
+ * The persisted row is now rehydrated from that same response by `useGetBankAccounts` above, so the
+ * two agree; reading through this hook is nevertheless what callers should do, because it is
+ * `undefined` in exactly the cases where the current currency is NOT KNOWN and a caller must not
+ * pretend otherwise: while the list is loading, after a failed read, and when the selected account is
+ * no longer in the response. All three mean "nothing to compare" — never "mismatch" — since an
+ * advisory that is wrong in either direction is worse than none.
  *
  * Reading through `useGetBankAccounts` costs nothing extra: it is the same SWR entry `BankPicker` and
  * the balance panels already subscribe to, so this deduplicates onto the existing request rather than
  * issuing another one, and it resolves the value down exactly the path the server uses -
  * `Bank Account.account` -> `Account.account_currency`.
- *
- * Returns `undefined` while the list is loading, when the request failed, or when the selected
- * account is no longer in it - all three mean "the current currency is not known", which callers must
- * treat as nothing to compare rather than as a mismatch.
  */
 export const useSelectedBankAccountCurrency = (): string | undefined => {
 

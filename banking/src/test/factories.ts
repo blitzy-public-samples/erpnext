@@ -578,7 +578,16 @@ export interface BankAccountListRow {
 	bank_account_no?: string
 	last_integration_date?: string
 	is_credit_card?: 0 | 1
-	account_currency?: string | null
+	/**
+	 * REQUIRED and NULLABLE, matching the endpoint rather than the persisted selection.
+	 * `bank_account.py:173-176` attaches this to every row in an unconditional loop, so the key is
+	 * always present; `Account.account_currency` is itself nullable, so `null` is a value it really
+	 * carries. Optional was wrong in a way that mattered for a fixture: it let a suite omit the key
+	 * entirely and still pass, which is a response this endpoint cannot produce, and it erased the
+	 * difference between this shape and the persisted `SelectedBank` — where the key genuinely can be
+	 * absent, because a localStorage snapshot may predate it.
+	 */
+	account_currency: string | null
 }
 
 export const makeBankAccountListRow = (
