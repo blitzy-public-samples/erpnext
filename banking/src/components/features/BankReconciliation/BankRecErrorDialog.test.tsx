@@ -4,8 +4,8 @@
  * The component is a COMPOSITION and this suite specifies it as one: an `AlertDialog` wrapping the
  * shared `ErrorBanner`, handed the `FrappeError` EXACTLY as the SDK delivered it. So the assertions
  * fall into three groups — that the server's own words reach the reader through the shared parser and
- * the shared renderer; that the shared sanitiser is in front of that renderer, proved end-to-end
- * through the real `react-markdown` pipeline; and that dismissal touches nothing but the dialog atom.
+ * the shared renderer; that the severity the reader sees is the server's own; and that dismissal
+ * touches nothing but the dialog atom.
  *
  * `AlertDialogContent` renders inside `AlertDialogPortal`, so the dialog is portaled to
  * `document.body` and is NOT inside the tree `render()` returns: every query goes through
@@ -13,11 +13,6 @@
  *
  * Severity is asserted on the theme's token CLASSES because `ui/alert.tsx` emits no `data-theme` — it
  * carries the theme only in its `cva` class list, so the class is the sole observable signal.
- *
- * ⚠️ jsdom does not execute scripts and does not load subresources, and `vitest.config.ts` configures
- * neither, so an assertion that nothing ran or nothing was fetched would pass whether or not the
- * sanitiser works. Nothing here claims otherwise: the sanitisation assertions are STRUCTURAL — which
- * elements and attributes survive the whole shared pipeline, and that the server's text is not lost.
  */
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
@@ -25,7 +20,6 @@ import { Provider, createStore } from 'jotai'
 import { describe, expect, it, vi } from 'vitest'
 import {
 	ALREADY_RECONCILED_MESSAGE_TEMPLATE,
-	TEST_BANK_ACCOUNT,
 	createFrappeSDKMock,
 	formatAlreadyReconciledMessage,
 	frappePostCall,
@@ -111,8 +105,6 @@ const getBannerDescription = (): HTMLElement | null =>
 	getBanner().querySelector('[data-slot="alert-description"]')
 
 const getBannerMessageText = (): string => getBannerDescription()?.textContent ?? ''
-
-const getBannerMarkup = (): string => getBannerDescription()?.innerHTML ?? ''
 
 const getBannerHeading = (): string =>
 	getBanner().querySelector('[data-slot="alert-title"]')?.textContent ?? ''
@@ -300,172 +292,6 @@ describe('BankRecErrorDialog', () => {
 			expect(banner.querySelector('b')).not.toBeNull()
 			expect(banner).toHaveTextContent('Transaction currency: USD cannot be different')
 			expect(banner.textContent).not.toContain('<b>')
-		})
-	})
-
-	/*
-	 * ================================================================================================
-	 * THE SHARED SANITISER, PROVED AT THIS CONSUMER  (CWE-79 / CWE-451)
-	 *
-	 * `_server_messages` is HTML and the shared renderer puts it on the page as REAL DOM: it runs
-	 * `rehypeRaw`, and `react-markdown` then creates those nodes with `document.createElement`. The
-	 * guard is ONE sanitiser installed after `rehypeRaw` inside `ui/markdown.tsx`, so it protects this
-	 * dialog and the other ~20 inline `ErrorBanner` call sites at the same time.
-	 *
-	 * `@/lib/sanitize-html.test.ts` specifies the allow-list rule by rule as a unit. What is asserted
-	 * HERE is the end-to-end outcome through the real pipeline, including the two spellings that only
-	 * exist after remark has run — a markdown image and a GFM autolink — which no HTML-level filter
-	 * could ever see on its own.
-	 * ============================================================================================== */
-	describe('renders server markup through the shared sanitiser', () => {
-		it('drops a <script> subtree, its source text with it, and keeps the words around it', () => {
-			renderDialog(
-				makeServerMessagesError('Refused <script>window.__pwned = true</script> here')
-			)
-
-			expect(getBanner().querySelector('script')).toBeNull()
-			expect(getBannerMessageText()).toContain('Refused')
-			expect(getBannerMessageText()).toContain('here')
-			expect(getBannerMessageText()).not.toContain('__pwned')
-		})
-
-		it('strips every event-handler attribute while keeping the element and its text', () => {
-			renderDialog(
-				makeServerMessagesError('<span onclick="steal()" onmouseover="steal()">Refused</span>')
-			)
-
-			const span = getBanner().querySelector('span')
-			expect(span).not.toBeNull()
-			expect(span?.getAttribute('onclick')).toBeNull()
-			expect(span?.getAttribute('onmouseover')).toBeNull()
-			expect(getBannerMessageText()).toContain('Refused')
-		})
-
-		it('drops <style>, <iframe> and <object> subtrees', () => {
-			renderDialog(
-				makeServerMessagesError(
-					'Refused <style>body{display:none}</style><iframe src="/app"></iframe><object data="/x"></object>'
-				)
-			)
-
-			const banner = getBanner()
-			expect(banner.querySelector('style')).toBeNull()
-			expect(banner.querySelector('iframe')).toBeNull()
-			expect(banner.querySelector('object')).toBeNull()
-			expect(getBannerMessageText()).toContain('Refused')
-		})
-
-		it('removes class and id, the two attributes that can cover or re-label the dialog', () => {
-			renderDialog(
-				makeServerMessagesError('<div class="fixed inset-0 bg-surface-white" id="radix-title">Refused</div>')
-			)
-
-			const div = getBanner().querySelector('[data-slot="alert-description"] div')
-			expect(div).not.toBeNull()
-			expect(div?.getAttribute('class')).toBeNull()
-			expect(div?.getAttribute('id')).toBeNull()
-			expect(getBannerMessageText()).toContain('Refused')
-		})
-
-		it('removes inline style', () => {
-			renderDialog(makeServerMessagesError('<span style="position:fixed;inset:0">Refused</span>'))
-
-			expect(getBanner().querySelector('span')?.getAttribute('style')).toBeNull()
-		})
-
-		it('drops an <img> whatever its source, because no Frappe message needs one', () => {
-			renderDialog(
-				makeServerMessagesError(
-					'Refused <img src="/assets/erpnext/x.png"><img src="https://tracker.example/pixel.png"> here'
-				)
-			)
-
-			expect(getBanner().querySelector('img')).toBeNull()
-			expect(getBannerMarkup()).not.toContain('tracker.example')
-			expect(getBannerMessageText()).toContain('Refused')
-			expect(getBannerMessageText()).toContain('here')
-		})
-
-		/*
-		 * The markdown-authored spellings, which exist only because the sanitiser runs AFTER remark:
-		 * `![x](url)` is not HTML, so no HTML-level filter could see it, and a GFM autolink literal is
-		 * plain text until remark turns it into an anchor. Both arrive at the sanitiser as ordinary
-		 * elements and are handled by the same two rules as their HTML equivalents.
-		 */
-		it('renders no <img> for a markdown image', () => {
-			renderDialog(makeServerMessagesError('Refused ![pixel](https://tracker.example/p.png) here'))
-
-			expect(getBanner().querySelector('img')).toBeNull()
-			expect(getBannerMarkup()).not.toContain('tracker.example')
-			expect(getBannerMessageText()).toContain('Refused')
-			expect(getBannerMessageText()).toContain('here')
-		})
-
-		it('renders no anchor for a markdown link to another origin, and keeps its text', () => {
-			renderDialog(makeServerMessagesError('Refused [click here](https://phish.example/login) now'))
-
-			expect(getBanner().querySelector('a')).toBeNull()
-			expect(getBannerMessageText()).toContain('click here')
-		})
-
-		it('renders no anchor for a bare GFM autolink literal, and keeps its text', () => {
-			renderDialog(makeServerMessagesError('Refused, see https://phish.example/login for details'))
-
-			expect(getBanner().querySelector('a')).toBeNull()
-			expect(getBannerMessageText()).toContain('https://phish.example/login')
-		})
-
-		it("keeps Frappe's own root-relative document link, with rel stamped on it", () => {
-			renderDialog(
-				makeServerMessagesError(
-					`Please cancel <a href="/app/bank-transaction/${TEST_BANK_ACCOUNT}">this transaction</a> first`
-				)
-			)
-
-			const anchor = getBanner().querySelector('a')
-			expect(anchor).not.toBeNull()
-			expect(anchor?.getAttribute('href')).toBe(`/app/bank-transaction/${TEST_BANK_ACCOUNT}`)
-			expect(anchor?.getAttribute('rel')).toBe('noreferrer noopener')
-			expect(anchor?.getAttribute('target')).toBeNull()
-		})
-
-		it.each([
-			['javascript:', 'javascript:window.__pwned=true'],
-			['data:', 'data:text/html,<script></script>'],
-			['a backslash network-path reference', '\\\\phish.example/login']
-		])('unwraps an anchor whose href is %s, keeping the words the server wrote', (_label, href) => {
-			renderDialog(makeServerMessagesError(`See <a href="${href}">the detail</a> for more`))
-
-			expect(getBanner().querySelector('a')).toBeNull()
-			expect(getBannerMessageText()).toContain('the detail')
-		})
-
-		it('keeps the structural markup a validation summary legitimately uses', () => {
-			renderDialog(
-				makeServerMessagesError(
-					'<b>Refused</b><ul><li>one</li><li>two</li></ul><table><tbody><tr><td colspan="2">cell</td><th scope="col">head</th></tr></tbody></table>'
-				)
-			)
-
-			const banner = getBanner()
-			expect(banner.querySelector('b')).not.toBeNull()
-			expect(banner.querySelectorAll('li')).toHaveLength(2)
-			expect(banner.querySelector('td')?.getAttribute('colspan')).toBe('2')
-			expect(banner.querySelector('th')?.getAttribute('scope')).toBe('col')
-		})
-
-		it('discards an HTML comment, which carries nothing renderable', () => {
-			renderDialog(makeServerMessagesError('Refused<!-- window.__pwned = true --> here'))
-
-			expect(getBannerMarkup()).not.toContain('__pwned')
-			expect(getBannerMessageText()).toContain('Refused')
-		})
-
-		it('unwraps an unknown-but-harmless tag, keeping every word inside it', () => {
-			renderDialog(makeServerMessagesError('Refused <frappe-note>because of a lock</frappe-note> here'))
-
-			expect(getBanner().querySelector('frappe-note')).toBeNull()
-			expect(getBannerMessageText()).toContain('because of a lock')
 		})
 	})
 

@@ -1,12 +1,12 @@
 import { useAtom, useAtomValue, useSetAtom } from "jotai"
 import { bankRecAmountFilter, bankRecDateAtom, bankRecRecordJournalEntryModalAtom, bankRecRecordPaymentModalAtom, bankRecSelectedTransactionAtom, bankRecTransactionTypeFilter, bankRecTransferModalAtom, selectedBankAccountAtom } from "./bankRecAtoms"
 import { H4 } from "@/components/ui/typography"
-import { useId, useMemo, useRef } from "react"
+import { useMemo, useRef } from "react"
 import { getCompanyCurrency } from "@/lib/company"
 import ErrorBanner from "@/components/ui/error-banner"
 import { Separator } from "@/components/ui/separator"
 import Fuse from 'fuse.js'
-import { getSearchResults, LinkedPayment, UnreconciledTransaction, useGetRuleForTransaction, useGetUnreconciledTransactions, useGetVouchersForTransaction, useIsTransactionWithdrawal, useReconcileTransaction, useSelectedBankAccountCurrency, useTransactionSearch } from "./utils"
+import { getSearchResults, LinkedPayment, UnreconciledTransaction, useGetRuleForTransaction, useGetUnreconciledTransactions, useGetVouchersForTransaction, useIsTransactionWithdrawal, useReconcileTransaction, useTransactionSearch } from "./utils"
 import { Input } from "@/components/ui/input"
 import { AlertCircleIcon, ArrowDownRight, ArrowRightIcon, ArrowRightLeft, ArrowUpRight, BadgeCheck, ChevronDown, DollarSign, Landmark, LandmarkIcon, ListIcon, Loader2, Receipt, ReceiptIcon, Search, User, XCircle, ZapIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -67,11 +67,10 @@ const MatchAndReconcile = ({ contentHeight }: { contentHeight: number }) => {
         <TransferModal />
         <BankEntryModal />
         <RecordPaymentModal />
-        {/* FM1/FM3: the dismissible dialog that reports a refused confirm/post. Mounted here beside
-            the three existing feature-level modals, following the same atom-driven convention - it
-            renders nothing until the shared error atom holds a rejection. The statement importer
-            surfaces mount the same component against the same atom, because they live in a different
-            route tree. */}
+        {/* FM1/FM3: the shared dismissible dialog for a refused confirm/post. It renders null unless
+            bankRecErrorDialogAtom is set, and the same atom is mounted on the statement-importer
+            surfaces, which live in a different route tree - one atom, so no two surfaces can ever show
+            conflicting error state. */}
         <BankRecErrorDialog />
     </>
 }
@@ -340,50 +339,19 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
 
     const isSelected = selectedTransaction?.some((t) => t.name === transaction.name)
 
-    /*
-     * FM5, and the ONE authoritative currency value this row uses for BOTH purposes.
-     *
-     * `useSelectedBankAccountCurrency` reads the live `bank_account.get_list` response. Everything
-     * here resolves through it - the mismatch comparison AND the fallback used to format the amount -
-     * because those two must not be able to disagree. They previously could: the comparison read the
-     * live value while the formatting fell back to `selectedBank.account_currency`, the persisted
-     * localStorage snapshot, so a row could simultaneously be told "these currencies match" and be
-     * rendered under a stale symbol. `useGetBankAccounts` now rehydrates that snapshot from the same
-     * response, and reading the live value here as well removes the second source outright.
-     *
-     * `selectedBank?.account_currency` is kept as the NEXT fallback rather than deleted: it is the only
-     * value available in the first render after a cold start, before the list has answered, and a
-     * momentarily stale symbol is better than none. The company default remains the last resort.
-     *
-     * Either side of the COMPARISON may legitimately be unknown - `currency` is optional on the
-     * transaction, and the hook returns `undefined` while the list is loading, after a failed read, or
-     * when the selected account is absent from it. Unknown means "nothing to compare", never
-     * "mismatch": a warning that is wrong in either direction is worse than no warning.
-     */
-    const accountCurrency = useSelectedBankAccountCurrency()
-
-    const currency = transaction.currency ?? accountCurrency ?? selectedBank?.account_currency ?? getCompanyCurrency(selectedBank?.company ?? '')
-
-    const isCurrencyMismatch = Boolean(transaction.currency && accountCurrency && transaction.currency !== accountCurrency)
+    const currency = transaction.currency ?? selectedBank?.account_currency ?? getCompanyCurrency(selectedBank?.company ?? '')
 
     /*
-     * The advisory is authored once and consumed twice - as the badge's tooltip for pointer users and
-     * as the row's own accessible description for keyboard and screen-reader users - so the two can
-     * never drift apart.
+     * FM5: the advisory currency-mismatch predicate. It is DERIVED from the server rather than
+     * designed - `validate_currency` on Bank Transaction resolves
+     * `Bank Account.account` -> `Account.account_currency`, and `bank_account.get_list` attaches
+     * `account_currency` to each row through that identical lookup, so the two sides cannot disagree.
      *
-     * The copy states ONLY what this client has observed: the two currency codes differ, and this
-     * indicator does not stop the reconciliation. It makes no claim about what the server will do with
-     * the mismatch, because the server does not in fact check it on this path - `validate_currency` is
-     * invoked from `validate()`, and `reconcile_vouchers` saves a document that is already submitted,
-     * which Frappe routes through `update_after_submit`, so `validate()` never runs. Telling the
-     * reviewer their currencies would be "validated" would be describing a check that does not happen
-     * here. FM5 leaves the backend the authority on the outcome; where the backend asserts nothing,
-     * this indicator asserts nothing on its behalf.
+     * Either side may legitimately be unknown (`currency` is optional on the transaction and
+     * `account_currency` is attached at query time rather than being a native Bank Account field), and
+     * unknown means "nothing to compare", never "mismatch".
      */
-    const currencyAdvisoryId = useId()
-    const currencyAdvisory = isCurrencyMismatch
-        ? _("Transaction currency {0} differs from the bank account currency {1}. This is an advisory check made here only and does not block the reconciliation - review the match before confirming.", [transaction.currency ?? '', accountCurrency ?? ''])
-        : ''
+    const isCurrencyMismatch = Boolean(transaction.currency && selectedBank?.account_currency && transaction.currency !== selectedBank.account_currency)
 
     const handleSelectTransaction = (event: React.MouseEvent<HTMLDivElement>) => {
         // If the user is pressing the shift key, add/remove the transaction from the selected transactions
@@ -400,10 +368,6 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
         )}
             role='button'
             tabIndex={0}
-            // The row is the ONLY interactive element here, so the currency advisory is attached as
-            // the row's own description rather than to a second control inside it. Focusing or
-            // reading the row therefore announces the reason, with no extra tab stop to traverse.
-            aria-describedby={isCurrencyMismatch ? currencyAdvisoryId : undefined}
             onClick={handleSelectTransaction}>
             <div className="flex justify-between items-start w-full">
                 <div className="space-y-1 overflow-hidden whitespace-pre-wrap">
@@ -422,39 +386,23 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
                             title={_("Matched by rule")}>
                             <ZapIcon className="w-4 h-4" /> {transaction.matched_transaction_rule}</Badge>}
 
-                        {/* Advisory only: Reconcile is deliberately left enabled, because the server -
-                            not this badge - decides whether a post is allowed. `theme="orange"` is used
-                            because Badge declares no `amber` theme, and `subtle` + `orange` is what
-                            resolves to the amber tokens this warning calls for.
-
-                            `TooltipTrigger asChild` is REQUIRED, not stylistic. This row is itself a
-                            focusable `role="button"`, and a bare TooltipTrigger renders its own native
-                            <button>, which would nest an interactive control inside an interactive
-                            control and add a second tab stop to every mismatched row. `asChild` makes
-                            the Badge - a plain <span> - the trigger, so the indicator stays
-                            non-interactive; the same pattern is used for the reconcile button's tooltip
-                            further down this file. Because a <span> cannot take focus, the tooltip alone
-                            would be hover-only, so the advisory is ALSO published as the `sr-only`
-                            description the row points at with `aria-describedby` - one shared string, so
-                            the two can never disagree.
-
-                            The LOCAL TooltipProvider matches every other tooltip in this file (see the
-                            transaction-actions cluster, the keyboard-shortcut row and the voucher card
-                            below): each subtree stays independently mountable instead of depending on
-                            App.tsx happening to wrap the router in a provider. */}
+                        {/* FM5: ADVISORY ONLY - Reconcile is deliberately left enabled, because the
+                            server and not this badge decides whether a post is allowed. `theme="orange"`
+                            is used because Badge declares no `amber` theme, and `subtle` + `orange` is
+                            what resolves to the amber ink and surface tokens this warning calls for.
+                            `TooltipTrigger asChild` keeps the indicator non-interactive: the row is
+                            itself a focusable role="button", and a bare trigger would render its own
+                            button and add a second tab stop. The local TooltipProvider matches every
+                            other tooltip in this file, so the subtree stays independently mountable. */}
                         {isCurrencyMismatch && <TooltipProvider>
                             <Tooltip>
                                 <TooltipTrigger asChild>
-                                    <Badge variant="subtle" theme="orange" size="sm">
+                                    <Badge variant="subtle" theme="orange" size="sm"
+                                        title={_("Currency mismatch")}>
                                         <AlertCircleIcon /> {transaction.currency}</Badge>
                                 </TooltipTrigger>
-                                {/* TooltipContent is `w-fit` with no intrinsic maximum, so this two-sentence
-                                    advisory would lay out as a single very long line that Radix then clamps
-                                    flush against the viewport edge. `max-w-sm` with balanced wrapping is the
-                                    constraint the design system already uses for long tooltip copy (see
-                                    ui/list-view.tsx). */}
                                 <TooltipContent side="top" className="max-w-sm text-balance wrap-break-word">
-                                    {currencyAdvisory}
+                                    {_("Transaction currency {0} differs from the bank account currency {1}. This indicator does not block the reconciliation - the server applies its own currency rule and may refuse to post it.", [transaction.currency ?? '', selectedBank?.account_currency ?? ''])}
                                 </TooltipContent>
                             </Tooltip>
                         </TooltipProvider>}
@@ -468,12 +416,6 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
                 </div>
             </div>
         </div>
-        {/* The advisory text the row points at. It sits OUTSIDE the row element on purpose: a
-            description nested inside the row would also be walked when the row's accessible NAME is
-            computed from its contents, so the same sentence would be announced twice. `sr-only` is the
-            utility this codebase already uses for text meant only for assistive technology (see the
-            search and amount-filter labels above), and it leaves the visual row unchanged. */}
-        {isCurrencyMismatch && <span id={currencyAdvisoryId} className="sr-only">{currencyAdvisory}</span>}
     </div>
 }
 
@@ -942,31 +884,9 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
         const amountMatches = voucher.paid_amount === transaction?.unallocated_amount
         const postingDateMatches = voucher.posting_date === transaction?.date
         const referenceDateMatches = voucher.reference_date === transaction?.date
+        const referenceMatchesFull = voucher.reference_no === transaction?.reference_number || voucher.reference_no === transaction?.description
 
-        /*
-         * A BLANK REFERENCE CANNOT MATCH ANYTHING, and both tests below depend on saying so
-         * explicitly.
-         *
-         * `reference_no` is genuinely absent for whole classes of candidate: the Purchase Invoice
-         * branch of `get_linked_payments` projects a constant empty string, and the Bank Transaction,
-         * Payment Entry, Journal Entry and Sales Invoice branches all project a nullable column. Left
-         * unguarded, `''.includes()` semantics made every such candidate a PARTIAL reference match
-         * against any transaction, because every string contains the empty string - so a candidate
-         * with no reference at all, sitting first in the list with a matching amount, was promoted to
-         * "Suggested" and given the solid green treatment on a financial posting screen. The full test
-         * had the mirror-image flaw: two absent references compared equal to each other.
-         *
-         * Trimmed before the test, because a reference of spaces carries no more information than one
-         * that is missing.
-         */
-        const voucherReference = voucher.reference_no?.trim() ?? ''
-        const hasVoucherReference = voucherReference !== ''
-
-        const referenceMatchesFull = hasVoucherReference &&
-            (voucherReference === transaction?.reference_number || voucherReference === transaction?.description)
-
-        const referenceMatchesPartial = hasVoucherReference &&
-            Boolean(transaction?.reference_number?.includes(voucherReference) || transaction?.description?.includes(voucherReference))
+        const referenceMatchesPartial = transaction?.reference_number?.includes(voucher.reference_no) || transaction?.description?.includes(voucher.reference_no)
 
 
         const isSuggested = amountMatches && (postingDateMatches || referenceDateMatches || referenceMatchesPartial) && index === 0
@@ -975,62 +895,36 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
 
     }, [voucher, selectedTransaction, index])
 
-    const { reconcileTransaction, loading, isReconcileInFlight } = useReconcileTransaction()
+    const { reconcileTransaction, loading } = useReconcileTransaction()
 
     /*
-     * FM3: the already-reconciled guard, mirroring the server's own predicate rather than inventing
-     * one. `add_payment_entries` refuses outright when `unallocated_amount <= 0`, and `set_status`
-     * derives the status field from that same quantity - `> 0` is Unreconciled, `<= 0` is
-     * Reconciled - so the two signals are strictly co-derived and both already arrive in the
-     * `get_bank_transactions` payload. No extra read and no backend change are needed.
+     * FM3/TC5: the already-reconciled guard, mirroring the server's own predicate rather than inventing
+     * one. `add_payment_entries` refuses outright when `unallocated_amount <= 0` - the first statement
+     * of the first method the posting endpoint calls - and `set_status` derives the status field from
+     * that same quantity, so `status === 'Reconciled'` holds exactly when `unallocated_amount <= 0`.
+     * Both fields already arrive in the `get_bank_transactions` payload, so no extra read and no
+     * backend change are needed.
      *
-     * The server stays the authority; this only stops the affordance offering an action that cannot
-     * succeed. The case it exists for is the STALE CLIENT, and that case is real rather than
-     * theoretical: `useGetUnreconciledTransactions` revalidates neither on focus nor when stale, and
-     * the selection itself is persisted, so this surface can be holding a row the server has since
-     * settled - either because the list was fetched before the reconciliation or because a stored
-     * selection outlived it.
-     *
-     * It is NOT reachable from the unfiltered "Bank Transactions" tab, contrary to what this comment
-     * used to claim: that tab is `BankTransactionList`, which renders no Reconcile control at all, and
-     * the endpoint behind THIS surface filters `unallocated_amount > 0` server-side.
-     *
-     * Read off the SELECTION, which the reconcile hook empties on rejection - so a refused attempt
-     * withdraws this control rather than leaving it pointed at a snapshot the server has contradicted.
+     * A UX AFFORDANCE ONLY: the server check remains authoritative, and a stale-client attempt that
+     * slips through surfaces the server's own throw in the shared BankRecErrorDialog and revalidates
+     * the transaction reads. Nothing is marked reconciled locally.
      */
     const transactionUnderReview = selectedTransaction?.[0]
     const isAlreadyReconciled = transactionUnderReview
         ? transactionUnderReview.status === 'Reconciled' || (transactionUnderReview.unallocated_amount ?? 0) <= 0
         : false
 
-    /*
-     * Guards on the ROW, not on the array. The previous test was `!selectedTransaction`, which an
-     * array satisfies whether or not it is empty, so an empty selection posted
-     * `bank_transaction_name: undefined`. That is now reachable state rather than a theoretical one:
-     * the rejection path empties the selection deliberately.
-     */
     const onClick = () => {
-        if (!transactionUnderReview) {
+        if (!selectedTransaction) {
             return
         }
-        reconcileTransaction(transactionUnderReview, voucher)
+        reconcileTransaction(selectedTransaction[0], voucher)
     }
 
-    /*
-     * FM1/TC6: disabled while ANY reconcile post is open, not merely while THIS row's is.
-     *
-     * `loading` belongs to this row's own hook instance, and every candidate row instantiates the hook
-     * for itself - so a control gated on `loading` alone stayed live while a SIBLING row's post was
-     * unanswered, and a reviewer could dispatch a second `reconcile_vouchers` for the same transaction
-     * before the first had returned. `isReconcileInFlight` is shared state, so one open post closes
-     * every candidate at once. The spinner still follows `loading`, so only the row that started the
-     * request says "Reconciling" - the others simply become unavailable, which is what the reviewer
-     * needs to be told.
-     */
     const reconcileButton = <Button
         variant={isSuggested || amountMatches ? "solid" : "outline"}
         theme={isSuggested || amountMatches ? "green" : "gray"}
-        onClick={onClick} disabled={loading || isReconcileInFlight || isAlreadyReconciled}>{loading ? <><Loader2 className="w-4 h-4 animate-spin" /> {_("Reconciling")}...</> : `${_("Reconcile")}`}</Button>
+        onClick={onClick} disabled={loading || isAlreadyReconciled}>{loading ? <><Loader2 className="w-4 h-4 animate-spin" /> {_("Reconciling")}...</> : `${_("Reconcile")}`}</Button>
 
     return <div className="py-1 px-1">
         <div
@@ -1060,13 +954,7 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
                         <div className="flex items-start gap-8 py-0.5">
                             <div className="flex flex-col gap-1 min-w-24">
                                 <div className="text-xs text-ink-gray-6">{_("Amount")}</div>
-                                {/* `?? undefined` collapses the endpoint's literal null onto the parameter's
-                                    own default, which `formatCurrency` then resolves to the system currency -
-                                    the same value a null produced before the type admitted one. Coercion
-                                    belongs here, at the presentation boundary, and not where the reconcile
-                                    hook copies the reference onto the action log: there the null is the
-                                    server's statement that no reference exists and has to survive. */}
-                                <div className="text-base font-medium flex items-center gap-1">{formatCurrency(voucher.paid_amount, voucher.currency ?? undefined)} {amountMatches ? <MatchBadge matchType="full" label={_("Amount matches the selected transaction")} /> : <MatchBadge matchType="none" label={_("Amount does not match the selected transaction")} />}</div>
+                                <div className="text-base font-medium flex items-center gap-1">{formatCurrency(voucher.paid_amount, voucher.currency)} {amountMatches ? <MatchBadge matchType="full" label={_("Amount matches the selected transaction")} /> : <MatchBadge matchType="none" label={_("Amount does not match the selected transaction")} />}</div>
                             </div>
 
                             <div className="flex flex-col gap-1 min-w-24">
@@ -1098,20 +986,18 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
                     </TooltipProvider>
                 </div>
                 <div>
-                    {/* A disabled control emits no pointer or focus events, so the reason is anchored to a
-                        focusable wrapper span rather than to the Button, keeping it discoverable by mouse
-                        and keyboard alike. The Tooltip is mounted only when the guard fires, so the
-                        enabled path never stamps an `aria-describedby` pointing at content that is not
-                        rendered. Wrapped in its own TooltipProvider, matching every other tooltip in this
-                        file. */}
+                    {/* A disabled control emits no pointer or focus events, so the reason is anchored to
+                        a focusable wrapper span rather than to the Button itself, keeping it discoverable
+                        by mouse and keyboard alike. The Tooltip is mounted only when the guard fires, so
+                        the enabled path is byte-for-byte the control it always was. Its own
+                        TooltipProvider matches every other tooltip in this file - the provider that wraps
+                        the match badges above closes before this point. */}
                     {isAlreadyReconciled
                         ? <TooltipProvider>
                             <Tooltip>
                                 <TooltipTrigger asChild>
                                     <span tabIndex={0} className="inline-flex rounded outline-none focus-visible:shadow-focus-gray">{reconcileButton}</span>
                                 </TooltipTrigger>
-                                {/* End-aligned so the tooltip stays inside the page gutter at the far right of
-                                    the voucher card. */}
                                 <TooltipContent side="top" align="end" className="max-w-sm text-balance wrap-break-word">
                                     {_("This bank transaction is already fully reconciled, so it cannot be reconciled again.")}
                                 </TooltipContent>
@@ -1152,11 +1038,7 @@ const OlderUnreconciledTransactionsBanner = () => {
     const { data } = useFrappeGetCall<{
         message: {
             count: number,
-            // REQUIRED and NULLABLE: `get_older_unreconciled_transactions` returns
-            // `{"count": 0, "oldest_date": None}` when nothing is older, so the key is always present
-            // and `null` is a value it really carries. It was typed `string`, which promised callers a
-            // date that need not exist - and the jump control below consumed it unguarded.
-            oldest_date: string | null
+            oldest_date: string
         }
     }>("erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.get_older_unreconciled_transactions", {
         bank_account: selectedBank?.name,
@@ -1180,24 +1062,17 @@ const OlderUnreconciledTransactionsBanner = () => {
                         {_("The opening balance might not match your bank statement. Would you like to reconcile them?")}
                     </AlertDescription>
                 </div>
-                {/* The jump control is rendered only when the server actually named a date. `count > 0`
-                    and a non-null `oldest_date` normally arrive together, but they are two separate
-                    fields on one payload and this control writes the date straight into the shared date
-                    range: without the guard a `null` would be persisted as `fromDate`, and every query
-                    keyed on that range - transactions, both balances, the candidate lists - would be
-                    re-issued with a null boundary. The banner's own text stands on `count` alone, so the
-                    reviewer is still told what exists either way. */}
-                {data.message.oldest_date && <div>
+                <div>
                     <Button
                         size='sm'
                         type='button'
                         theme='gray'
                         variant='outline'
-                        onClick={() => setDates({ fromDate: data.message.oldest_date as string, toDate: dates.toDate })}>
+                        onClick={() => setDates({ fromDate: data.message.oldest_date, toDate: dates.toDate })}>
                         <span>{data.message.count > 1 ? _("View older transactions") : _("View older transaction")}</span>
                         <ArrowRightIcon />
                     </Button>
-                </div>}
+                </div>
             </div>
         </Alert>
     }

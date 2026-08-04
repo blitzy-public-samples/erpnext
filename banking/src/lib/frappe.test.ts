@@ -26,8 +26,8 @@
  *            for them (`frappe.ts:137-145`).
  *
  * The numbering starts at 3 deliberately. QUIRKS 1 and 2 are not pinned as quirks but specified as
- * LIMITS, in the `the envelope is parsed UNGUARDED` block below, because they are the reason the
- * failure paths this work delivers do not call this module directly:
+ * LIMITS, in the `the envelope is parsed UNGUARDED` block below, because they bound what a caller of
+ * this parser is entitled to assume:
  *
  *   LIMIT 1  The outer `JSON.parse` of `_server_messages` is UNGUARDED, and `.map` then runs on
  *            whatever it produced - so a truncated body, a rewritten body, or valid JSON that is not
@@ -39,11 +39,16 @@
  *
  * This module is FROZEN by the Agent Action Plan - section 0.6.4 records the error-transport envelope
  * as "Unchanged - reused verbatim by the new dialog", and section 0.9.1 does not list it among the
- * paths this work may touch - so neither limit is fixed here. Both are handled instead by
- * `readServerMessages` / `readErrorText` in
- * `components/features/BankReconciliation/utils.ts`, which every failure path in this feature reads
- * through and whose TOTALITY is specified in `utils.test.ts`. The block below pins this module's real
- * behaviour so that the wrapper's reason for existing cannot quietly stop being true.
+ * paths this work may touch - so neither limit is repaired here, and no wrapper is introduced to hide
+ * one. They are SPECIFIED instead, which is the useful thing a frozen contract's suite can do: the
+ * dialog this work adds renders through `ErrorBanner`, so it reads the envelope through exactly this
+ * parser, and the block below pins what that parser really does so a future change to it fails here
+ * rather than quietly altering what a reviewer is told about a refusal.
+ *
+ * LIMIT 1 is also worth putting in proportion: it is unreachable through the real transport. A
+ * `FrappeError` only carries `_server_messages` once the response body has already parsed as JSON, so
+ * a truncated body or an intermediary's HTML error page never produces the field at all - it produces
+ * an error resolved through the `_error_message` -> `exception` -> `message` chain instead.
  *
  * Every other behaviour below is asserted as the module BEHAVES, never as it ideally would: this
  * suite is a specification of the shipped parser, so a future change to it fails here rather than
@@ -219,10 +224,9 @@ describe('getErrorMessages', () => {
 	 * of `ErrorBanner` (`error-banner.tsx:34`).
 	 *
 	 * The module is frozen (see the file header), so the cases below are specified as LIMITS rather
-	 * than repaired. They exist to pin exactly what a caller must protect itself from: every failure
-	 * path in the Bank Reconciliation feature therefore reads through `readServerMessages` /
-	 * `readErrorText` in `components/features/BankReconciliation/utils.ts`, whose totality — and its
-	 * recovery of this module's own fallback chain — is specified in `utils.test.ts`.
+	 * than repaired. They exist to pin exactly what a caller is and is not entitled to assume — and
+	 * the inputs that reach them do not arise on the real transport, because `_server_messages` only
+	 * exists on an error whose body already parsed as JSON.
 	 * ══════════════════════════════════════════════════════════════════════════════════════════════ */
 	describe('the envelope is parsed UNGUARDED — specified LIMITS of the shared parser', () => {
 		it('LIMIT 1: THROWS on an envelope that is not valid JSON at all', () => {

@@ -25,10 +25,6 @@ import _ from "@/lib/translate"
  * the server's own words - for example `"Bank Transaction {0} is already fully reconciled"` - reach
  * the reviewer verbatim.
  *
- * Untrusted markup inside those messages is handled where it is actually rendered: the shared markdown
- * renderer runs one restrictive allow-list sanitiser after `rehypeRaw` (`@/lib/sanitize-html`), which
- * protects this dialog and every other `ErrorBanner`/`Markdown` consumer at once.
- *
  * Dismissing clears the dialog atom and nothing else - it issues no request, triggers no revalidation
  * and raises no notification, because the calling hook owns revalidation and the backend remains the
  * sole authority on what was recorded.

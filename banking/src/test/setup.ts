@@ -47,7 +47,7 @@ import '@testing-library/jest-dom/vitest'
 // `globals: true` exposes the Vitest API at runtime but does not TYPE it —
 // `tsconfig.app.json` declares no `types` array and adding one is out of bounds — so
 // every Vitest symbol must be imported explicitly.
-import { afterEach, beforeEach, vi } from 'vitest'
+import { afterEach, vi } from 'vitest'
 
 // Imported so the shared teardown below can reset the `frappe-react-sdk` spies without any
 // suite having to opt in. Importing this executes no application code - it declares fixtures
@@ -134,8 +134,8 @@ const TEST_ROLES = ['System Manager', 'Accounts Manager', 'Accounts User']
  * `cancel` to anybody.
  *
  * A suite that needs a narrower profile assigns over these arrays directly on
- * `window.frappe.boot.user`; `beforeEach` restores this pristine copy, so no suite can leak
- * a profile into the next.
+ * `window.frappe.boot.user`, and restores what it narrowed itself, so no suite leaks a
+ * profile into the next.
  */
 const USER_PERMISSIONS = {
 	can_read: [
@@ -343,9 +343,8 @@ const boot = {
  * ────────────────────────────────────────────────────────────────────────────────── */
 
 /**
- * The `frappe` namespace object, held in a const so {@link resetHarnessState} can restore
- * it - and reset the mutable maps inside it - rather than leaving a test's pollution in
- * place for the next one.
+ * The `frappe` namespace object, assembled once and installed on both `window` and the bare
+ * global below so the two spellings resolve to the same object.
  */
 const frappeNamespace = {
 	boot,
@@ -408,68 +407,6 @@ globalScope.csrf_token = CSRF_TOKEN
  * ────────────────────────────────────────────────────────────────────────────────── */
 
 document.cookie = `user_id=${TEST_USER}`
-
-/* ── 7b. Per-test reconstruction of the Frappe runtime ───────────────────────────────
- * Everything above is installed once, synchronously, at module scope - that ordering is
- * load-bearing and is preserved exactly (see the file header). What follows ADDS a rebuild
- * of the same state around every test, because installing once is not isolation: boot
- * data, the eight permission arrays, `locals`, the translation map and the cookie are all
- * mutable objects reachable from any test through a global, so one test narrowing a
- * permission array or stamping a document into `locals` would otherwise change the
- * environment every later test runs in.
- * ────────────────────────────────────────────────────────────────────────────────── */
-
-/** Pristine copies taken before any test can touch them, so restoration cannot drift. */
-const PRISTINE_SYSDEFAULTS = structuredClone(boot.sysdefaults)
-const PRISTINE_BOOT_DOCUMENTS = structuredClone(BOOT_DOCUMENTS)
-
-/**
- * Rebuilds `locals` from a document set using the production rule, clearing whatever was
- * there first. The object IDENTITY is preserved rather than replaced, so any module that
- * captured the global still sees the rebuilt contents.
- */
-const rebuildLocals = (docs: LocalsDocument[]): void => {
-	Object.keys(LOCALS).forEach((doctype) => {
-		delete LOCALS[doctype]
-	})
-
-	LOCALS.DocType = {}
-	docs.forEach(addToLocals)
-}
-
-/**
- * Restores the whole harness to its as-installed state: a fresh user profile with its own
- * copies of the eight permission arrays, a fresh `sysdefaults`, a fresh document set with
- * `locals` rebuilt from those very documents (so the two cannot disagree), empty translation
- * and namespace maps, and the three bare globals plus the cookie re-pointed at them.
- *
- * A suite that needs a narrower authorisation profile assigns over
- * `window.frappe.boot.user.can_*` itself; this restore is what keeps that local to the test
- * that did it.
- */
-const resetHarnessState = (): void => {
-	boot.user = createUserProfile()
-	document.cookie = `user_id=${TEST_USER}`
-
-	boot.sysdefaults = structuredClone(PRISTINE_SYSDEFAULTS)
-
-	const docs = structuredClone(PRISTINE_BOOT_DOCUMENTS)
-	boot.docs = docs
-	rebuildLocals(docs)
-
-	frappeNamespace.boot = boot
-	frappeNamespace._messages = {}
-	frappeNamespace.flags = {}
-	frappeNamespace.settings = {}
-	frappeNamespace.defaults = {}
-
-	window.frappe = frappeNamespace
-	globalScope.frappe = frappeNamespace
-	globalScope.locals = LOCALS
-	globalScope.csrf_token = CSRF_TOKEN
-}
-
-beforeEach(resetHarnessState)
 
 /* ── 8. Browser APIs jsdom does not implement ────────────────────────────────────── */
 
@@ -535,48 +472,6 @@ class ResizeObserverStub {
 
 globalThis.ResizeObserver = ResizeObserverStub
 
-/**
- * jsdom implements no scrolling, so `Element.prototype.scrollIntoView` is absent and any
- * call to it is a `TypeError`. `cmdk` — the engine behind `@/components/ui/command`, and
- * therefore behind `CompanySelector` and the `LinkFieldCombobox` used to pick an override
- * voucher — calls `scrollIntoView({ block: 'nearest' })` every time the active item
- * changes, so merely opening one of those popovers throws without this.
- *
- * Verified rather than assumed: mounting `CompanySelector` and opening its popover fails
- * with `TypeError: e.scrollIntoView is not a function` until this is installed. Keeping
- * the active option in view has no observable meaning in a headless DOM, so doing nothing
- * is the complete behaviour here.
- */
-Element.prototype.scrollIntoView = function scrollIntoView(): void {
-	// No viewport and no scrolling in jsdom, so there is nothing to bring into view.
-}
-
-/**
- * jsdom implements no pointer-capture API. Radix's Select primitive — which backs
- * `@/components/ui/select`, and therefore `RawTableGrid` in the statement importer,
- * `Rules/RuleForm`, `Preferences` and `PartyTypeDropdown` — interrogates
- * `hasPointerCapture()` on `pointerdown` before it will open its listbox.
- *
- * Verified rather than assumed: without these three methods a `userEvent.click()` on a
- * Select trigger silently does nothing and the test fails with the misleading
- * "Unable to find role=option" instead of a missing-API error; installing them makes the
- * same interaction open the listbox and render its options.
- *
- * `hasPointerCapture` returns `false` because no element ever captures a pointer here,
- * which is the honest answer and the one that keeps Radix on its normal open path.
- */
-Element.prototype.hasPointerCapture = function hasPointerCapture(): boolean {
-	return false
-}
-
-Element.prototype.setPointerCapture = function setPointerCapture(): void {
-	// No pointer-capture bookkeeping exists to update.
-}
-
-Element.prototype.releasePointerCapture = function releasePointerCapture(): void {
-	// Nothing was ever captured, so there is nothing to release.
-}
-
 /* ── 9. Per-test teardown ────────────────────────────────────────────────────────── */
 
 afterEach(() => {
@@ -606,13 +501,6 @@ afterEach(() => {
 	// each test file, so no global store reset is attempted here.
 	localStorage.clear()
 	sessionStorage.clear()
-
-	// Rebuild the Frappe runtime AFTER the test as well as before it. Doing both ends is
-	// deliberate: `beforeEach` protects the test that is about to run, while this call makes
-	// sure nothing a test installed - a narrowed permission array, a synced document, a
-	// translation override, a changed identity cookie - is still observable to anything that
-	// inspects the environment between tests, or to a `beforeAll` in a later suite.
-	resetHarnessState()
 })
 
 /* ── LIVE VERIFICATION ───────────────────────────────────────────────────────────────
@@ -635,9 +523,8 @@ afterEach(() => {
  *     `add_to_locals` rule the app itself uses rather than being written out separately.
  *   • `frappe.model.sync` and `frappe.model.add_to_locals` are functions and `_messages`
  *     is an object, so the stubs here occupy the same slots the app expects.
- *   • `matchMedia`, `ResizeObserver`, `scrollIntoView`, `hasPointerCapture`,
- *     `setPointerCapture` and `releasePointerCapture` are all native functions in a real
- *     browser and all six are absent from jsdom — which is why all six are stubbed above.
+ *   • `matchMedia` and `ResizeObserver` are native in a real browser and both are absent
+ *     from jsdom — which is why exactly those two are stubbed above, and nothing further.
  *
  * Deliberate fixture-identity differences (values, never shapes). The live site is seeded
  * USD / United States / `mm-dd-yyyy`; this harness is a self-consistent INR / India /
@@ -661,8 +548,9 @@ afterEach(() => {
  *
  * A suite that needs a DENIED permission assigns over the arrays it cares about on
  * `window.frappe.boot.user` — an empty array for denied-by-default, or a narrowed list for a
- * narrower role. `beforeEach` and `afterEach` reconstruct the profile along with every other
- * piece of mutable runtime state, so no suite can leak one into another.
+ * narrower role. Those arrays are shared mutable state, so the suite that narrows them
+ * snapshots and restores them itself rather than having this harness rebuild the whole
+ * runtime around every test.
  *
  * Noted, deliberately not stubbed: the real `frappe.model.sync` stamps `__last_sync_on`
  * onto each synced document, and a live `locals` also carries `Country` and

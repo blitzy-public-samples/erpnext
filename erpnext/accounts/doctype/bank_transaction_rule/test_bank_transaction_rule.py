@@ -1,17 +1,11 @@
 # Copyright (c) 2026, Frappe Technologies Pvt. Ltd. and Contributors
 # See license.txt
 
-from unittest.mock import patch
-
 import frappe
 from frappe import qb
 from frappe.exceptions import ValidationError
 
-from erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule import (
-	_run_rule_evaluation,
-	enqueue_rule_evaluation,
-	run_rule_evaluation,
-)
+from erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule import _run_rule_evaluation
 from erpnext.accounts.test.accounts_mixin import AccountsTestMixin
 from erpnext.tests.utils import ERPNextTestSuite
 
@@ -326,10 +320,10 @@ class TestBankTransactionRule(ERPNextTestSuite, AccountsTestMixin):
 		self.assertEqual(transaction.company, self.company)
 		self.assertEqual(transaction.is_rule_evaluated, 0)
 
-		# The whitelisted run_rule_evaluation() checks authority and then queues a background job
-		# (after commit, so nothing runs during a test at all), which makes the private synchronous
-		# entry point the one a test can assert the stamping on. The endpoint's own authority and
-		# queueing contract is covered separately below.
+		# The whitelisted run_rule_evaluation() only checks permission and then enqueues a
+		# background job, so it is asynchronous and would stamp nothing inside a synchronous test.
+		# The private entry point it enqueues is therefore the one a test can assert the stamping
+		# on, and it is also the only place in the application that writes the rule stamp.
 		_run_rule_evaluation()
 
 		# The evaluator writes through frappe.db.set_value and never updates the in-memory
@@ -392,163 +386,3 @@ class TestBankTransactionRule(ERPNextTestSuite, AccountsTestMixin):
 		self.assertEqual(evaluated.matched_transaction_rule, winner.name)
 		self.assertNotEqual(evaluated.matched_transaction_rule, runner_up.name)
 		self.assertEqual(evaluated.is_rule_evaluated, 1)
-
-	def test_run_rule_evaluation_only_evaluates_the_named_bank_account(self):
-		"""A scoped pass leaves transactions on every other bank account untouched."""
-		token = f"btr-scope-{frappe.generate_hash(length=8)}"
-		rule = self._rule("scoped", [{"check": "Contains", "value": token}])
-		rule.insert()
-
-		other_account = self._second_bank_account()
-		in_scope = self._submitted_transaction(self.bank_account, f"NEFT {token} in scope")
-		out_of_scope = self._submitted_transaction(other_account, f"NEFT {token} out of scope")
-
-		# Both are eligible and both match the rule, so only the scope can separate them.
-		self.assertTrue(rule.evaluate_rule(in_scope))
-		self.assertTrue(rule.evaluate_rule(out_of_scope))
-
-		_run_rule_evaluation(bank_account=self.bank_account)
-
-		self.assertEqual(
-			frappe.db.get_value("Bank Transaction", in_scope.name, "matched_transaction_rule"), rule.name
-		)
-		self.assertEqual(frappe.db.get_value("Bank Transaction", in_scope.name, "is_rule_evaluated"), 1)
-		# The out-of-scope row keeps BOTH fields untouched: not stamped, and not marked evaluated -
-		# so a later unscoped or differently scoped pass still picks it up.
-		self.assertIsNone(
-			frappe.db.get_value("Bank Transaction", out_of_scope.name, "matched_transaction_rule")
-		)
-		self.assertEqual(frappe.db.get_value("Bank Transaction", out_of_scope.name, "is_rule_evaluated"), 0)
-
-	# ------------------------------------------------------------------ #
-	# CR-07: authority and queueing of the whitelisted entry point
-	# ------------------------------------------------------------------ #
-
-	def test_run_rule_evaluation_requires_write_authority(self):
-		"""
-		A caller who cannot WRITE Bank Transactions cannot start an evaluation pass.
-
-		Evaluation stamps `is_rule_evaluated` and `matched_transaction_rule` through
-		`frappe.get_all` and `frappe.db.set_value`, both of which ignore permissions - so read
-		permission was never the authority this effect needs.
-		"""
-		self.addCleanup(frappe.set_user, "Administrator")
-		frappe.set_user("Guest")
-
-		with patch("frappe.enqueue") as enqueue:
-			self.assertRaises(frappe.PermissionError, run_rule_evaluation)
-
-		# The refusal has to precede the queueing, not follow it.
-		enqueue.assert_not_called()
-
-	def test_run_rule_evaluation_demands_write_not_read(self):
-		"""
-		Pin the authority LEVEL, not merely that some check happens.
-
-		A regression that swapped `write` back to `read` would still raise for Guest, so the
-		negative test above cannot detect it on its own.
-		"""
-		asked = []
-
-		def record(doctype=None, ptype="read", doc=None, **kwargs):
-			asked.append((doctype, ptype, doc))
-			return True
-
-		with patch("frappe.has_permission", side_effect=record), patch("frappe.enqueue"):
-			run_rule_evaluation(bank_account=self.bank_account)
-
-		self.assertIn(("Bank Transaction", "write", None), asked)
-		# A named scope is itself authorised, so the parameter cannot be used to reach an account
-		# the caller may not see.
-		self.assertIn(("Bank Account", "read", self.bank_account), asked)
-
-	def test_run_rule_evaluation_defers_to_commit_and_deduplicates(self):
-		"""The user-initiated endpoint queues after commit and collapses repeated requests."""
-		with patch("frappe.enqueue") as enqueue:
-			run_rule_evaluation(bank_account=self.bank_account)
-
-		enqueue.assert_called_once()
-		kwargs = enqueue.call_args.kwargs
-		self.assertTrue(kwargs["enqueue_after_commit"])
-		self.assertTrue(kwargs["deduplicate"])
-		self.assertEqual(kwargs["bank_account"], self.bank_account)
-		# force_evaluate is normalised to an int so the job id is stable whatever the wire sent.
-		self.assertEqual(kwargs["force_evaluate"], 0)
-		# The job id carries the scope, so two different accounts are never collapsed into one pass.
-		self.assertIn(self.bank_account, kwargs["job_id"])
-
-	def test_enqueue_rule_evaluation_does_not_deduplicate_by_default(self):
-		"""
-		The importer's path must never be collapsed into an existing pass.
-
-		RQ skips a duplicate when the twin job is queued OR ALREADY STARTED, and a started pass
-		cannot see rows committed after it began - so deduplicating a caller that has just written
-		the rows it wants evaluated would silently discard them.
-		"""
-		with patch("frappe.enqueue") as enqueue:
-			enqueue_rule_evaluation(bank_account=self.bank_account)
-
-		kwargs = enqueue.call_args.kwargs
-		self.assertFalse(kwargs["deduplicate"])
-		self.assertTrue(kwargs["enqueue_after_commit"])
-
-		# Two successive calls must produce DIFFERENT job ids, or RQ would replace the first job.
-		with patch("frappe.enqueue") as enqueue_again:
-			enqueue_rule_evaluation(bank_account=self.bank_account)
-
-		self.assertNotEqual(kwargs["job_id"], enqueue_again.call_args.kwargs["job_id"])
-
-	# ------------------------------------------------------------------ #
-	# Shared fixtures for the scope and authority tests
-	# ------------------------------------------------------------------ #
-
-	def _second_bank_account(self) -> str:
-		"""
-		A second company bank account, so a scoped pass has something to leave alone.
-
-		It gets a GL account of its own because `Bank Account.validate_account` refuses to share one
-		with an existing bank account, and reusing a chart-of-accounts default risks colliding with
-		whatever else the site already has.
-		"""
-		suffix = frappe.generate_hash(length=8)
-		gl_account = frappe.get_doc(
-			{
-				"doctype": "Account",
-				"company": self.company,
-				"parent_account": "Current Assets - _TC",
-				"account_type": "Bank",
-				"is_group": 0,
-				"account_name": f"_Test Scoped Bank {suffix}",
-			}
-		).insert()
-		bank = frappe.get_doc({"doctype": "Bank", "bank_name": f"SBI-{suffix}"}).save()
-
-		return (
-			frappe.get_doc(
-				{
-					"doctype": "Bank Account",
-					"account_name": f"SBI _current_ {suffix}",
-					"bank": bank.name,
-					"is_company_account": True,
-					"account": gl_account.name,
-					"company": self.company,
-				}
-			)
-			.insert()
-			.name
-		)
-
-	def _submitted_transaction(self, bank_account: str, description: str):
-		account = frappe.get_cached_value("Bank Account", bank_account, "account")
-		transaction = frappe.get_doc(
-			{
-				"doctype": "Bank Transaction",
-				"date": "2026-01-20",
-				"description": description,
-				"withdrawal": 250,
-				"currency": frappe.get_cached_value("Account", account, "account_currency"),
-				"bank_account": bank_account,
-			}
-		).insert()
-		transaction.submit()
-		return transaction

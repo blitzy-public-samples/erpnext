@@ -136,14 +136,6 @@ class BankTransaction(Document):
 			self.auto_set_party()
 
 	def before_update_after_submit(self):
-		# MJ-09: `validate()` does not run for an update-after-submit, so the currency check it
-		# performs was skipped on the one path that matters most - the reconciliation posting, which
-		# reaches the database through `save()` on an already-submitted transaction. A transaction
-		# whose currency no longer agrees with its Bank Account's account currency could therefore be
-		# allocated against vouchers in a different currency, producing allocations that the amounts
-		# do not actually support. Validating here puts the check inside the posting operation, where
-		# a mismatch is refused before any allocation or clearance is written.
-		self.validate_currency()
 		self.validate_duplicate_references()
 		self.update_allocated_amount()
 		self.delink_old_payment_entries()
@@ -375,13 +367,7 @@ def get_doctypes_for_bank_reconciliation():
 	return frappe.get_hooks("bank_reconciliation_doctypes")
 
 
-# CR-08: POST only. This endpoint removes payment entries from a submitted Bank Transaction and
-# CANCELS every voucher that reconciliation created, so it is about as state-changing as an endpoint
-# in this module gets. A bare `@frappe.whitelist()` also accepts GET, and Frappe does not enforce CSRF
-# protection on GET requests - which made the whole operation reachable from a link or an image tag in
-# any page the user happened to open while logged in. `unreconcile_transaction_entry` below, which
-# does strictly less, was already POST-only; this simply brings the two into line.
-@frappe.whitelist(methods=["POST"])
+@frappe.whitelist()
 def unreconcile_transaction(transaction_name: str | int):
 	"""
 	Unreconcile an entire bank transaction - this does not handle individual entries but clears the entire transaction

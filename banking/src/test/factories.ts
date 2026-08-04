@@ -128,7 +128,7 @@ export const TEST_ALTERNATE_DATE = '2024-01-09'
  */
 export const TEST_TRANSACTION_AMOUNT = 12500
 
-export const TEST_ALTERNATE_AMOUNT = 8750
+const TEST_ALTERNATE_AMOUNT = 8750
 
 /**
  * The base transaction's `reference_number` and the suggested voucher's `reference_no`, so they form
@@ -151,13 +151,13 @@ export const TEST_REFERENCE_NUMBER = 'NEFT/2024/000145'
  * {@link TEST_REFERENCE_NUMBER} or of the base description — otherwise it would read as a partial
  * match instead of "No Match".
  */
-export const TEST_ALTERNATE_REFERENCE_NUMBER = 'JV-ADJ-2024-0007'
+const TEST_ALTERNATE_REFERENCE_NUMBER = 'JV-ADJ-2024-0007'
 
 export const TEST_TRANSACTION_DESCRIPTION = 'NEFT credit from ACME Traders'
 
-export const TEST_CREATION_TIMESTAMP = '2024-01-15 10:30:00.000000'
+const TEST_CREATION_TIMESTAMP = '2024-01-15 10:30:00.000000'
 
-export const TEST_MODIFIED_TIMESTAMP = '2024-01-15 10:31:12.000000'
+const TEST_MODIFIED_TIMESTAMP = '2024-01-15 10:31:12.000000'
 
 /* ═══ 2. Bank transactions ════════════════════════════════════════════════════════════
  * THE BACKEND CONTRACT. `get_bank_transactions` selects SIXTEEN columns
@@ -566,7 +566,7 @@ export const makeSelectedBank = (overrides: Partial<SelectedBank> = {}): Selecte
  * module-private, and exporting it purely to satisfy a fixture would widen the module's public
  * surface for the benefit of a test.
  */
-export interface BankAccountListRow {
+interface BankAccountListRow {
 	name: string
 	account?: string
 	company?: string
@@ -635,9 +635,9 @@ const LINKED_PAYMENT_RANK_INDICATORS = {
 	'Purchase Invoice': ['party', 'amount']
 } as const satisfies Record<string, readonly LinkedPaymentRankIndicator[]>
 
-export type LinkedPaymentRankIndicator = 'reference' | 'amount' | 'party' | 'unallocated'
+type LinkedPaymentRankIndicator = 'reference' | 'amount' | 'party' | 'unallocated'
 
-export type LinkedPaymentBranch = keyof typeof LINKED_PAYMENT_RANK_INDICATORS
+type LinkedPaymentBranch = keyof typeof LINKED_PAYMENT_RANK_INDICATORS
 
 /**
  * The `rank` the named branch would compute for a row matching the given indicators — DERIVED from
@@ -646,7 +646,7 @@ export type LinkedPaymentBranch = keyof typeof LINKED_PAYMENT_RANK_INDICATORS
  * An indicator the branch does not measure is silently ignored, exactly as the SQL does: asking for
  * `party` on a Journal Entry row adds nothing, because that query has no party term.
  */
-export const linkedPaymentRank = (
+const linkedPaymentRank = (
 	branch: LinkedPaymentBranch,
 	matched: Partial<Record<LinkedPaymentRankIndicator, boolean>> = {}
 ): number =>
@@ -752,15 +752,13 @@ export const makeAlternateLinkedPayment = (overrides: Partial<LinkedPayment> = {
  *
  * It is the Purchase Invoice branch specifically, and NOT "the invoice branches" generally: Sales
  * Invoice blanks only its reference DATE and projects a real, nullable
- * `Sales Invoice Payment.reference_no` (`bank_reconciliation_tool.py:1474-1475`). That case has its
- * own builder — {@link makeSalesInvoiceLinkedPayment} — because a row carrying a usable reference
- * grades differently from one that cannot.
+ * `Sales Invoice Payment.reference_no` (`bank_reconciliation_tool.py:1474-1475`), so a row carrying
+ * a usable reference grades differently from one that cannot. Pass `reference_no` explicitly to
+ * model that half of the projection.
  *
  * The amount deliberately AGREES with {@link makeUnreconciledTransaction}, which is what makes this
- * fixture worth having. Amount agreement alone must NOT promote a voucher to "suggested": the
- * blank reference has to contribute nothing. Under the previous inline comparison it contributed a
- * spurious partial match - `''.includes` aside, `includes('')` is always true - and the row was
- * presented in green as though the rule engine had proposed it.
+ * fixture worth having: it lets a suite assert the badge grid against a shape the endpoint really
+ * produces rather than only against tidy ones.
  */
 export const makeBlankReferenceLinkedPayment = (overrides: Partial<LinkedPayment> = {}): LinkedPayment =>
 	makeLinkedPayment({
@@ -773,64 +771,6 @@ export const makeBlankReferenceLinkedPayment = (overrides: Partial<LinkedPayment
 		paid_amount: TEST_TRANSACTION_AMOUNT,
 		reference_no: '',
 		reference_date: '',
-		posting_date: TEST_ALTERNATE_DATE,
-		party_type: 'Supplier',
-		party: 'Globex Supplies',
-		...overrides
-	})
-
-/**
- * A SALES INVOICE row, whose reference projection is asymmetric and is the one shape easiest to get
- * wrong: `get_si_matching_query` selects the real `sip.reference_no` off
- * `Sales Invoice Payment` — which is NULLABLE, not constant — while blanking `reference_date` with
- * `ConstantColumn("")` (`bank_reconciliation_tool.py:1471-1478`). Its `party_type` is
- * `ConstantColumn("Customer")`.
- *
- * So this builder defaults to a row that DOES carry a reference number and does NOT carry a
- * reference date. Pass `reference_no: null` for the other half of the projection — a sales invoice
- * whose payment row has no reference recorded — which is the case a fixture modelled on the Purchase
- * Invoice branch could never produce:
- *
- *     makeSalesInvoiceLinkedPayment({ reference_no: null })
- *
- * The reference deliberately AGREES with {@link makeUnreconciledTransaction}, so the reference
- * grader has something real to match; the blank DATE must still contribute nothing on its own.
- */
-export const makeSalesInvoiceLinkedPayment = (overrides: Partial<LinkedPayment> = {}): LinkedPayment =>
-	makeLinkedPayment({
-		// Sales Invoice sums reference, party and amount. This row agrees on reference, amount and
-		// party, so it is at the branch maximum of 4.
-		rank: linkedPaymentRank('Sales Invoice', { reference: true, amount: true, party: true }),
-		doctype: 'Sales Invoice',
-		name: 'ACC-SINV-2024-00001',
-		paid_amount: TEST_TRANSACTION_AMOUNT,
-		reference_no: TEST_REFERENCE_NUMBER,
-		reference_date: '',
-		posting_date: TEST_TRANSACTION_DATE,
-		party_type: 'Customer',
-		party: 'ACME Traders',
-		...overrides
-	})
-
-/**
- * A JOURNAL ENTRY row whose reference columns are NULL rather than empty, which is what
- * `Max(je.cheque_no)` yields when no row in the group carries a cheque number. Distinct from
- * {@link makeBlankReferenceLinkedPayment} because `null` and `''` reach a naive comparison
- * differently - `null === undefined` is false while `'' === ''` is true - so both shapes have to be
- * covered to prove the grader treats "absent" uniformly.
- *
- * The amount agrees here too, for the same reason.
- */
-export const makeNullReferenceLinkedPayment = (overrides: Partial<LinkedPayment> = {}): LinkedPayment =>
-	makeLinkedPayment({
-		// Journal Entry sums reference and amount. The reference is NULL so it scores nothing there;
-		// the amount agrees, giving 2 of a possible 3.
-		rank: linkedPaymentRank('Journal Entry', { amount: true }),
-		doctype: 'Journal Entry',
-		name: 'ACC-JV-2024-00002',
-		paid_amount: TEST_TRANSACTION_AMOUNT,
-		reference_no: null,
-		reference_date: null,
 		posting_date: TEST_ALTERNATE_DATE,
 		party_type: 'Supplier',
 		party: 'Globex Supplies',
@@ -1093,16 +1033,15 @@ export const makeMessageOnlyError = (
 	})
 
 /** The message `insert_transactions` rejects an unreadable or empty statement with. */
-export const IMPORT_FAILURE_MESSAGE = 'No tables found in the PDF file'
+const IMPORT_FAILURE_MESSAGE = 'No tables found in the PDF file'
 
 /**
- * Builds the value held by `bankRecImportFailuresAtom`: a `Map` from `Bank Statement Import Log` name
- * to the message the server refused that import with.
+ * Builds the value held by `bankRecImportFailuresAtom`: a `Record` from `Bank Statement Import Log`
+ * name to the RAW `FrappeError` the server refused that import with.
  *
- * A `Map` because that is the atom's actual type, and it is a `Map` for a reason worth preserving in
- * the fixture — a plain object answers a membership test for `__proto__`, `constructor` and
- * `toString` whether or not anything was recorded under them, so a fixture built as `{}` could not
- * distinguish "recorded" from "inherited".
+ * The raw error rather than a parsed string, because that is the atom's contract: the rendering layer
+ * parses it through the same shared path every other reported failure goes through, so a marker and a
+ * dialog can never disagree about the same refusal.
  *
  * The marker supplements, never replaces, the document: `Bank Statement Import Log` offers only
  * `Not Started` and `Completed` and carries no error field, and a refused import rolls back, so the
@@ -1116,7 +1055,7 @@ export const IMPORT_FAILURE_MESSAGE = 'No tables found in the PDF file'
 export const makeImportFailures = (
 	log: BankStatementImportLog,
 	message: string = IMPORT_FAILURE_MESSAGE
-): Map<string, string> => new Map([[log.name, message]])
+): Record<string, FrappeError> => ({ [log.name]: makeServerMessagesError(message) })
 
 /* Every suite mocks the SDK through {@link createFrappeSDKMock}, so none hand-rolls a module mock or
  * omits a symbol. The `vi.mock('frappe-react-sdk', () => createFrappeSDKMock())` line must stay
@@ -1135,7 +1074,7 @@ export const makeImportFailures = (
  *
  * ─── Which symbols are stubbed, and which must NOT be ────────────────────────────────
  * Every `from 'frappe-react-sdk'` import in the APPLICATION code under `src/` was
- * enumerated: EIGHTEEN distinct symbols, of which FOURTEEN are used as VALUES and are
+ * enumerated: SEVENTEEN distinct symbols, of which THIRTEEN are used as VALUES and are
  * stubbed below, while four — `FrappeError`, `FrappeConfig`, `SWRConfiguration` and
  * `Filter` — appear only in type positions.
  *
@@ -1143,13 +1082,13 @@ export const makeImportFailures = (
  * esbuild drops an import specifier that survives only in a type annotation, so the name
  * never reaches Vite's import validation. Verified rather than assumed — `BankBalance.tsx`
  * (`FrappeConfig`), `LinkFieldCombobox.tsx` (`Filter`), `MatchAndReconcile.tsx` and
- * `pages/BankStatementImporter.tsx` all import cleanly against this fourteen-symbol mock.
+ * `pages/BankStatementImporter.tsx` all import cleanly against this thirteen-symbol mock.
  * Adding a runtime stub for a type would be inventing an export the library does not have.
  *
  * This module itself imports five FURTHER type-only names — `Key`, `GetDocListArgs`,
  * `FileArgs`, `FrappeFileUploadResponse` and `DocumentUpdateEventData` — to derive the
  * contracts in §8a. They are `import type` and therefore erased outright, so the runtime
- * surface a suite receives is still exactly fourteen symbols.
+ * surface a suite receives is still exactly thirteen symbols.
  *
  * ─── Return shapes are the library's, not a guess ────────────────────────────────────
  * Each shape below was read off `frappe-react-sdk/dist/lib/index.d.ts`, then cross-checked
@@ -1202,9 +1141,8 @@ export const makeImportFailures = (
  * of a scenario rather than the scenario itself. So are the document-event emitters, which
  * nothing in the SPA calls.
  *
- * Opting in is a one-liner, and {@link makeReconcileSuccessResponse} /
- * {@link makeImportSuccessResponse} make the payload contract-valid by construction rather
- * than hand-shaped per suite.
+ * Opting in is a one-liner, and {@link makeReconcileSuccessResponse} makes the payload
+ * contract-valid by construction rather than hand-shaped per suite.
  * ══════════════════════════════════════════════════════════════════════════════════ */
 
 /* ─── 8a. Callable contracts, derived from the installed declarations ──────────────────
@@ -1344,29 +1282,6 @@ interface MockedUpdateDocResult {
 }
 
 type MockedUpdateDocHook = () => MockedUpdateDocResult
-
-/**
- * The `deleteDoc` returned by `useFrappeDeleteDoc` (`index.d.ts:238`). It resolves to
- * `{ message: string }`, which the library documents as `"ok"` on success.
- *
- * `pages/BankStatementImporter.tsx` uses this seam for exactly one purpose - removing the private
- * statement upload when the `Bank Statement Import Log` insert that would have owned it is refused -
- * so the spy exists to make that CLEANUP assertable. `docname` is optional in the library signature
- * and is mirrored as such here rather than narrowed, so a call that forgot it still type-checks and is
- * caught by an assertion instead of by the compiler refusing to model the real API.
- */
-type MockedDeleteDoc = (doctype: string, docname?: string | null) => Promise<{ message: string }>
-
-/** `index.d.ts:236-249`, which carries no `result` member and types `error` as `Error | null | undefined`. */
-interface MockedDeleteDocResult {
-	deleteDoc: MockedDeleteDoc
-	loading: boolean
-	error: FrappeError | null | undefined
-	isCompleted: boolean
-	reset: () => void
-}
-
-type MockedDeleteDocHook = () => MockedDeleteDocResult
 
 /**
  * The `upload` returned by `useFrappeFileUpload` (`index.d.ts:433`). It resolves to the File
@@ -1512,7 +1427,7 @@ type MockedContextUploadFile = (
  * NOT quietly succeed, and so anyone meeting the message in a failure report can find its
  * origin by searching for this one constant.
  */
-export const UNCONFIGURED_OPERATION_MESSAGE = 'Unconfigured frappe SDK operation'
+const UNCONFIGURED_OPERATION_MESSAGE = 'Unconfigured frappe SDK operation'
 
 /**
  * Builds the rejection an unconfigured imperative operation produces.
@@ -1551,20 +1466,6 @@ const rejectUnconfigured = (operation: string, how: string): Promise<never> =>
 export const makeReconcileSuccessResponse = (
 	overrides: Partial<BankTransaction> = {}
 ): { message: BankTransaction } => ({ message: makeBankTransaction(overrides) })
-
-/**
- * The success payload of the statement import, shaped exactly as its hook declares it:
- * `useFrappePostCall<{ docs: BankStatementImportLog[] }>('run_doc_method')`.
- *
- * `run_doc_method` always appends the document it ran the method on (`frappe/handler.py:342`), and
- * `insert_transactions` sets `status = "Completed"` and saves as its last act, so a returned
- * document reports the terminal status. The import step reads `docs[0].start_date` / `.end_date` to
- * move the reconciliation date range; it guards on both being present, so a suite can model a
- * response carrying no usable range by passing a log without them, or `[]` for no document at all.
- */
-export const makeImportSuccessResponse = (
-	logs: BankStatementImportLog[] = [makeBankStatementImportLog()]
-): { docs: BankStatementImportLog[] } => ({ docs: logs })
 
 /**
  * The File document the hook upload resolves to (`index.d.ts:401-430`). Every member of that
@@ -1702,19 +1603,6 @@ export const frappeUpdateDoc = vi.fn<MockedUpdateDoc>(() =>
 		'frappeUpdateDoc.mockResolvedValue(makeSelectedBank())'
 	)
 )
-
-/**
- * Stable spy for the `deleteDoc` returned by `useFrappeDeleteDoc`.
- *
- * RESOLVES by default, unlike every other imperative operation here, and the exception is deliberate.
- * This seam is only ever reached on a chain that has ALREADY failed - it removes the private statement
- * upload that the refused import-log insert would have owned - and the production code deliberately
- * swallows its refusal so the reviewer is told about the insert failure rather than about the cleanup.
- * A rejecting default would therefore exercise the swallow branch in every failure test rather than
- * the cleanup itself, which is the behaviour the SEC-09 assertions are about. A suite that wants the
- * refusal drives it explicitly with `frappeDeleteDoc.mockRejectedValue(...)`.
- */
-export const frappeDeleteDoc = vi.fn<MockedDeleteDoc>(async () => ({ message: 'ok' }))
 
 /**
  * Stable spy for the `upload` returned by `useFrappeFileUpload`. Rejects unconfigured, because
@@ -1893,13 +1781,13 @@ export const frappeContextValue = {
  * suite's module graph shares one identity; a fresh context per call would hand `useContext` the
  * default value instead of a provided one.
  */
-export const FrappeContextMock = createContext(frappeContextValue)
+const FrappeContextMock = createContext(frappeContextValue)
 
 /**
  * A pass-through replacement for `FrappeProvider`, so a suite can mount `App`-shaped trees without a
  * server, a socket or a site name.
  */
-export const FrappeProviderMock = ({ children }: { children?: ReactNode }) =>
+const FrappeProviderMock = ({ children }: { children?: ReactNode }) =>
 	createElement(Fragment, null, children)
 
 /**
@@ -1978,14 +1866,6 @@ export const frappeSDKMock = {
 		isCompleted: false,
 		reset: vi.fn<() => void>(() => undefined)
 	})),
-	useFrappeDeleteDoc: vi.fn<MockedDeleteDocHook>(() => ({
-		deleteDoc: frappeDeleteDoc,
-		loading: false,
-		error: null,
-		isCompleted: false,
-		reset: vi.fn<() => void>(() => undefined)
-	})),
-
 	// `progress` completes the library's shape and is read by the importer's upload UI.
 	useFrappeFileUpload: vi.fn<MockedFileUploadHook>(() => ({
 		upload: frappeFileUpload,
@@ -2052,7 +1932,6 @@ export const resetFrappeSDKMock = (): void => {
 		frappePostCall,
 		frappeCreateDoc,
 		frappeUpdateDoc,
-		frappeDeleteDoc,
 		frappeFileUpload,
 		frappeEmitDocOpen,
 		frappeEmitDocClose
@@ -2068,8 +1947,8 @@ export const resetFrappeSDKMock = (): void => {
 
 /**
  * The exact surface {@link createFrappeSDKMock} hands back in place of `frappe-react-sdk`:
- * the twelve hook spies of {@link frappeSDKMock} plus {@link FrappeContextMock} and
- * {@link FrappeProviderMock} — the fourteen runtime symbols enumerated in this module's
+ * the eleven hook spies of {@link frappeSDKMock} plus {@link FrappeContextMock} and
+ * {@link FrappeProviderMock} — the thirteen runtime symbols enumerated in this module's
  * header, and nothing else.
  *
  * Naming that surface is what lets the helper's `overrides` parameter be a typed partial of
@@ -2081,19 +1960,19 @@ export const resetFrappeSDKMock = (): void => {
  * point of there being ONE shared mock, and it is why an override must not be able to
  * introduce a symbol privately.
  */
-export type FrappeSDKMockExports = typeof frappeSDKMock & {
+type FrappeSDKMockExports = typeof frappeSDKMock & {
 	FrappeContext: typeof FrappeContextMock
 	FrappeProvider: typeof FrappeProviderMock
 }
 
 /**
  * THE shared module mock — what a `vi.mock` factory hands back in place of `frappe-react-sdk`. It
- * exposes the twelve hook spies plus `FrappeContext` and `FrappeProvider`, and none of the four
+ * exposes the eleven hook spies plus `FrappeContext` and `FrappeProvider`, and none of the four
  * type-only symbols. The spies are the same identities exported above.
  *
  *     vi.mock('frappe-react-sdk', () => createFrappeSDKMock())
  *
- * It exposes the fourteen runtime symbols and none of the four type-only ones. The spies
+ * It exposes the thirteen runtime symbols and none of the four type-only ones. The spies
  * are the same identities exported above, so a suite mocks and asserts through
  * {@link frappeSDKMock}, {@link frappePostCall} and {@link frappeSWRMutate} without
  * re-deriving anything.

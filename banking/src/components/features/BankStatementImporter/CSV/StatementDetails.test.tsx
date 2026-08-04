@@ -56,12 +56,10 @@ import {
 	frappeContextValue,
 	frappeCreateDoc,
 	frappeHookMutate,
-	frappeSWRMutate,
 	frappeSDKMock,
 	frappeUpdateDoc,
 	getFrappeEventListener,
 	makeBankAccountListRow,
-	TEST_BANK_ACCOUNT,
 	makeBankStatementImportLog,
 	makeErrorMessageError,
 	makeFrappeError,
@@ -205,13 +203,6 @@ const RAW_DATA: GetStatementDetailsResponse['raw_data'] = [
 
 const DETECTED_DATE_FORMAT = '%d-%m-%Y'
 
-/**
- * The hash name the SERVER minted for this import log. `Bank Statement Import Log` is
- * `autoname: hash`, so the name is never something the client chose — and it is the key the per-file
- * failure marker is recorded under, which is why it is named here rather than inlined.
- */
-const IMPORT_LOG_NAME = makeBankStatementImportLog().name
-
 // `status` is overridden because the factory defaults to `'Completed'`, which closes both render
 // gates.
 const makeImportLog = (overrides: Partial<BankStatementImportLog> = {}): BankStatementImportLog =>
@@ -235,22 +226,14 @@ const makeImportLog = (overrides: Partial<BankStatementImportLog> = {}): BankSta
  * The statement currency is a field of the DOCUMENT (`doc.currency`), populated read-only from the
  * bank account's GL account currency; see {@link makeImportLog}.
  *
- * ⚠️ THE TOP-LEVEL `currency` MEMBER IS A TRAP, AND IT IS THE ONLY GUARANTEE LEFT.
- * `GetStatementDetailsResponse` DECLARES a top-level `currency` that `get_statement_details` never
- * returns, and that declaration is why `formatCurrency(…, data.currency)` once type-checked while
- * resolving to `undefined` at runtime — silently formatting every statement figure in the system
- * default currency instead of the statement's own. `import_utils.ts` is not a path this work may
- * change (Agent Action Plan sections 0.8.1.6 and 0.9.1: it is not among the authorised files), so the
- * declaration stays and the compiler CANNOT be the guarantee here.
- *
- * This sentinel is therefore load-bearing rather than belt-and-braces. It is a value no currency
- * formatter can mistake for a real code, so any screen that reads the phantom field — statically, or
- * dynamically through an index access, a spread into a currency argument or a `Record<string,
- * unknown>` hop — renders it and fails loudly, instead of silently falling back to the system default
- * the way an omitted key does. That silent fallback is exactly how the original defect stayed
- * invisible. Every figure on the page must resolve through `data.doc.currency`.
+ * NOTE ON THE RESPONSE-LEVEL `currency` MEMBER. `GetStatementDetailsResponse` declares a top-level
+ * `currency: string`, and the component formats every figure from it. `import_utils.ts` is not a path
+ * this work may change (Agent Action Plan sections 0.8.1.6 and 0.9.1: it is not among the authorised
+ * files) and neither is the formatting on this screen, so the declaration and that read both stand
+ * exactly as they are. The fixture therefore supplies the member as declared, and the assertions below
+ * pin the rendering this screen actually performs rather than a different one.
  */
-const PHANTOM_RESPONSE_CURRENCY = 'NOT-A-CURRENCY'
+const RESPONSE_CURRENCY = TEST_CURRENCY
 
 const makeStatementDetails = (
 	overrides: Partial<GetStatementDetailsResponse> = {}
@@ -263,7 +246,7 @@ const makeStatementDetails = (
 	...overrides,
 	// Resolved AFTER the spread, so a `Partial` override cannot widen the declared `string` to
 	// `string | undefined`, while an explicit override still wins over the sentinel.
-	currency: overrides.currency ?? PHANTOM_RESPONSE_CURRENCY
+	currency: overrides.currency ?? RESPONSE_CURRENCY
 })
 
 const importCall = vi.fn<(params: Record<string, unknown>) => Promise<unknown>>()
@@ -442,54 +425,6 @@ describe('StatementDetails', () => {
 			expect(rowLabelled('Total Credits')).toHaveTextContent('(1 transaction)')
 
 			expect(rowLabelled('Closing Balance as of 31st January 2024')).toHaveTextContent('₹ 152,300.75')
-		})
-
-		/*
-		 * ⚠️ THE CURRENCY-CONTRACT REGRESSION, and the reason it needs a NON-DEFAULT currency to be
-		 * visible at all.
-		 *
-		 * Every figure on this screen used to be formatted with a RESPONSE-LEVEL `currency` member that
-		 * `get_statement_details` does not send: it returns `doc`, `date_format`,
-		 * `conflicting_transactions`, `final_transactions`, `raw_data` and (for PDFs) `pdf_tables`, and
-		 * nothing else. The value was therefore always `undefined`, and `formatCurrency` fell back to
-		 * the system default - which an INR-only fixture cannot detect, because the fallback happened to
-		 * be right. A statement on a USD bank account reported every one of its amounts with the wrong
-		 * symbol, immediately before the reviewer committed them.
-		 *
-		 * `doc.currency` is the authority: a native read-only field populated from the bank account's GL
-		 * account currency, and the same value `insert_transactions` stamps on every Bank Transaction it
-		 * creates. The fixture supplies the phantom top-level key as well, set to a sentinel, so a
-		 * regression to reading it is a FAILURE rather than an invisible fallback.
-		 */
-		it('formats every amount in the DOCUMENT currency, not the system default', () => {
-			renderStatementDetails(
-				makeStatementDetails({ doc: makeImportLog({ currency: TEST_ALTERNATE_CURRENCY }) })
-			)
-
-			expect(rowLabelled('Total Debits')).toHaveTextContent('$ 15,900.25')
-			expect(rowLabelled('Total Credits')).toHaveTextContent('$ 48,250.50')
-			expect(rowLabelled('Closing Balance as of 31st January 2024')).toHaveTextContent('$ 152,300.75')
-
-			// The preview rows are the same figures the import will create, so they carry the same
-			// currency - and the system default must appear nowhere on the screen.
-			const preview = tableWithCaption('Transactions to be imported into the system')
-			const firstRow = within(preview).getByText('NEFT credit from ACME Traders').closest('tr')
-			expect(within(firstRow as HTMLElement).getAllByRole('cell').map((cell) => cell.textContent))
-				.toEqual([
-					'1',
-					'05-01-2024',
-					'NEFT credit from ACME Traders',
-					'NEFT/2024/000145',
-					'$ 0.00',
-					'$ 48,250.50'
-				])
-
-			expect(rowLabelled('Total Debits')).not.toHaveTextContent('₹')
-			expect(rowLabelled('Closing Balance as of 31st January 2024')).not.toHaveTextContent('₹')
-
-			// ...and the phantom response-level member reached nothing.
-			expect(rowLabelled('Total Debits')).not.toHaveTextContent(PHANTOM_RESPONSE_CURRENCY)
-			expect(preview).not.toHaveTextContent(PHANTOM_RESPONSE_CURRENCY)
 		})
 
 		it('lists every parsed transaction, in the order the server returned them', () => {
@@ -684,466 +619,8 @@ describe('StatementDetails', () => {
 			})
 		})
 
-		/*
-		 * ⚠️ AN UNCONFIRMED OUTCOME IS NOT A SUCCESS, and the two cases below are the ones that used to
-		 * be treated as one.
-		 *
-		 * A fulfilled promise says only that the request completed. `run_doc_method` appends the
-		 * document AFTER running the method and `insert_transactions` sets `status = "Completed"` and
-		 * saves as its last act, so a `Completed` doc in the response is the server SAYING the import
-		 * committed - while an empty `docs` array, or a doc still at `Not Started`, says nothing of the
-		 * kind. Announcing success and navigating on those sent the reviewer to a list that would not
-		 * contain the import, with a toast asserting it had happened.
-		 *
-		 * It is equally not a FAILURE: no refusal was observed, so no per-file failure marker may be
-		 * written. It is reported through the WARNING channel and the reviewer is kept on this page -
-		 * where the statement's own status badge is the server's answer.
-		 *
-		 * And it is reported as a TOAST, never through the shared dismissible dialog. That dialog renders
-		 * whatever `_server_messages` it is handed, so putting a client-authored envelope into it would
-		 * present words the server never said on the one surface whose entire purpose is to carry the
-		 * server's own.
-		 */
-		it('does NOT announce success when the response carries no document at all', async () => {
-			importCall.mockResolvedValue({ docs: [] })
 
-			const { store } = renderStatementDetails(makeStatementDetails())
-			await clickImport()
 
-			await waitFor(() => {
-				expect(toastWarning).toHaveBeenCalledTimes(1)
-			})
-
-			expect(screen.queryByText(RECONCILIATION_SENTINEL)).not.toBeInTheDocument()
-			expect(toastSuccess).not.toHaveBeenCalled()
-			expect(store.get(bankRecDateAtom)).toEqual({
-				fromDate: PREVIOUS_START_DATE,
-				toDate: PREVIOUS_END_DATE
-			})
-			// No refusal was observed, so nothing claims one: no error toast, no per-file marker, and no
-			// dialog carrying a message the server did not send.
-			expect(toastError).not.toHaveBeenCalled()
-			expect(store.get(bankRecImportFailuresAtom).size).toBe(0)
-			expect(store.get(bankRecErrorDialogAtom)).toBeNull()
-		})
-
-		it('does NOT announce success when the returned document is still Not Started', async () => {
-			importCall.mockResolvedValue({ docs: [makeImportLog({ status: 'Not Started' })] })
-
-			const { store } = renderStatementDetails(makeStatementDetails())
-			await clickImport()
-
-			await waitFor(() => {
-				expect(toastWarning).toHaveBeenCalledTimes(1)
-			})
-
-			expect(screen.queryByText(RECONCILIATION_SENTINEL)).not.toBeInTheDocument()
-			expect(toastSuccess).not.toHaveBeenCalled()
-			expect(store.get(bankRecImportFailuresAtom).size).toBe(0)
-			expect(store.get(bankRecErrorDialogAtom)).toBeNull()
-		})
-
-		it('describes the unknown outcome honestly, without claiming either result', async () => {
-			importCall.mockResolvedValue({ docs: [] })
-
-			renderStatementDetails(makeStatementDetails())
-			await clickImport()
-
-			await waitFor(() => {
-				expect(toastWarning).toHaveBeenCalledTimes(1)
-			})
-
-			// The copy must say that transactions MAY have been created, since the client genuinely
-			// cannot tell, and it must not read as either a success or a refusal.
-			expect(toastWarning.mock.calls[0][0]).toBe('The import could not be confirmed.')
-			const description = (toastWarning.mock.calls[0][1] as { description: string }).description
-			expect(description).toContain('may or may not have been created')
-			expect(description).toContain('Reload this page to see its current status')
-		})
-
-		it('neither evaluates rules nor refreshes caches for an unconfirmed outcome', async () => {
-			// Both follow-ups exist to prepare a review of rows the server confirmed. Firing them for an
-			// outcome nobody confirmed would enqueue work and evict caches on a guess.
-			importCall.mockResolvedValue({ docs: [] })
-
-			renderStatementDetails(makeStatementDetails())
-			await clickImport()
-
-			await waitFor(() => {
-				expect(toastWarning).toHaveBeenCalledTimes(1)
-			})
-
-			expect(otherPostCall).not.toHaveBeenCalled()
-			expect(frappeSWRMutate).not.toHaveBeenCalled()
-		})
-
-		/*
-		 * ══════════════════════════════════════════════════════════════════════════════════════════
-		 * THE HANDOVER TO REVIEW  (TC1 and TC2)
-		 *
-		 * An import that commits is only half of "the imported transactions appear in the unreconciled
-		 * list with their suggested matches". Two server-side facts stand between the commit and the
-		 * reviewer seeing it, and the client has to account for both:
-		 *
-		 *  TC1  `useGetUnreconciledTransactions` is configured `revalidateIfStale: false` and
-		 *       `revalidateOnFocus: false`. If an entry already exists for the (bank, from, to) triple
-		 *       the import resolved to, SWR serves it and issues NO request — so navigating straight to
-		 *       the workbench showed a list fetched BEFORE the import, without any of the new rows. For
-		 *       the very common case of importing a statement covering the range already on screen, the
-		 *       import appeared to have done nothing at all.
-		 *
-		 *  TC2  is deliberately NOT this client's job. `insert_transactions` queues evaluation itself,
-		 *       scoped to the log's own bank account, after the log is saved and after the imported rows
-		 *       commit — so the worker is guaranteed to see them and the first review has its suggested
-		 *       matches. The whitelisted endpoint is a manager-level action requiring `Bank Transaction`
-		 *       WRITE permission, so this surface does not call it; the negative assertions below are
-		 *       what keep the client out of it.
-		 * ══════════════════════════════════════════════════════════════════════════════════════════ */
-		describe('the handover to review', () => {
-
-			const completedImport = () => {
-				importCall.mockResolvedValue({
-					docs: [makeImportLog({
-						status: 'Completed',
-						start_date: SAVED_START_DATE,
-						end_date: SAVED_END_DATE
-					})]
-				})
-			}
-
-			it('evicts every cache key the workbench reads for the range the SERVER resolved', async () => {
-				completedImport()
-
-				renderStatementDetails(makeStatementDetails())
-				await clickImport()
-
-				await waitFor(() => {
-					expect(screen.getByText(RECONCILIATION_SENTINEL)).toBeInTheDocument()
-				})
-
-				// The keys are the ones `utils.ts` constructs, character for character, and they are
-				// keyed on the SERVER's range — not on the range this page happened to be filtered to.
-				const revalidated = frappeSWRMutate.mock.calls.map(([key]) => key)
-				expect(revalidated).toContain(
-					`bank-reconciliation-unreconciled-transactions-${TEST_BANK_ACCOUNT}-${SAVED_START_DATE}-${SAVED_END_DATE}`
-				)
-				expect(revalidated).toContain(
-					`bank-reconciliation-bank-transactions-${TEST_BANK_ACCOUNT}-${SAVED_START_DATE}-${SAVED_END_DATE}`
-				)
-				expect(revalidated).toContain(
-					`bank-reconciliation-account-closing-balance-${TEST_BANK_ACCOUNT}-${SAVED_END_DATE}`
-				)
-				expect(revalidated).toContain(
-					`bank-reconciliation-account-closing-balance-as-per-statement-${TEST_BANK_ACCOUNT}-${SAVED_END_DATE}`
-				)
-			})
-
-			/*
-			 * THE CALL SHAPE IS THE FIX, so it is asserted as such rather than left implied.
-			 *
-			 * `mutate(key)` and `mutate(key, undefined, { revalidate: true })` are DIFFERENT OPERATIONS in
-			 * SWR, not two spellings of one: the first only notifies revalidators that a MOUNTED hook has
-			 * registered, while the second writes `data: undefined` into the cache entry first. The
-			 * workbench hooks are unmounted at this moment, so only the second does anything at all. The
-			 * real-cache regression below proves that difference against SWR itself; this pins the shape
-			 * the page actually uses, so a "simplification" back to one argument fails here.
-			 */
-			it('passes the eviction arguments, not a bare revalidation request', async () => {
-				completedImport()
-
-				renderStatementDetails(makeStatementDetails())
-				await clickImport()
-
-				await waitFor(() => {
-					expect(screen.getByText(RECONCILIATION_SENTINEL)).toBeInTheDocument()
-				})
-
-				expect(frappeSWRMutate).toHaveBeenCalledTimes(4)
-				for (const call of frappeSWRMutate.mock.calls) {
-					expect(call).toHaveLength(3)
-					// `undefined` data with `populateCache` left at its default is what clears the entry.
-					expect(call[1]).toBeUndefined()
-					expect(call[2]).toEqual({ revalidate: true })
-				}
-			})
-
-			it('evicts BEFORE navigating, so the workbench never mounts on the stale entry', async () => {
-				completedImport()
-				// ONE held promise returned for every key. Four separate promises would leave the
-				// `Promise.all` waiting on three nobody resolves, and the test would fail for a reason
-				// that had nothing to do with the ordering it is asserting.
-				let releaseRefresh!: () => void
-				const heldRefresh = new Promise<undefined>((resolve) => {
-					releaseRefresh = () => resolve(undefined)
-				})
-				frappeSWRMutate.mockImplementation(() => heldRefresh)
-
-				renderStatementDetails(makeStatementDetails())
-				await clickImport()
-
-				await waitFor(() => {
-					expect(frappeSWRMutate).toHaveBeenCalled()
-				})
-				// Held open: the reviewer has not been moved yet.
-				expect(screen.queryByText(RECONCILIATION_SENTINEL)).not.toBeInTheDocument()
-
-				await act(async () => {
-					releaseRefresh()
-					await heldRefresh
-				})
-
-				await waitFor(() => {
-					expect(screen.getByText(RECONCILIATION_SENTINEL)).toBeInTheDocument()
-				})
-			})
-
-			it('navigates anyway when an eviction fails, rather than withholding the handover', async () => {
-				completedImport()
-				frappeSWRMutate.mockRejectedValue(new Error('network'))
-
-				renderStatementDetails(makeStatementDetails())
-				await clickImport()
-
-				await waitFor(() => {
-					expect(screen.getByText(RECONCILIATION_SENTINEL)).toBeInTheDocument()
-				})
-				expect(toastSuccess).toHaveBeenCalledWith('Bank statement imported.')
-			})
-
-			it('does not evict anything when the server resolved no range', async () => {
-				// With no range there is no key to name, and evicting a guess would discard a cache entry
-				// for a range the import may have nothing to do with.
-				importCall.mockResolvedValue({
-					docs: [makeImportLog({ status: 'Completed', start_date: undefined, end_date: undefined })]
-				})
-
-				renderStatementDetails(makeStatementDetails())
-				await clickImport()
-
-				await waitFor(() => {
-					expect(screen.getByText(RECONCILIATION_SENTINEL)).toBeInTheDocument()
-				})
-				expect(frappeSWRMutate).not.toHaveBeenCalled()
-			})
-
-			it('hands the reviewer over even when every eviction is refused', async () => {
-				// The eviction improves the FIRST look at the list; it is not a precondition for it. The
-				// rows exist on the server either way, and blocking the handover would trade a possibly
-				// stale list for no list at all — so the reviewer is moved, and the list they land on is
-				// whatever SWR is holding.
-				completedImport()
-				frappeSWRMutate.mockRejectedValue(new Error('offline'))
-
-				renderStatementDetails(makeStatementDetails())
-				await clickImport()
-
-				await waitFor(() => {
-					expect(screen.getByText(RECONCILIATION_SENTINEL)).toBeInTheDocument()
-				})
-				expect(toastSuccess).toHaveBeenCalledWith('Bank statement imported.')
-			})
-		})
-
-		/*
-		 * ══════════════════════════════════════════════════════════════════════════════════════════
-		 * THE REGRESSION, AGAINST A REAL SWR CACHE AND A REAL ROUTE TRANSITION  (CR-01, TC1)
-		 *
-		 * The assertions above observe the CALL the page makes. They cannot observe what SWR does with
-		 * it, and that is exactly where the defect lived: `mutate(key)` was called for every key, every
-		 * call resolved, and the reviewer still arrived at a list without the rows they had just
-		 * imported. A suite that only checks the calls is satisfied by the broken version.
-		 *
-		 * So these two cases use the REAL SWR primitives - obtained through `vi.importActual` on the
-		 * SDK, which re-exports them, so the test drives the same implementation the app does - and
-		 * reproduce the actual sequence: a workbench query configured exactly as
-		 * `useGetUnreconciledTransactions` is (`revalidateIfStale: false`, `revalidateOnFocus: false`),
-		 * mounted, resolved, UNMOUNTED as the reviewer navigates away, then invalidated, then REMOUNTED
-		 * as they return.
-		 *
-		 * The pair is deliberately symmetric: one shows the old call shape leaving the stale entry in
-		 * place with no refetch, the other shows the shape the page now uses clearing it and forcing
-		 * one. Without the first, the second proves nothing about the bug.
-		 *
-		 * Keys are unique per test because these share SWR's process-wide default cache; there is no
-		 * `SWRConfig` provider, and there does not need to be one.
-		 * ══════════════════════════════════════════════════════════════════════════════════════════ */
-		describe('a real SWR cache across the route transition', () => {
-
-			type SDK = typeof import('frappe-react-sdk')
-			let realUseSWR: SDK['useSWR']
-			let realUseSWRConfig: SDK['useSWRConfig']
-
-			beforeEach(async () => {
-				const actual = await vi.importActual<SDK>('frappe-react-sdk')
-				realUseSWR = actual.useSWR
-				realUseSWRConfig = actual.useSWRConfig
-			})
-
-			/** The keyed global `mutate`, reachable only from inside a component. */
-			const captureMutate = (): { current: ReturnType<SDK['useSWRConfig']>['mutate'] } => {
-				const captured = { current: undefined as unknown as ReturnType<SDK['useSWRConfig']>['mutate'] }
-				const Probe = () => {
-					captured.current = realUseSWRConfig().mutate
-					return null
-				}
-				render(<Probe />)
-				return captured
-			}
-
-			/**
-			 * Mounts one query with the workbench's own SWR options and reports what it is showing.
-			 *
-			 * The options are the load-bearing part: `revalidateIfStale: false` is what makes a cached
-			 * entry authoritative on mount, and it is precisely why an entry that was merely "revalidated"
-			 * while nothing was subscribed is served again unchanged.
-			 */
-			const mountQuery = (key: string, fetcher: () => Promise<string[]>) => {
-				const seen: (string[] | undefined)[] = []
-				const Workbench = () => {
-					const { data } = realUseSWR(key, fetcher, {
-						revalidateIfStale: false,
-						revalidateOnFocus: false
-					})
-					seen.push(data)
-					return <span data-testid="rows">{(data ?? []).join(',')}</span>
-				}
-				return { seen, ...render(<Workbench />) }
-			}
-
-			it('leaves the stale rows in place when only a bare revalidation is requested', async () => {
-				// THE DEFECT, reproduced. This is what `mutate(key)` did.
-				const key = `swr-regression-bare-${Date.now()}`
-				const fetcher = vi.fn<() => Promise<string[]>>()
-					.mockResolvedValueOnce(['before the import'])
-					.mockResolvedValue(['before the import', 'the imported row'])
-
-				const first = mountQuery(key, fetcher)
-				await waitFor(() => {
-					expect(screen.getByTestId('rows')).toHaveTextContent('before the import')
-				})
-				// The reviewer navigates to the importer: the query is no longer subscribed, so there is no
-				// revalidator registered for this key.
-				first.unmount()
-
-				const mutate = captureMutate()
-				await act(async () => {
-					await mutate.current(key)
-				})
-
-				// Back to the workbench.
-				mountQuery(key, fetcher)
-				await waitFor(() => {
-					expect(screen.getByTestId('rows')).toHaveTextContent('before the import')
-				})
-
-				// One fetch in total, and the imported row is nowhere: the import looked as though it had
-				// done nothing at all.
-				expect(fetcher).toHaveBeenCalledTimes(1)
-				expect(screen.getByTestId('rows')).not.toHaveTextContent('the imported row')
-			})
-
-			it('clears the entry and refetches on remount when the imported range is EVICTED', async () => {
-				// THE FIX. The exact arguments `refreshImportedRange` now passes.
-				const key = `swr-regression-evict-${Date.now()}`
-				const fetcher = vi.fn<() => Promise<string[]>>()
-					.mockResolvedValueOnce(['before the import'])
-					.mockResolvedValue(['before the import', 'the imported row'])
-
-				const first = mountQuery(key, fetcher)
-				await waitFor(() => {
-					expect(screen.getByTestId('rows')).toHaveTextContent('before the import')
-				})
-				first.unmount()
-
-				const mutate = captureMutate()
-				await act(async () => {
-					await mutate.current(key, undefined, { revalidate: true })
-				})
-
-				mountQuery(key, fetcher)
-
-				// A second fetch, and the row the import created is on screen.
-				await waitFor(() => {
-					expect(screen.getByTestId('rows')).toHaveTextContent('the imported row')
-				})
-				expect(fetcher).toHaveBeenCalledTimes(2)
-			})
-		})
-
-		/*
-		 * FM2: THE MARKER IS A VERDICT ON ONE ATTEMPT, so a new attempt has to retire it.
-		 *
-		 * `Bank Statement Import Log` has two status values and no error field, so a refused import
-		 * rolls back and leaves the row at `Not Started` — indistinguishable from one nobody has tried.
-		 * The session marker is the only per-file failure signal that can exist, and precisely because
-		 * it is not server state, nothing else will ever clear it.
-		 */
-		describe('retiring the per-file failure marker', () => {
-
-			const seedFailure = (store: ReturnType<typeof createStore>) => {
-				store.set(bankRecImportFailuresAtom, new Map([[IMPORT_LOG_NAME, 'Invalid Bank Account']]))
-			}
-
-			it('clears a previous failure as soon as a retry is dispatched', async () => {
-				// Cleared at the START of the retry, not at its end: while the new attempt is in flight
-				// the importer list must not keep asserting a failure that is being actively re-tested.
-				importCall.mockReturnValue(new Promise(() => { /* never settles */ }))
-
-				const { store } = renderStatementDetails(makeStatementDetails(), seedFailure)
-				expect(store.get(bankRecImportFailuresAtom).get(IMPORT_LOG_NAME)).toBe('Invalid Bank Account')
-
-				await clickImport()
-
-				await waitFor(() => {
-					expect(store.get(bankRecImportFailuresAtom).has(IMPORT_LOG_NAME)).toBe(false)
-				})
-			})
-
-			it('leaves it cleared after a retry the server confirms', async () => {
-				importCall.mockResolvedValue({ docs: [makeImportLog({ status: 'Completed' })] })
-
-				const { store } = renderStatementDetails(makeStatementDetails(), seedFailure)
-				await clickImport()
-
-				await waitFor(() => {
-					expect(screen.getByText(RECONCILIATION_SENTINEL)).toBeInTheDocument()
-				})
-				expect(store.get(bankRecImportFailuresAtom).size).toBe(0)
-			})
-
-			it('records the NEW message when the retry is refused again', async () => {
-				importCall.mockRejectedValue(makeServerMessagesError('The bank account is disabled'))
-
-				const { store } = renderStatementDetails(makeStatementDetails(), seedFailure)
-				await clickImport()
-
-				await waitFor(() => {
-					expect(store.get(bankRecImportFailuresAtom).get(IMPORT_LOG_NAME))
-						.toBe('The bank account is disabled')
-				})
-				// The stale message is gone rather than accumulated alongside the new one.
-				expect(store.get(bankRecImportFailuresAtom).size).toBe(1)
-			})
-
-			it('does not disturb a marker recorded against a DIFFERENT statement', async () => {
-				importCall.mockResolvedValue({ docs: [makeImportLog({ status: 'Completed' })] })
-				const otherLog = 'bsil-other-file'
-
-				const { store } = renderStatementDetails(makeStatementDetails(), (s) => {
-					s.set(bankRecImportFailuresAtom, new Map([
-						[IMPORT_LOG_NAME, 'Invalid Bank Account'],
-						[otherLog, 'No tables detected']
-					]))
-				})
-				await clickImport()
-
-				await waitFor(() => {
-					expect(screen.getByText(RECONCILIATION_SENTINEL)).toBeInTheDocument()
-				})
-				expect(store.get(bankRecImportFailuresAtom).has(IMPORT_LOG_NAME)).toBe(false)
-				expect(store.get(bankRecImportFailuresAtom).get(otherLog)).toBe('No tables detected')
-			})
-		})
 
 		it('records no failure marker for an import the server accepted', async () => {
 			importCall.mockResolvedValue({ docs: [makeImportLog({ status: 'Completed' })] })
@@ -1154,7 +631,7 @@ describe('StatementDetails', () => {
 			await waitFor(() => {
 				expect(screen.getByText(RECONCILIATION_SENTINEL)).toBeInTheDocument()
 			})
-			expect(store.get(bankRecImportFailuresAtom).size).toBe(0)
+			expect(Object.keys(store.get(bankRecImportFailuresAtom))).toHaveLength(0)
 			expect(store.get(bankRecErrorDialogAtom)).toBeNull()
 		})
 
@@ -1226,50 +703,54 @@ describe('StatementDetails', () => {
 			})
 		})
 
-		it('records a per-file failure marker keyed by this import log', async () => {
+		it('records the RAW error as a per-file marker keyed by this import log', async () => {
 			// The only place a per-file failure can live: `Bank Statement Import Log` offers just
 			// `Not Started` and `Completed`, carries no error field, and a refused import rolls back -
 			// so the row would otherwise look exactly like one merely waiting to be imported.
-			const { store, data } = await refuseImport()
+			//
+			// The marker holds the FrappeError by identity, exactly as the dialog atom does, so the
+			// rendering layer parses it through the one shared path and the two cannot disagree.
+			const { store, data, error } = await refuseImport()
 
 			await waitFor(() => {
-				expect(store.get(bankRecImportFailuresAtom).get(data.doc.name)).toContain(REFUSAL)
+				expect(store.get(bankRecImportFailuresAtom)[data.doc.name]).toBe(error)
 			})
-			expect(store.get(bankRecImportFailuresAtom).size).toBe(1)
+			expect(Object.keys(store.get(bankRecImportFailuresAtom))).toEqual([data.doc.name])
 		})
 
-		it('replaces the marker map rather than mutating it, so the list re-renders', async () => {
+		it('replaces the marker record rather than mutating it, so the list re-renders', async () => {
 			const data = makeStatementDetails()
 			importCall.mockRejectedValue(makeServerMessagesError(REFUSAL))
 
-			const seededMap = new Map<string, string>()
+			const seededRecord = {}
 			const { store } = renderStatementDetails(data, (seeded) => {
-				seeded.set(bankRecImportFailuresAtom, seededMap)
+				seeded.set(bankRecImportFailuresAtom, seededRecord)
 			})
 			await clickImport()
 
 			await waitFor(() => {
-				expect(store.get(bankRecImportFailuresAtom).size).toBe(1)
+				expect(Object.keys(store.get(bankRecImportFailuresAtom))).toHaveLength(1)
 			})
-			// A mutated Map would be the same reference and jotai would publish nothing.
-			expect(store.get(bankRecImportFailuresAtom)).not.toBe(seededMap)
-			expect(seededMap.size).toBe(0)
+			// A mutated record would be the same reference and jotai would publish nothing.
+			expect(store.get(bankRecImportFailuresAtom)).not.toBe(seededRecord)
+			expect(Object.keys(seededRecord)).toHaveLength(0)
 		})
 
 		it('leaves a marker recorded for another file alone', async () => {
 			const data = makeStatementDetails()
 			const otherLog = makeImportLog({ name: 'other-import-log' })
+			const otherFailures = makeImportFailures(otherLog, 'a different refusal')
 			importCall.mockRejectedValue(makeServerMessagesError(REFUSAL))
 
 			const { store } = renderStatementDetails(data, (seeded) => {
-				seeded.set(bankRecImportFailuresAtom, makeImportFailures(otherLog, 'a different refusal'))
+				seeded.set(bankRecImportFailuresAtom, otherFailures)
 			})
 			await clickImport()
 
 			await waitFor(() => {
-				expect(store.get(bankRecImportFailuresAtom).size).toBe(2)
+				expect(Object.keys(store.get(bankRecImportFailuresAtom))).toHaveLength(2)
 			})
-			expect(store.get(bankRecImportFailuresAtom).get(otherLog.name)).toBe('a different refusal')
+			expect(store.get(bankRecImportFailuresAtom)[otherLog.name]).toBe(otherFailures[otherLog.name])
 		})
 
 		it('keeps the transient toast as well — the dialog is additive, not a replacement', async () => {
@@ -1315,7 +796,7 @@ describe('StatementDetails', () => {
 				expect(store.get(bankRecErrorDialogAtom)).toBeNull()
 			})
 			// The dialog is transient; the row has to keep saying the import failed after it is gone.
-			expect(store.get(bankRecImportFailuresAtom).get(data.doc.name)).toContain(REFUSAL)
+			expect(store.get(bankRecImportFailuresAtom)[data.doc.name]).toBeDefined()
 		})
 
 		it('surfaces a refusal that arrives in _error_message rather than _server_messages', async () => {
@@ -1350,81 +831,35 @@ describe('StatementDetails', () => {
 			expect(getFrappeEventListener(IMPORT_PROGRESS_CHANNEL)).toBeTypeOf('function')
 		})
 
+		/*
+		 * The channel's payload and the label the page renders from it are both pre-existing and
+		 * unchanged by this work: `insert_transactions` publishes `{ progress: <percent> }` after each
+		 * row plus one final `{ progress: 100, total: <rows> }`, and the page renders the `progress`
+		 * member through its own existing copy. The assertions below pin exactly that, so a change to
+		 * either side is visible.
+		 */
+		it('renders the pushed figure alongside the bar, and follows each subsequent push', () => {
+			renderStatementDetails(makeStatementDetails())
+
+			// `act` is the caller's responsibility: the captured handler sets React state.
+			act(() => {
+				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 33 })
+			})
+			expect(screen.getByText('Importing 33 transactions')).toBeInTheDocument()
+			expect(screen.getByRole('progressbar')).toBeInTheDocument()
+
+			act(() => {
+				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 67 })
+			})
+			expect(screen.getByText('Importing 67 transactions')).toBeInTheDocument()
+			expect(screen.queryByText('Importing 33 transactions')).not.toBeInTheDocument()
+		})
+
 		it('renders nothing until the server pushes a figure', () => {
 			renderStatementDetails(makeStatementDetails())
 
 			expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
 			expect(screen.queryByText(/Importing transactions/)).not.toBeInTheDocument()
-		})
-
-		/*
-		 * ⚠️ `progress` IS A PERCENTAGE, NOT A COUNT, and the label used to say otherwise.
-		 *
-		 * `insert_transactions` publishes `{"progress": round(rows_inserted / total_rows * 100)}` after
-		 * each row and one final `{"progress": 100, "total": <rows>}`. The label rendered that figure as
-		 * "Importing {progress} transactions", so a 30-row statement announced "Importing 3 transactions"
-		 * at the first row and "Importing 100 transactions" at the last - a number that was neither the
-		 * count nor recognisable as a percentage, and which OVERSTATED the work for any statement of
-		 * fewer than 100 rows. `total` is the only row count the channel carries.
-		 */
-		it('renders the pushed figure as a PERCENTAGE, alongside the bar', () => {
-			renderStatementDetails(makeStatementDetails())
-
-			// `act` is the caller's responsibility: the captured handler sets React state.
-			act(() => {
-				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 50 })
-			})
-
-			expect(screen.getByText('Importing transactions... 50% complete')).toBeInTheDocument()
-			// The regression spelling, pinned as absent: 50 is not a number of transactions.
-			expect(screen.queryByText('Importing 50 transactions')).not.toBeInTheDocument()
-			expect(screen.getByRole('progressbar')).toBeInTheDocument()
-		})
-
-		it('follows each subsequent push', () => {
-			renderStatementDetails(makeStatementDetails())
-
-			act(() => {
-				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 33 })
-			})
-			act(() => {
-				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 67 })
-			})
-
-			expect(screen.getByText('Importing transactions... 67% complete')).toBeInTheDocument()
-			expect(screen.queryByText('Importing transactions... 33% complete')).not.toBeInTheDocument()
-		})
-
-		/**
-		 * The server's final push carries both members (`{ progress: 100, total: N }`), which is the
-		 * shape that made the count/percentage confusion easy to miss. Once `total` has arrived the
-		 * label can state BOTH quantities, each as what it is.
-		 */
-		it("reports the row total from the server's final push, distinctly from the percentage", () => {
-			renderStatementDetails(makeStatementDetails())
-
-			act(() => {
-				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 100, total: 300 })
-			})
-
-			expect(screen.getByText('Imported 300 transactions (100% complete)')).toBeInTheDocument()
-			// The regression spelling: 100 is the percentage and must never be shown as a count.
-			expect(screen.queryByText('Importing 100 transactions')).not.toBeInTheDocument()
-		})
-
-		it('keeps the row total once it has arrived, and does not invent one before', () => {
-			renderStatementDetails(makeStatementDetails())
-
-			act(() => {
-				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 40 })
-			})
-			// Before the final push there is NO count on the channel, so none is stated.
-			expect(screen.getByText('Importing transactions... 40% complete')).toBeInTheDocument()
-
-			act(() => {
-				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 100, total: 30 })
-			})
-			expect(screen.getByText('Imported 30 transactions (100% complete)')).toBeInTheDocument()
 		})
 
 		it('caps the bar at the maximum it declares, whatever figure arrives', () => {

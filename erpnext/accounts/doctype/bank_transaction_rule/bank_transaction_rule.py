@@ -6,7 +6,6 @@ import re
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import cint
 
 from erpnext.accounts.doctype.bank_transaction.bank_transaction import BankTransaction
 
@@ -236,69 +235,16 @@ def scheduler_run_rule_evaluation():
 
 
 @frappe.whitelist(methods=["POST"])
-def run_rule_evaluation(force_evaluate: bool = False, bank_account: str | None = None):
-	"""
-	Queue a rule-evaluation pass for the caller.
-
-	`bank_account` is optional and restricts the pass to a single account. It exists so a caller that
-	knows which account it just changed can say so instead of triggering a global pass.
-	"""
-	# CR-07: rule evaluation WRITES to every unreconciled Bank Transaction it can reach - it stamps
-	# `is_rule_evaluated` and `matched_transaction_rule` - and it does so through `frappe.get_all`
-	# and `frappe.db.set_value`, both of which ignore permissions entirely. Authorising that with
-	# READ permission meant anyone who could merely look at one Bank Transaction could restamp the
-	# suggested match on every transaction of every company on the site. The authority demanded has
-	# to match the effect produced, so write permission is now the gate.
-	frappe.has_permission("Bank Transaction", ptype="write", throw=True)
-
-	# CR-07: when the caller names a scope, the scope itself has to be authorised - otherwise the
-	# parameter would become a way to act on an account the caller is not allowed to see.
-	if bank_account:
-		frappe.has_permission("Bank Account", ptype="read", doc=bank_account, throw=True)
-
-	enqueue_rule_evaluation(force_evaluate=force_evaluate, bank_account=bank_account, deduplicate=True)
+def run_rule_evaluation(force_evaluate: bool = False):
+	frappe.has_permission("Bank Transaction", ptype="read", throw=True)
+	frappe.enqueue(method=_run_rule_evaluation, force_evaluate=force_evaluate)
 
 
-def enqueue_rule_evaluation(
-	force_evaluate: bool = False, bank_account: str | None = None, deduplicate: bool = False
-):
-	"""
-	Queue `_run_rule_evaluation` to run AFTER the current transaction commits.
-
-	Any caller that has just written the rows it wants evaluated MUST come through here rather than
-	enqueuing directly: rows written by this request are invisible to the worker's own connection
-	until the commit lands, so a job that starts before that point reads none of them.
-
-	`deduplicate` collapses repeated user-initiated requests into one pass. It is off by default and
-	deliberately so - RQ skips a duplicate when a job with the same id is queued OR already started,
-	and a job that has already started cannot see rows committed after it began, so collapsing into
-	it would silently discard the second caller's work.
-	"""
-	force_evaluate = cint(force_evaluate)
-	job_id = f"bank-transaction-rule-evaluation::{bank_account or 'all'}::{force_evaluate}"
-
-	if not deduplicate:
-		# A unique suffix keeps this pass out of RQ's deduplicate/replace handling altogether.
-		job_id = f"{job_id}::{frappe.generate_hash(length=10)}"
-
-	frappe.enqueue(
-		method=_run_rule_evaluation,
-		job_id=job_id,
-		deduplicate=deduplicate,
-		enqueue_after_commit=True,
-		force_evaluate=force_evaluate,
-		bank_account=bank_account,
-	)
-
-
-def _run_rule_evaluation(force_evaluate=False, bank_account: str | None = None):
+def _run_rule_evaluation(force_evaluate=False):
 	"""
 	Run the rule evaluation for all bank transactions
 
 	If force evaluate is set to True, then transactions that were previously evaluated will be evaluated again.
-
-	If bank_account is given, only that account's transactions are evaluated - the server-derived
-	scope a caller such as the statement importer passes so an import only touches its own rows.
 	"""
 	rules = frappe.get_all("Bank Transaction Rule", fields=["name"], order_by="priority asc")
 
@@ -309,9 +255,6 @@ def _run_rule_evaluation(force_evaluate=False, bank_account: str | None = None):
 
 	if not force_evaluate:
 		filters["is_rule_evaluated"] = 0
-
-	if bank_account:
-		filters["bank_account"] = bank_account
 
 	unreconciled_transactions = frappe.get_all(
 		"Bank Transaction",

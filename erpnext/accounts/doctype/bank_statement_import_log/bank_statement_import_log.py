@@ -488,23 +488,7 @@ class BankStatementImportLog(Document):
 
 	@frappe.whitelist(methods=["POST"])
 	def insert_transactions(self):
-		# CR-06: claim this log under a row lock BEFORE trusting its status. `self.status` is a
-		# snapshot taken when the document was loaded, so two callers that arrive together - a
-		# double-click, a retried request, two reviewers on the same log - could both read
-		# "Not Started" and both go on to insert AND SUBMIT the same statement's Bank Transactions.
-		# Nothing downstream rejects that: the duplicates are valid submitted financial records.
-		# `for_update=True` issues `SELECT ... FOR UPDATE` against this log's row, so the second
-		# caller blocks here until the first request's transaction commits, then reads "Completed"
-		# and returns having done nothing. The lock is held for the remainder of this request, which
-		# is exactly the window that has to be serialised.
-		#
-		# A separate "In Progress" claim state is deliberately NOT used: `status` is a two-value
-		# Literal on this DocType and adding a third value would change a frozen DocType contract
-		# for a guarantee the row lock already provides.
-		if (
-			frappe.db.get_value("Bank Statement Import Log", self.name, "status", for_update=True)
-			== "Completed"
-		):
+		if self.status == "Completed":
 			return
 
 		company, account, is_company_account, disabled = frappe.get_value(
@@ -533,23 +517,6 @@ class BankStatementImportLog(Document):
 			final_transactions = self.get_final_transactions(transaction_rows=transaction_rows)
 
 		total_transactions = len(final_transactions)
-
-		# CR-04: refuse an empty statement before anything observable happens. A file that parses to
-		# zero transaction rows - an empty upload, a malformed layout, a column mapping that matched
-		# nothing - used to fall straight through the loop below, publish a 100% progress event and
-		# save the log as "Completed", making a failed import indistinguishable from a successful
-		# one. The required behaviour is the opposite: the backend has to raise so the importer can
-		# show a per-file failure. Throwing here, ahead of every insert, every realtime event, the
-		# closing-balance write and the status change, also leaves the log at "Not Started" so the
-		# reviewer can correct the file and retry this same log.
-		if not total_transactions:
-			frappe.throw(
-				_(
-					"No transactions could be read from this statement. Check that the file contains"
-					" transaction rows and that the date and amount columns are mapped correctly."
-				),
-				title=_("No Transactions Found"),
-			)
 
 		for transaction in final_transactions:
 			bank_tx = frappe.get_doc(
@@ -595,26 +562,12 @@ class BankStatementImportLog(Document):
 				self.bank_account, frappe.utils.getdate(self.end_date), self.closing_balance
 			)
 
+		from erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule import run_rule_evaluation
+
+		run_rule_evaluation()
+
 		self.status = "Completed"
 		self.save()
-
-		# CR-03: queue rule evaluation only after this log is saved, and let the queueing itself wait
-		# for the commit. The transactions inserted above are invisible to the worker's connection
-		# until this request's transaction commits, so the previous ordering - enqueue first, save
-		# afterwards, with `enqueue_after_commit` off - allowed a worker to start immediately, read
-		# none of the imported rows and finish having stamped nothing. The reviewer then opened the
-		# workbench to no suggested match at all and had to wait for the next scheduled pass.
-		#
-		# `enqueue_rule_evaluation` is used instead of the whitelisted `run_rule_evaluation` for two
-		# reasons: it queues after commit, and it does not deduplicate, so a second import of the
-		# same account can never be collapsed into an evaluation pass that already started and
-		# therefore cannot see this import's rows. The scope is derived here from the log's own bank
-		# account rather than taken from the caller.
-		from erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule import (
-			enqueue_rule_evaluation,
-		)
-
-		enqueue_rule_evaluation(bank_account=self.bank_account)
 
 
 HEADER_KEYWORDS = [

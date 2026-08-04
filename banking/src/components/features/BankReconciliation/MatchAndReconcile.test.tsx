@@ -48,7 +48,6 @@ import {
 	makeBankAccountListRow,
 	makeBankTransactionRule,
 	makeBlankReferenceLinkedPayment,
-	makeNullReferenceLinkedPayment,
 	makeCurrencyMismatchTransaction,
 	makeLinkedPayment,
 	makeReconcileSuccessResponse,
@@ -97,8 +96,6 @@ import {
 	bankRecSelectedTransactionAtom,
 	selectedBankAccountAtom
 } from './bankRecAtoms'
-// The shared single-flight guard lives with the hook that owns it, not in the feature's atom store.
-import { bankRecReconcileInFlightAtom } from './utils'
 import type { LinkedPayment, UnreconciledTransaction, useGetRuleForTransaction } from './utils'
 
 type QueryResponse = ReturnType<typeof frappeSDKMock.useFrappeGetCall>
@@ -258,24 +255,6 @@ interface WorkbenchOptions {
 	 * distinguishable from one deliberately left unresolved.
 	 */
 	accountCurrency?: string | null
-	/**
-	 * The account currency carried by the PERSISTED selection, when it must differ from the current
-	 * one. Defaults to `accountCurrency`, so an ordinary test seeds a consistent world.
-	 *
-	 * This option exists to make the stale-snapshot case reachable, and it is the only way to reach
-	 * it: `selectedBankAccountAtom` is `atomWithStorage` over localStorage, and the bank picker
-	 * deliberately leaves a stored row alone while the account it names still exists - so the stored
-	 * `account_currency` is written once and can then be arbitrarily old. Seeding both sides with the
-	 * same value cannot distinguish an implementation that reads the snapshot from one that reads the
-	 * server.
-	 */
-	persistedAccountCurrency?: string | null
-	/**
-	 * Answers `bank_account.get_list` as still fetching, or as a list that does not contain the
-	 * selected account at all. Both mean the CURRENT account currency is not known, which the advisory
-	 * must read as "nothing to compare" rather than as a mismatch.
-	 */
-	bankListState?: 'loading' | 'without-selected-account'
 	withoutBank?: boolean
 	transactionsState?: 'loading' | 'error'
 	vouchersState?: 'loading' | 'error'
@@ -311,8 +290,6 @@ const renderWorkbench = (options: WorkbenchOptions = {}) => {
 		vouchers = [],
 		selected = [],
 		accountCurrency = TEST_CURRENCY,
-		persistedAccountCurrency = accountCurrency,
-		bankListState,
 		withoutBank = false,
 		transactionsState,
 		vouchersState,
@@ -327,7 +304,7 @@ const renderWorkbench = (options: WorkbenchOptions = {}) => {
 	const store = createStore()
 
 	if (!withoutBank) {
-		store.set(selectedBankAccountAtom, makeSelectedBank({ account_currency: persistedAccountCurrency }))
+		store.set(selectedBankAccountAtom, makeSelectedBank({ account_currency: accountCurrency ?? undefined }))
 	}
 	store.set(bankRecDateAtom, { fromDate: FROM_DATE, toDate: TO_DATE })
 	store.set(SELECTED_TRANSACTION_ATOM, selected)
@@ -352,21 +329,16 @@ const renderWorkbench = (options: WorkbenchOptions = {}) => {
 			return answered({ message: vouchers })
 		}
 
-		// Shared with the bank picker, and the source of the FRESH account currency the mismatch
-		// advisory compares against.
+		// Shared with the bank picker, which resolves the row's logo. The mismatch advisory compares
+		// against the account currency carried by the SELECTED-BANK atom, not against this response.
 		//
 		// Answered with the ENDPOINT-row builder rather than by spreading `BANK`: that constant is
 		// the persisted selection, whose shape differs from this endpoint's projection in both
 		// directions (it carries `integration_id`, which is not projected, and lacks
-		// `account_subtype`, which is). The row's `name` still matches the selection, because that
-		// is what the currency lookup keys on.
+		// `account_subtype`, which is). The row's `name` still matches the selection.
 		if (method.endsWith('bank_account.bank_account.get_list')) {
-			if (bankListState === 'loading') return fetching()
-			if (bankListState === 'without-selected-account') {
-				return answered({ message: [makeBankAccountListRow({ name: 'Other Bank - Test Company' })] })
-			}
 			return answered({
-				message: [makeBankAccountListRow({ name: BANK.name, account_currency: accountCurrency })]
+				message: [makeBankAccountListRow({ name: BANK.name, account_currency: accountCurrency ?? undefined })]
 			})
 		}
 
@@ -1001,113 +973,9 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			expect(within(voucherCard(blankReference)).queryByText('Complete Match')).not.toBeInTheDocument()
 		})
 
-		/*
-		 * ─── A BLANK OR NULL REFERENCE MUST NOT PROMOTE A CANDIDATE ─────────────────────────────
-		 *
-		 * The blank-reference candidate is placed FIRST here, and that placement is the whole test.
-		 * The suggestion predicate is `amountMatches && (postingDate || referenceDate || partialRef)
-		 * && index === 0`, so at any later index `index === 0` alone withholds the badge and a broken
-		 * reference grader is invisible. First, with a matching amount and DELIBERATELY non-matching
-		 * dates, the partial-reference term is the only thing that can promote it - which is exactly
-		 * what `''.includes` semantics used to do, because every string contains the empty string.
-		 *
-		 * Both absent shapes the endpoint really produces are covered: the literal `''` the Purchase
-		 * Invoice branch projects as a constant, and the `null` that `Max(je.cheque_no)` yields when no
-		 * row in the group carries a cheque number.
-		 */
-		it.each([
-			['an empty-string reference, as the Purchase Invoice branch projects it', makeBlankReferenceLinkedPayment],
-			['a NULL reference, as Max(cheque_no) yields it', makeNullReferenceLinkedPayment]
-		])('does not suggest a FIRST candidate carrying %s', async (_label, buildCandidate) => {
-			// Amount agrees; neither date does. `makeBlankReferenceLinkedPayment` and
-			// `makeNullReferenceLinkedPayment` both post on TEST_ALTERNATE_DATE for this reason.
-			const candidate = buildCandidate()
-			expect(candidate.paid_amount).toBe(DEPOSIT_ROW.unallocated_amount)
-			expect(candidate.posting_date).not.toBe(DEPOSIT_ROW.date)
-			expect(candidate.reference_date).not.toBe(DEPOSIT_ROW.date)
-
-			renderWorkbench({
-				transactions: [DEPOSIT_ROW],
-				selected: [DEPOSIT_ROW],
-				vouchers: [candidate]
-			})
-
-			await waitFor(() => {
-				expect(screen.getByRole('link', { name: candidate.name })).toBeInTheDocument()
-			})
-
-			const card = voucherCard(candidate)
-
-			// It is first, so `index === 0` is satisfied and cannot be what withholds the badge.
-			expect(card).toHaveAttribute('data-index', '0')
-			expect(within(card).queryByText('Suggested')).not.toBeInTheDocument()
-
-			// Nor is it dressed as a proposal: the solid green treatment is reserved for a candidate
-			// the client has a reason to steer the reviewer towards.
-			expect(card.className).not.toContain('border-outline-green-4')
-		})
-
-		it('whitespace alone is not a reference either', async () => {
-			// A reference of spaces carries no more information than a missing one, and `includes(' ')`
-			// would otherwise match any description containing a space - which is nearly all of them.
-			const candidate = makeLinkedPayment({
-				name: 'ACC-PAY-2024-04099',
-				reference_no: '   ',
-				paid_amount: DEPOSIT_ROW.unallocated_amount,
-				posting_date: TEST_ALTERNATE_DATE,
-				reference_date: TEST_ALTERNATE_DATE
-			})
-
-			renderWorkbench({
-				transactions: [DEPOSIT_ROW],
-				selected: [DEPOSIT_ROW],
-				vouchers: [candidate]
-			})
-
-			await waitFor(() => {
-				expect(screen.getByRole('link', { name: candidate.name })).toBeInTheDocument()
-			})
-
-			const card = voucherCard(candidate)
-			expect(card).toHaveAttribute('data-index', '0')
-			expect(within(card).queryByText('Suggested')).not.toBeInTheDocument()
-			expect(within(card).queryByText('Partial Match')).not.toBeInTheDocument()
-		})
-
-		it('two absent references do not count as agreeing with each other', async () => {
-			// The mirror-image flaw in the FULL comparison: a transaction with no reference number and a
-			// candidate with no reference compared equal, and the row claimed a Complete Match.
-			const referencelessTransaction = makeUnreconciledTransaction({
-				name: 'ACC-BTN-2024-04090',
-				description: 'Cash deposit with no reference recorded',
-				reference_number: ''
-			})
-			const candidate = makeLinkedPayment({
-				name: 'ACC-PAY-2024-04090',
-				reference_no: '',
-				paid_amount: referencelessTransaction.unallocated_amount,
-				posting_date: TEST_ALTERNATE_DATE,
-				reference_date: TEST_ALTERNATE_DATE
-			})
-
-			renderWorkbench({
-				transactions: [referencelessTransaction],
-				selected: [referencelessTransaction],
-				vouchers: [candidate]
-			})
-
-			await waitFor(() => {
-				expect(screen.getByRole('link', { name: candidate.name })).toBeInTheDocument()
-			})
-
-			const card = voucherCard(candidate)
-			expect(within(card).queryByText('Complete Match')).not.toBeInTheDocument()
-			expect(within(card).queryByText('Suggested')).not.toBeInTheDocument()
-		})
-
 		it('still suggests a first candidate whose reference genuinely matches', async () => {
-			// The guard must not have closed the legitimate path: a real reference, no date agreement,
-			// promoted on the strength of the reference alone.
+			// The legitimate path: a real reference and no date agreement, promoted at index 0 on the
+			// strength of the reference alone.
 			const candidate = makeLinkedPayment({
 				name: 'ACC-PAY-2024-04091',
 				reference_no: DEPOSIT_ROW.reference_number,
@@ -1395,14 +1263,14 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 		})
 
 		/*
-		 * FM3, FAIL CLOSED. A refused attempt was made against a snapshot the server has just
-		 * contradicted, so the affordance is withdrawn rather than left pointing at it: the rejection
-		 * handler empties the selection, and the voucher panel is rendered only while a transaction is
-		 * selected.
+		 * FM1/FM3/TC6. A refusal is reported and NOTHING is mutated optimistically: the selected row
+		 * keeps the state the server gave it, no row is marked reconciled, and the authoritative reads
+		 * are revalidated so the server's own answer is what corrects the client.
 		 */
-		it('withdraws the affordance when the server refuses, and reports the refusal', async () => {
+		it('reports the refusal and leaves the transaction unreconciled and unchanged', async () => {
 			const user = userEvent.setup()
-			frappePostCall.mockRejectedValue(makeAlreadyReconciledError(DEPOSIT_ROW.name))
+			const refusal = makeAlreadyReconciledError(DEPOSIT_ROW.name)
+			frappePostCall.mockRejectedValue(refusal)
 
 			const { store } = renderWorkbench({
 				transactions: [DEPOSIT_ROW],
@@ -1415,11 +1283,12 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			})
 			await user.click(confirmControlFor(suggested))
 
-			// The selection - and with it the Reconcile control - is gone.
+			// The raw rejection reaches the shared dialog by identity, and the row is untouched.
 			await waitFor(() => {
-				expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([])
+				expect(store.get(bankRecErrorDialogAtom)).toBe(refusal)
 			})
-			expect(screen.queryByRole('button', { name: 'Reconcile' })).not.toBeInTheDocument()
+			expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([DEPOSIT_ROW])
+			expect(store.get(SELECTED_TRANSACTION_ATOM)?.[0].status).toBe('Unreconciled')
 
 			// One request, and nothing was posted: the reviewer is told it failed.
 			expect(frappePostCall).toHaveBeenCalledTimes(1)
@@ -1429,16 +1298,15 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			})
 		})
 
-		it('does NOT reopen the affordance when the follow-up refresh itself fails', async () => {
+		it('does not retry a refused post, so a refusal cannot become a duplicate posting', async () => {
 			const user = userEvent.setup()
 			frappePostCall.mockRejectedValue(makeAlreadyReconciledError(DEPOSIT_ROW.name))
 
-			// The case the guard exists for: the client has been told its snapshot is unreliable AND
-			// cannot obtain a reliable one. Withdrawing the affordance first is what makes an
-			// unavailable server cost one extra click rather than a post against unverifiable state.
+			// Even when the follow-up revalidation itself fails, the client makes exactly one attempt:
+			// a second post would be one made without knowing the outcome of the first.
 			frappeSWRMutate.mockRejectedValue(new Error('revalidation unavailable'))
 
-			const { store } = renderWorkbench({
+			renderWorkbench({
 				transactions: [DEPOSIT_ROW],
 				selected: [DEPOSIT_ROW],
 				vouchers: [suggested]
@@ -1450,12 +1318,11 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			await user.click(confirmControlFor(suggested))
 
 			await waitFor(() => {
-				expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([])
+				expect(frappePostCall).toHaveBeenCalledTimes(1)
 			})
 
-			// Given time for any deferred reopen to land, there is still nothing to confirm.
-            await new Promise((resolve) => setTimeout(resolve, 50))
-			expect(screen.queryByRole('button', { name: 'Reconcile' })).not.toBeInTheDocument()
+			// Given time for any deferred retry to land, there is still exactly one request.
+			await new Promise((resolve) => setTimeout(resolve, 50))
 			expect(frappePostCall).toHaveBeenCalledTimes(1)
 		})
 
@@ -1503,206 +1370,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			})
 			expect(screen.queryByRole('button', { name: 'Reconcile' })).not.toBeInTheDocument()
 			expect(frappePostCall).toHaveBeenCalledTimes(1)
-		})
-
-		/*
-		 * ══════════════════════════════════════════════════════════════════════════════════════════
-		 * AT MOST ONE POST IS EVER OPEN  (FM1 / TC4 / TC6)
-		 *
-		 * The gap these tests close could not be seen by a single-candidate test, which is why one had
-		 * to be written that renders TWO. `useReconcileTransaction` exposes `loading` from
-		 * `useFrappePostCall`, and EVERY candidate row instantiates that hook for itself - so `loading`
-		 * describes one row's own request and nothing about any sibling's. A control gated on `loading`
-		 * alone therefore stayed live while another candidate's post was unanswered, and a reviewer
-		 * could dispatch a second `reconcile_vouchers` for the SAME transaction. The server allocates
-		 * against whatever the transaction still has unallocated when each request arrives, so the
-		 * outcome would have depended on interleaving rather than on what was chosen.
-		 *
-		 * The first request is held PENDING throughout - a promise that never settles - because the
-		 * whole question is what the client permits while the server has not yet answered.
-		 * ══════════════════════════════════════════════════════════════════════════════════════════ */
-		describe('while one post is unanswered', () => {
-			const alternate = makeAlternateLinkedPayment()
-			const twoCandidates = sortLinkedPaymentsAsEndpoint([alternate, suggested])
-
-			/** A `reconcile_vouchers` call that never settles, so the in-flight window stays open. */
-			const holdTheFirstPost = () => {
-				frappePostCall.mockReturnValue(new Promise(() => { /* deliberately never settles */ }))
-			}
-
-			const renderTwoCandidates = async () => {
-				const rendered = renderWorkbench({
-					transactions: [DEPOSIT_ROW],
-					selected: [DEPOSIT_ROW],
-					vouchers: twoCandidates
-				})
-
-				await waitFor(() => {
-					expect(screen.getByRole('link', { name: alternate.name })).toBeInTheDocument()
-				})
-				expect(screen.getByRole('link', { name: suggested.name })).toBeInTheDocument()
-
-				return rendered
-			}
-
-			it('renders both candidates with their own independent controls to begin with', async () => {
-				// The premise, asserted rather than assumed: without two live controls there is nothing
-				// for the guard below to be tested against.
-				await renderTwoCandidates()
-
-				expect(confirmControlFor(suggested)).toBeEnabled()
-				expect(confirmControlFor(alternate)).toBeEnabled()
-			})
-
-			it('disables the OTHER candidate the moment the first post is dispatched', async () => {
-				const user = userEvent.setup()
-				holdTheFirstPost()
-
-				await renderTwoCandidates()
-				await user.click(confirmControlFor(suggested))
-
-				await waitFor(() => {
-					expect(confirmControlFor(alternate)).toBeDisabled()
-				})
-				expect(frappePostCall).toHaveBeenCalledTimes(1)
-			})
-
-			it('disables the initiating control as well, so neither candidate can post again', async () => {
-				const user = userEvent.setup()
-				holdTheFirstPost()
-
-				await renderTwoCandidates()
-				await user.click(confirmControlFor(suggested))
-
-				await waitFor(() => {
-					expect(confirmControlFor(alternate)).toBeDisabled()
-				})
-				// EVERY candidate closes, the initiator included. The shared flag is what achieves that
-				// here: under the real SDK the initiator would also be held by its own `loading`, but
-				// this harness answers `useFrappePostCall` with one fixed object for every instance, so
-				// `loading` is uniform and cannot distinguish the rows - which is precisely why the
-				// pre-existing `loading`-only gate could not close a sibling in production.
-				expect(confirmControlFor(suggested)).toBeDisabled()
-			})
-
-			it('dispatches nothing when the other candidate is clicked anyway', async () => {
-				holdTheFirstPost()
-
-				await renderTwoCandidates()
-
-				const first = confirmControlFor(suggested)
-				await act(async () => {
-					first.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-				})
-
-				const second = confirmControlFor(alternate)
-				expect(second).toBeDisabled()
-
-				// `fireEvent` rather than `user-event`: a synthetic click bypasses the pointer-events
-				// check a real one performs, so this asserts the GUARD refuses the request rather than
-				// merely that the browser would not deliver the click.
-				await act(async () => {
-					second.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-				})
-
-				expect(frappePostCall).toHaveBeenCalledTimes(1)
-				expect(String(capturedReconcileRequest().vouchers)).toContain(suggested.name)
-				expect(String(capturedReconcileRequest().vouchers)).not.toContain(alternate.name)
-			})
-
-			/*
-			 * The SYNCHRONOUS half of the guard, and the reason it is read from the jotai store rather
-			 * than from a subscribed value. Both clicks are dispatched inside ONE `act` block, so React
-			 * batches them and the handler runs twice with NO re-render in between: a guard derived from
-			 * rendered state would see `null` both times and post twice.
-			 */
-			it('dispatches once for two clicks delivered in the same tick', async () => {
-				holdTheFirstPost()
-
-				await renderTwoCandidates()
-
-				const control = confirmControlFor(suggested)
-				await act(async () => {
-					control.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-					control.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-				})
-
-				expect(frappePostCall).toHaveBeenCalledTimes(1)
-			})
-
-			it('reopens every candidate once an ACCEPTED post has settled', async () => {
-				const user = userEvent.setup()
-				let acceptThePost!: () => void
-				frappePostCall.mockReturnValue(
-					new Promise((resolve) => {
-						acceptThePost = () => resolve(makeReconcileSuccessResponse({ unallocated_amount: 2500 }))
-					})
-				)
-
-				await renderTwoCandidates()
-				await user.click(confirmControlFor(suggested))
-
-				await waitFor(() => {
-					expect(confirmControlFor(alternate)).toBeDisabled()
-				})
-
-				await act(async () => {
-					acceptThePost()
-					await Promise.resolve()
-				})
-
-				// A PARTIAL allocation keeps the reviewer on this transaction, so the affordance has to
-				// come back - a guard released only on rejection, or not at all, would lock the reviewer
-				// out of the remaining allocation entirely.
-				await waitFor(() => {
-					expect(confirmControlFor(alternate)).toBeEnabled()
-				})
-			})
-
-			it('reopens the affordance after a REFUSED post, once the selection is restored', async () => {
-				const user = userEvent.setup()
-				let refuseThePost!: () => void
-				frappePostCall.mockReturnValue(
-					new Promise((_resolve, reject) => {
-						refuseThePost = () => reject(makeAlreadyReconciledError(DEPOSIT_ROW.name))
-					})
-				)
-
-				const { store } = await renderTwoCandidates()
-				await user.click(confirmControlFor(suggested))
-
-				await waitFor(() => {
-					expect(confirmControlFor(alternate)).toBeDisabled()
-				})
-
-				await act(async () => {
-					refuseThePost()
-					await Promise.resolve()
-				})
-
-				// FM3 empties the selection, which withdraws the voucher panel outright — so the guard's
-				// release is asserted on the SHARED FLAG rather than on a control that no longer exists.
-				// Leaving the flag set would permanently disable reconciliation for the rest of the
-				// session, which is why releasing on both outcomes is the contract.
-				await waitFor(() => {
-					expect(store.get(bankRecReconcileInFlightAtom)).toBeNull()
-				})
-				expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([])
-			})
-
-			it('records the transaction the open post belongs to, not merely that one is open', async () => {
-				const user = userEvent.setup()
-				holdTheFirstPost()
-
-				const { store } = await renderTwoCandidates()
-				expect(store.get(bankRecReconcileInFlightAtom)).toBeNull()
-
-				await user.click(confirmControlFor(suggested))
-
-				await waitFor(() => {
-					expect(store.get(bankRecReconcileInFlightAtom)).toBe(DEPOSIT_ROW.name)
-				})
-			})
 		})
 	})
 
@@ -1878,10 +1545,11 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 		 * THE STALE-CLIENT CASE, end to end. A client holding a row the server has since settled can
 		 * still reach an enabled control, because its list revalidates neither on focus nor when
 		 * stale - so the guard cannot be a first-load-only check. The server refuses, its own words
-		 * are reported, and the affordance is WITHDRAWN rather than left pointing at the snapshot the
-		 * attempt was made against. No status is written locally anywhere.
+		 * are reported verbatim in the dismissible dialog, and BOTH authoritative reads are
+		 * revalidated so the server's answer is what corrects the client. No status is written
+		 * locally anywhere and nothing is mutated optimistically.
 		 */
-		it('withdraws the action after a refusal, and reports the server\'s own words', async () => {
+		it('reports the server\'s own words and re-reads the server after a refusal', async () => {
 			const user = userEvent.setup()
 			const stale = makeUnreconciledTransaction({
 				name: 'ACC-BTN-2024-05004',
@@ -1911,15 +1579,16 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 
 			await user.click(await screen.findByRole('button', { name: 'Dismiss' }))
 
-			// ...and dismissing it does not hand the action back: the selection was emptied, so the
-			// voucher panel - and with it the only Reconcile control - is gone.
+			// ...and dismissing it changes nothing else: the row is exactly as the server left it, with
+			// no local status written and nothing marked reconciled.
 			await waitFor(() => {
-				expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([])
+				expect(store.get(bankRecErrorDialogAtom)).toBeNull()
 			})
-			expect(screen.queryByRole('button', { name: 'Reconcile' })).not.toBeInTheDocument()
+			expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([stale])
+			expect(store.get(SELECTED_TRANSACTION_ATOM)?.[0].status).toBe('Unreconciled')
 
-			// Both authoritative reads were revalidated, so re-selecting the row can only come from
-			// the server's current answer.
+			// Both authoritative reads were revalidated, so the row's true state comes from the
+			// server's current answer rather than from this client.
 			expect(frappeSWRMutate).toHaveBeenCalledWith(UNRECONCILED_KEY)
 			expect(frappeSWRMutate).toHaveBeenCalledWith(BANK_TRANSACTIONS_KEY)
 
@@ -2042,170 +1711,6 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 
 			expect(currencyAdvisoryChip(transactionRow(mismatched))).not.toBeNull()
 			expect(currencyAdvisoryChip(transactionRow(DEPOSIT_ROW))).toBeNull()
-		})
-
-		/*
-		 * ─── THE SNAPSHOT MUST NOT DECIDE THIS ──────────────────────────────────────────────────
-		 *
-		 * `selectedBankAccountAtom` is persisted to localStorage with `getOnInit: true`, and the bank
-		 * picker deliberately leaves a stored row alone whenever the account it names is still present
-		 * in a fresh response. So the stored `account_currency` is written once and can then be
-		 * arbitrarily old - a repointed bank account, or an edited `Account.account_currency`, changes
-		 * the server's answer and not the snapshot.
-		 *
-		 * The two cases below seed the persisted value and the CURRENT endpoint row with DIFFERENT
-		 * currencies, one in each direction. That is the only way to tell the two sources apart: an
-		 * implementation reading the snapshot and one reading the server are indistinguishable while
-		 * they agree. Each asserts that the CURRENT row wins - so the advisory can neither claim a
-		 * mismatch the server has since resolved, nor stay silent about one the server now has.
-		 */
-		it('warns from the CURRENT account currency, even when the persisted snapshot agrees with the transaction', async () => {
-			// Stored: the transaction's own currency, so a snapshot-driven comparison sees no mismatch.
-			// Current: a different currency, so the server's own view says there IS one.
-			renderWorkbench({
-				transactions: [mismatched],
-				persistedAccountCurrency: TEST_ALTERNATE_CURRENCY,
-				accountCurrency: TEST_CURRENCY
-			})
-
-			await waitFor(() => {
-				expect(transactionRow(mismatched)).toBeInTheDocument()
-			})
-
-			const chip = currencyAdvisoryChip(transactionRow(mismatched))
-			expect(chip).not.toBeNull()
-			expect(chip).toHaveTextContent(TEST_ALTERNATE_CURRENCY)
-		})
-
-		it('stays SILENT when the persisted snapshot disagrees but the current account currency matches', async () => {
-			// The mirror image, and the more damaging direction: a stale snapshot would raise a caution
-			// on a transaction the server considers perfectly consistent.
-			const sameCurrencyRow = makeUnreconciledTransaction({
-				description: 'Wire whose currency the account was later changed to match',
-				currency: TEST_CURRENCY
-			})
-
-			renderWorkbench({
-				transactions: [sameCurrencyRow],
-				persistedAccountCurrency: TEST_ALTERNATE_CURRENCY,
-				accountCurrency: TEST_CURRENCY
-			})
-
-			await waitFor(() => {
-				expect(transactionRow(sameCurrencyRow)).toBeInTheDocument()
-			})
-
-			expect(currencyAdvisoryChip(transactionRow(sameCurrencyRow))).toBeNull()
-		})
-
-		it('shows no chip while the account list has not answered yet', async () => {
-			// Loading is not a mismatch either. The hook returns `undefined` until the list arrives, and
-			// the advisory must read that as "not known" rather than warning on a comparison it has not
-			// yet been able to make. The PERSISTED snapshot is seeded with a currency that WOULD produce
-			// a mismatch, so a snapshot-driven implementation fails here.
-			renderWorkbench({
-				transactions: [mismatched],
-				bankListState: 'loading',
-				persistedAccountCurrency: TEST_CURRENCY
-			})
-
-			await waitFor(() => {
-				expect(transactionRow(mismatched)).toBeInTheDocument()
-			})
-
-			expect(currencyAdvisoryChip(transactionRow(mismatched))).toBeNull()
-		})
-
-		it('withdraws the whole surface when the selected account is absent from the current list', async () => {
-			/*
-			 * SEC-12: an account a SUCCESSFUL, permission-filtered response does not contain is not merely
-			 * an account whose currency is unknown - it is an account this reviewer, in this company, is
-			 * no longer being shown at all: disabled, deleted, de-permissioned, or belonging to a company
-			 * the selector has moved away from. `useGetBankAccounts` therefore DISCARDS the persisted
-			 * selection rather than leaving a `localStorage` snapshot of a bank account and its account
-			 * number on screen.
-			 *
-			 * So the advisory is not merely absent here; the row it would have annotated is gone with the
-			 * selection, which is a stronger and more useful guarantee than "no chip". Asserting the row's
-			 * absence is what pins it: an implementation that kept the stale selection would render the
-			 * row again and fail here even if it also suppressed the chip.
-			 */
-			const { store } = renderWorkbench({
-				transactions: [mismatched],
-				bankListState: 'without-selected-account',
-				persistedAccountCurrency: TEST_CURRENCY
-			})
-
-			await waitFor(() => {
-				expect(store.get(selectedBankAccountAtom)).toBeNull()
-			})
-
-			expect(screen.queryByText(mismatched.description as string)).not.toBeInTheDocument()
-		})
-
-		/*
-		 * ─── ONE AUTHORITATIVE CURRENCY, FOR COMPARING *AND* FOR FORMATTING ─────────────────────
-		 *
-		 * The advisory reading the server's answer is only half the requirement. The row also FORMATS
-		 * its amount, and that fell back to `selectedBank.account_currency` — the persisted snapshot —
-		 * while the comparison read the live response. Two sources for one fact means they can
-		 * disagree, and they did: a row could simultaneously be told "these currencies match" and be
-		 * rendered under a stale symbol.
-		 *
-		 * A transaction with NO `currency` of its own is what exposes the fallback, since a
-		 * transaction that carries one never reaches it.
-		 */
-		describe('the amount is formatted from the same authoritative value the advisory compares', () => {
-			const withoutOwnCurrency = makeUnreconciledTransaction({
-				name: 'ACC-BTN-2024-07001',
-				description: 'Wire with no currency of its own',
-				currency: undefined
-			})
-
-			it('formats from the CURRENT account currency, not the persisted snapshot', async () => {
-				renderWorkbench({
-					transactions: [withoutOwnCurrency],
-					accountCurrency: TEST_CURRENCY,
-					persistedAccountCurrency: TEST_ALTERNATE_CURRENCY
-				})
-
-				const row = await waitFor(() => transactionRow(withoutOwnCurrency))
-
-				// `TEST_CURRENCY` is INR and `TEST_ALTERNATE_CURRENCY` is USD, so the two format to
-				// different symbols and the assertion can tell the sources apart.
-				expect(row.textContent).toContain('₹')
-				expect(row.textContent).not.toContain('$')
-			})
-
-			it('rehydrates the persisted snapshot, so no OTHER screen is left on the stale value', async () => {
-				// The reason the refresh lives in `useGetBankAccounts` rather than in this component:
-				// every consumer of the selection is corrected at once, including the ones this suite
-				// does not render.
-				const { store } = renderWorkbench({
-					transactions: [withoutOwnCurrency],
-					accountCurrency: TEST_CURRENCY,
-					persistedAccountCurrency: TEST_ALTERNATE_CURRENCY
-				})
-
-				await waitFor(() => {
-					expect(store.get(selectedBankAccountAtom)?.account_currency).toBe(TEST_CURRENCY)
-				})
-			})
-
-			it('falls back to the persisted value only while the current one is unknown', async () => {
-				// A cold start: the list has not answered, so there is no authoritative value yet. A
-				// momentarily stale symbol beats no symbol, and the advisory still stays silent (proved
-				// by the loading case above).
-				renderWorkbench({
-					transactions: [withoutOwnCurrency],
-					bankListState: 'loading',
-					persistedAccountCurrency: TEST_ALTERNATE_CURRENCY
-				})
-
-				const row = await waitFor(() => transactionRow(withoutOwnCurrency))
-
-				expect(row.textContent).toContain('$')
-			})
 		})
 	})
 
