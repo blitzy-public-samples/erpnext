@@ -13,7 +13,7 @@ and TypeScript, and it is served by the host ERPNext app at `/banking`.
 > **About `"version": "0.0.0"` in `package.json`.** That string is an unbumped artefact of the
 > original Vite scaffold. It is **not** an indication that the application is unimplemented,
 > and nothing reads it. The workspace holds 163 tracked files — none of them empty — and
-> roughly 1 MB of hand-written TypeScript/TSX, including a complete five-tab reconciliation
+> over 1.2 MB of hand-written TypeScript/TSX, including a complete five-tab reconciliation
 > workbench, 43 design-system primitives under `src/components/ui/` and 17 generated DocType
 > declarations under `src/types/`. The version string is deliberately left as it is.
 
@@ -116,6 +116,7 @@ yarn typecheck                   # tsc -b — must exit 0
 yarn lint                        # eslint .
 yarn test                        # vitest run — no bench config needed
 yarn test:coverage               # enforces the >= 80% line threshold
+rm -rf coverage                  # generated output — see the coverage section
 yarn dev                         # requires ../../../sites/common_site_config.json
 yarn build                       # requires ../../../sites/common_site_config.json
 ```
@@ -132,8 +133,13 @@ yarn build                       # requires ../../../sites/common_site_config.js
 | `test` | `vitest run` | **Non-watch by construction** — a bare `vitest` enters watch mode, which is unusable in CI or any non-interactive context. **Does not require the bench config file.** |
 | `test:coverage` | `vitest run --coverage` | V8 provider; emits `text` + `json-summary` + `lcov`; **fails the process** below the configured line thresholds. |
 | `typecheck` | `tsc -b` | Builds the TypeScript solution. It exists because **`build` never invokes the compiler**, so without this script a type error would not be observable from this package's scripts at all. |
-| `verify` | `yarn typecheck && yarn lint && yarn test:coverage` | The acceptance gate, in one non-watch, bench-independent command. Run this before proposing a change. |
-| `ci` | `yarn verify && yarn build` | `verify` plus the production bundle. **Requires the bench config file**, because of the `build` step. |
+
+Those eight are the whole script set — there is deliberately no aggregate `verify` or `ci` script.
+The acceptance gate is the three of them that need no bench config, run in order:
+
+```bash
+yarn typecheck && yarn lint && yarn test:coverage
+```
 
 ## The bench-config prerequisite — and why `test` does not share it
 
@@ -245,17 +251,46 @@ so it is a gate rather than a report. The threshold is **80% lines**, enforced i
 - a **per-file** `lines: 80` for each measured unit, so a weak new module cannot be carried over
   the line by easier files around it.
 
-Measured scope equals gated scope: `coverage.include` is an explicit list of the reconciliation
-and importer units and the three shared helpers they resolve errors, companies and currencies
-through, and the per-file thresholds name exactly the same files. Whatever the `All files` row
-of the text reporter prints is therefore exactly what is enforced. `coverage.exclude` is
-retained as a guard so that broadening `include` back to a directory glob can never silently
-re-admit generated DocType declarations (`src/types/**`), the harness itself (`src/test/**`),
-declaration files, or the browser entry point.
+**Measured scope equals gated scope, and that equality is enforced mechanically.** Both
+`coverage.include` and every per-file threshold key are generated from a single `COVERED_UNITS`
+array at the top of `vitest.config.ts`, so the two cannot drift:
 
-> **Adding a component or API-client module to this work means adding it to `coverage.include`
-> *and* to `coverage.thresholds`.** Adding it to only one of the two makes the headline
-> percentage and the gate disagree.
+```ts
+include: [...COVERED_UNITS],
+thresholds: {
+  lines: LINE_COVERAGE_THRESHOLD,
+  ...Object.fromEntries(COVERED_UNITS.map((unit) => [unit, { lines: LINE_COVERAGE_THRESHOLD }]))
+}
+```
+
+This matters more than it looks. A threshold naming a file that `include` omits does **not** fail:
+Vitest builds an empty coverage map for it, `resolveThresholds()` skips it as "not included by glob
+patterns", and the gate passes on a file nothing measured. Generating both from one array is what
+makes that impossible. Whatever the `All files` row of the text reporter prints is therefore exactly
+what is enforced.
+
+The nine gated units, and their measured line coverage:
+
+| Unit | Lines |
+| --- | --- |
+| `src/components/features/BankReconciliation/utils.ts` | 98.73% |
+| `src/components/features/BankReconciliation/bankRecAtoms.ts` | 94.44% |
+| `src/components/features/BankReconciliation/BankRecErrorDialog.tsx` | 100% |
+| `src/components/features/BankReconciliation/MatchAndReconcile.tsx` | 98.01% |
+| `src/components/features/BankStatementImporter/CSV/StatementDetails.tsx` | 100% |
+| `src/pages/BankStatementImporter.tsx` | 97.14% |
+| `src/lib/frappe.ts` | 97.05% |
+| `src/lib/company.ts` | 100% |
+| `src/lib/currency.ts` | 100% |
+| **Aggregate** | **98.36%** |
+
+`coverage.exclude` is retained as a guard so that broadening `include` back to a directory glob can
+never silently re-admit generated DocType declarations (`src/types/**`), the harness itself
+(`src/test/**`), declaration files, or the browser entry point.
+
+> **Adding a component or API-client module to this work means adding it to `COVERED_UNITS`** — one
+> array, both purposes. Maintaining `include` and `thresholds` as two hand-written lists is the
+> failure mode described above.
 
 Three reporters run:
 
@@ -265,10 +300,18 @@ Three reporters run:
 | `json-summary` | `coverage/coverage-summary.json` | Machine-readable totals |
 | `lcov` | `coverage/lcov.info` plus an HTML report under `coverage/lcov-report/` | `lcov.info` is the standard interchange format, and the repository already carries a Codecov configuration at `erpnext/codecov.yml`, so no extra reporting plumbing is needed here. For line-by-line annotation, open `coverage/lcov-report/index.html` in a browser. |
 
-`coverage/` is generated output, never authored: it is listed in this package's `.gitignore` and
-in the ESLint flat config's `globalIgnores`, so a coverage run leaves `git status` clean and does
-not change the result of `eslint .`. Both entries are deliberate — the HTML report ships its own
-pre-disabled helper scripts, which ESLint would otherwise try to lint.
+`coverage/` is generated output, never authored — and **this package's `.gitignore` and ESLint flat
+config do not mention it**, because both files are frozen in this change set (see
+[Intentionally unchanged files](#intentionally-unchanged-files)). Two consequences worth knowing
+before you run the gate:
+
+- `git status` reports `coverage/` as untracked afterwards. **Delete it** (`rm -rf coverage`) rather
+  than committing it; if you run the gate often, add it to `.git/info/exclude`, which is local to
+  your clone and changes no tracked file.
+- `eslint .` run *after* a coverage run reports **3 warnings and 0 errors**, all of them
+  `Unused eslint-disable directive` inside the HTML report's own vendored helper scripts
+  (`coverage/lcov-report/{block-navigation,prettify,sorter}.js`). They come from generated output,
+  never from source. Delete `coverage/` and `eslint .` is silent again.
 
 > ⚠️ **Do not ask for Vitest's `basic` reporter.** It was **removed in Vitest 4** and requesting
 > it fails with a module-load error. Use the default reporter.
@@ -314,10 +357,17 @@ Three configuration files, all of them intentionally unchanged:
 | --- | --- |
 | `tsconfig.json` | Solution file: `files: []`, references `./tsconfig.app.json` and `./tsconfig.node.json`, and declares `baseUrl: "."` with `paths { "@/*": ["./src/*"] }` |
 | `tsconfig.app.json` | The application program: `include: ["src"]`, `target` `ES2020`, `lib` `["ES2020", "DOM", "DOM.Iterable"]`, `moduleResolution` `bundler`, `jsx` `react-jsx`, and `strict`, `noUnusedLocals`, `noUnusedParameters`, `noFallthroughCasesInSwitch`, `noUncheckedSideEffectImports` all enabled. It declares **no `types` array.** |
-| `tsconfig.node.json` | The tooling program: `include: ["vite.config.ts", "vitest.config.ts"]`, `types: ["node"]`, `target`/`lib` `ES2023`, with `verbatimModuleSyntax` and `erasableSyntaxOnly` enabled — which is why `proxyOptions.ts` imports its Node HTTP request type with `import type` |
+| `tsconfig.node.json` | The tooling program: `include: ["vite.config.ts"]`, `types: ["node"]`, `target`/`lib` `ES2023`, with `verbatimModuleSyntax` and `erasableSyntaxOnly` enabled — which is why `proxyOptions.ts` imports its Node HTTP request type with `import type` |
 
-`yarn typecheck` (`tsc -b`) builds both programs, so both the application **and** the two config
-files are type-checked.
+`yarn typecheck` (`tsc -b`) builds both programs, so the whole of `src/` — application code and
+colocated suites alike — plus `vite.config.ts` and the `proxyOptions.ts` it imports are
+type-checked.
+
+> **`vitest.config.ts` is not part of either program.** The tooling program's `include` names
+> `vite.config.ts` only, and all three `tsconfig.*.json` files are frozen here, so `tsc -b` never
+> reads the runner's own configuration. ESLint does (`eslint .` covers `**/*.{ts,tsx}` at the package
+> root), and a mistake in it fails the very next `yarn test` at config load — but do not expect
+> `yarn typecheck` to catch one.
 
 ### What that means if you are writing a test
 
@@ -336,7 +386,7 @@ files are type-checked.
 
 ## Linting
 
-`eslint.config.js` is a flat config: `globalIgnores(["dist", "coverage"])`, then a single block
+`eslint.config.js` is a flat config: `globalIgnores(["dist"])`, then a single block
 over `files: ["**/*.{ts,tsx}"]` extending the recommended JavaScript, recommended
 `typescript-eslint` and React-Refresh Vite configurations, with the `react-hooks` plugin
 (`rules-of-hooks` as an error, `exhaustive-deps` as a warning) and
@@ -346,8 +396,8 @@ over `files: ["**/*.{ts,tsx}"]` extending the recommended JavaScript, recommende
 reinforces point 2 above: a test that leans on an implicit `describe` fails lint as well as
 type-checking.
 
-This file is intentionally unchanged, and the stock scaffold's advice about expanding the ESLint
-configuration has been deliberately removed rather than carried over.
+This file is intentionally unchanged. `coverage` is **not** among its ignores, which is the whole of
+the [three-warning caveat](#coverage-gate) above.
 
 ## Source layout
 
@@ -371,7 +421,9 @@ configuration has been deliberately removed rather than carried over.
   container. Persistence is deliberate: `atomWithStorage` over `localStorage` for the selected
   bank account, the date range and the match filters; `createJSONStorage` over `sessionStorage`
   for the session action log; plain in-memory atoms for anything that must **not** survive a
-  reload, such as the error-dialog payload and the import-attempt markers.
+  reload — the error-dialog payload and the per-file import-failure map, which are the only two
+  atoms this work added. A stale error dialog, or a stale failure marker, must not outlive the
+  session that observed it.
 - **Data fetching is `frappe-react-sdk` hooks with explicit SWR cache keys.** Backend calls for
   the reconciliation feature are centralised as typed hooks in
   `src/components/features/BankReconciliation/utils.ts`; new calls extend that module and reuse
@@ -404,11 +456,11 @@ verbatim. It closes on `Escape` and on **Dismiss**, and dismissing it changes no
 
 | # | Situation | Behaviour |
 | --- | --- | --- |
-| **FM1** | The confirm/post request fails — refused by the server, or no response at all | The dialog shows the server's own message. Confirm/post is **one** server-side call and **nothing is mutated optimistically**, so the transaction stays unreconciled with its state unchanged and no partial or duplicate posting is possible. A rejection carrying no envelope is reported as *indeterminate* — never as "nothing was posted" — and the reviewer is sent to check the record rather than invited to retry blindly. The two transaction-list cache keys are then re-read from the server, so the affordance re-evaluates against the server's current figures. |
-| **FM2** | A malformed or empty statement file | The importer list carries a **per-file** indicator, and no transaction is ever created client-side. Three distinct states: **Failed** (the server refused the import, or refused to produce the statement's details), **No Transactions** (the server parsed the file and recognised nothing importable in it — its own words, and the reason the log sits at `Not Started` forever), and **Unknown** (no server envelope came back, so the outcome could not be established). A server `Completed` status always outranks every marker, and a marker is retired as soon as the condition that produced it has passed. The markers exist because `Bank Statement Import Log` has exactly two status values and **no error field**, so the failure has nowhere else to live. |
-| **FM3** | The transaction has already been reconciled | Confirm is **disabled**, on the backend's own predicate — `status === 'Reconciled'` or `unallocated_amount <= 0`, which the server derives from each other — and a tooltip says why. This is an affordance, not the control: the authoritative guard is the first statement of the first method `reconcile_vouchers` invokes. A stale client that gets through is refused by the server, and that refusal surfaces in the same dialog before the affected caches are re-read. |
+| **FM1** | The confirm/post request fails — refused by the server, or no response at all | The dialog shows the server's own message, passed through **unmodified**: the client paraphrases nothing and adds no wording of its own. Confirm/post is **one** server-side call and **nothing is mutated optimistically**, so the transaction stays unreconciled with its state unchanged and no partial or duplicate posting is possible. The rejection handler then does two things and only two: it **clears the transaction selection**, which withdraws the Reconcile affordance outright (see FM3), and it revalidates the two transaction-list cache keys so the next render is built from the server's current figures. |
+| **FM2** | A malformed or empty statement file | The server refuses the import synchronously and rolls it back; the refusal reaches the reviewer twice over. It opens the shared dialog in the server's own words, and it marks that **one file** on the importer list: a red **Failed** chip in place of the stored status, carrying the server's message as its tooltip and on its accessible name, and reachable by keyboard as well as pointer. No transaction is ever created client-side. The chip is driven from the observed rejection rather than from the document because `Bank Statement Import Log` has exactly two status values — `Not Started` and `Completed` — and **no error field**: a rolled-back import leaves the row saying `Not Started`, indistinguishable from one merely waiting to be imported, so the failure has nowhere else to live. The marker is held in memory, keyed by import-log name, and is deliberately **not** persisted. |
+| **FM3** | The transaction has already been reconciled | Confirm is **disabled**, on the backend's own predicate — `status === 'Reconciled'` or `unallocated_amount <= 0`, which the server derives from one another — and a tooltip on a focusable wrapper says why. This is an affordance, not the control: the authoritative guard is the first statement of the first method `reconcile_vouchers` invokes, and this SPA never decides a financial outcome for itself. A stale client that gets through is refused by the server, and the refusal is handled **fail-closed**: the selection is cleared *unconditionally*, so the Reconcile control is withdrawn rather than merely greyed, and it cannot come back on its own — not on a timer, and not because a revalidation request also failed. The affordance returns only when the reviewer selects a transaction again, against list data re-read from the server. |
 | **FM4** | A re-import produces duplicate transactions | Rendered exactly as the backend produces them. **There is no client-side deduplication, and none may be added.** |
-| **FM5** | The transaction's currency differs from the bank account's | A **non-blocking** amber advisory badge beside the rule badge. It does **not** disable confirm; whatever the backend enforces is what happens, and a rejection surfaces through the FM1 path. Both sides resolve the currency through the same lookup (`Bank Account.account` → `Account.account_currency`), so the indicator cannot disagree with the server. |
+| **FM5** | The transaction's currency differs from the bank account's | A **non-blocking** amber advisory badge beside the rule badge, with its explanation in a tooltip and in an `sr-only` description sharing the same string. It does **not** disable confirm; whatever the backend enforces is what happens, and a rejection surfaces through the FM1 path. The account currency it compares against is read from the **current** `bank_account.get_list` response — through `useSelectedBankAccountCurrency()`, which reads the account list already in the SWR cache and therefore issues no extra request — and *not* from the `selectedBankAccountAtom` snapshot in `localStorage`, which is written once when an account is picked and is never refreshed while that account stays selected. Both sides therefore resolve the same value by the same lookup (`Bank Account.account` → `Account.account_currency`), so the advisory cannot contradict the server. Where no account currency is known yet, there is nothing to compare and no badge is shown. |
 
 ## Scope boundaries
 
@@ -421,9 +473,9 @@ What this package does **not** do, stated so a reader does not go looking:
 | REST/RPC contract | Unchanged, including the call style: module functions by dotted path, the one document method through the generic `run_doc_method` bridge. |
 | Routes and providers | Unchanged. The dialog is mounted inside existing trees; no route or provider was added. |
 | Design system | **No** new token and **no** new primitive. New affordances compose the primitives in `src/components/ui/`. |
-| CI workflows | Unchanged. The Python suites are already discovered on both database engines; the frontend gate is `yarn verify`, which is **not** yet wired into a workflow — doing so is a workflow change and belongs to whoever owns those files. |
+| CI workflows | Unchanged. The Python suites are already discovered on both database engines; the frontend gate (`yarn typecheck && yarn lint && yarn test:coverage`) is **not** yet wired into a workflow — doing so is a workflow-file change and belongs to whoever owns those files. |
 | `frappe/` submodule | Untouched, pointer and contents. `frappe/cypress/` is referenced for **conventions only**; no Cypress spec is added here. |
-| Backend diff | One **additive** test module per bank DocType directory that needed coverage. No backend source file changes. |
+| Backend diff | **One file**: two test methods appended to `erpnext/accounts/doctype/bank_transaction_rule/test_bank_transaction_rule.py`, covering rule-based auto-match, which had no coverage anywhere. Additive only — none of the 20 existing tests is touched, and no backend source file changes. |
 
 Out of scope as features: no Plaid interface, no MT-940/XML ingestion in this SPA (the dropzone
 accepts CSV, XLSX, XLS and PDF, and the server-side reader rejects anything else), no currency
@@ -435,20 +487,43 @@ change to general-ledger posting or to the legacy Desk reconciliation tool.
 These are load-bearing and are deliberately left as they are. Read them for context; do not edit
 them as a side effect of feature work:
 
-`vite.config.ts` · `tsconfig.json` · `tsconfig.app.json` · `.env.production` · `index.html` ·
-`src/index.css` · everything under `src/types/` · and the `"version": "0.0.0"` field in
-`package.json` — a Vite-scaffold artefact, not a statement about how complete this application is.
+`vite.config.ts` · `tsconfig.json` · `tsconfig.app.json` · `tsconfig.node.json` ·
+`eslint.config.js` · `.gitignore` · `.env.production` · `index.html` · `src/index.css` ·
+everything under `src/components/ui/` · everything under `src/types/` · and the
+`"version": "0.0.0"` field in `package.json` — a Vite-scaffold artefact, not a statement about how
+complete this application is.
 
-Four files in that neighbourhood **did** change, each for one narrow reason, and each is worth
-knowing about before you assume it is untouched:
+That list is a **requirement of this change set, not a preference**: the plan this work implements
+freezes the build, TypeScript and lint configuration, so a convenience edit to any of them puts a
+file in the diff that does not belong there. Two of them are the reason for caveats documented
+above rather than fixed in place:
 
-| File | The one change, and why |
+| Frozen file | The caveat it produces |
 | --- | --- |
-| `tsconfig.node.json` | `vitest.config.ts` added to `include`, so the runner's own configuration is type-checked. `tsc -b` only ever sees a file some project includes, so without that line a type error there is silently undetected. |
-| `eslint.config.js` | `coverage` added to `globalIgnores`. The V8 HTML report ships its own vendored scripts, so linting it made the result of `eslint .` depend on whether a coverage run had happened first. |
-| `.gitignore` | `coverage` added, for the same output. Running the required gate must not leave the working tree dirty. |
-| `src/components/ui/markdown.tsx` | Its same-origin link filter. This renderer is the sink for server-authored `_server_messages`, and the error dialog put that sink on a financial posting screen — so an off-origin `href` written by the server is refused, including every backslash spelling of the scheme-relative form, and a backslash is refused outright rather than folded into `/`. |
+| `.gitignore` | Does not list `coverage`, so a coverage run leaves an untracked directory — [delete it](#coverage-gate) instead of ignoring it. |
+| `eslint.config.js` | Does not ignore `coverage` either, so `eslint .` after a coverage run reports [3 warnings from generated files](#coverage-gate). |
+| `tsconfig.node.json` | Includes `vite.config.ts` only, so [`vitest.config.ts` is not type-checked](#typescript-project-layout) by `tsc -b`. |
 
-The same care applies to `vitest.config.ts`'s independence from `vite.config.ts` and to the
-`resolutions` field: both look like tidy-up candidates and both are load-bearing, which is why
-each has its own section above.
+### What this work did change
+
+Sixteen files under this workspace, plus one additive backend test module. The source edits are
+small and each has a comment at its site explaining itself:
+
+| File | The change |
+| --- | --- |
+| `package.json` | Three scripts (`test`, `test:coverage`, `typecheck`), seven exactly-pinned test dependencies, and the [`resolutions` override](#the-resolutions-override--do-not-remove-it). |
+| `yarn.lock` | Regenerated by the install that added those seven packages. It is committed deliberately: `yarn install --frozen-lockfile` is the documented install command, and it cannot resolve the new dependencies from a lockfile that predates them. |
+| `proxyOptions.ts` | Two lines: an `import type` for the Node HTTP request type, and the parameter annotation that removes the one implicit-`any` error in the package. |
+| `vitest.config.ts`, `src/test/setup.ts`, `src/test/factories.ts` | New — the runner configuration, the Desk-runtime harness and the fixtures. |
+| `BankRecErrorDialog.tsx` | New — the dismissible dialog, composed from the existing `AlertDialog` and `ErrorBanner`. |
+| `bankRecAtoms.ts` | Two plain in-memory atoms appended to the sixteen already there. |
+| `utils.ts` | The reconcile rejection handler (dialog + fail-closed selection clear + revalidation), and `useSelectedBankAccountCurrency()`. |
+| `MatchAndReconcile.tsx` | Three sites: the dialog mount, the currency advisory, the already-reconciled guard on the confirm control. |
+| `CSV/StatementDetails.tsx` | The import rejection callback now *takes* the error, records the per-file failure and opens the dialog. The call shape, the success path and the realtime subscription are byte-identical to before. |
+| `pages/BankStatementImporter.tsx` | The third per-file badge state, and the dialog mount. |
+| `README.md` | This file, replacing the stock Vite scaffold text. |
+| Eight `*.test.{ts,tsx}` files | The suites listed under [Testing](#suites). |
+
+The same care as the frozen list applies to `vitest.config.ts`'s independence from
+`vite.config.ts` and to the `resolutions` field: both look like tidy-up candidates and both are
+load-bearing, which is why each has its own section above.

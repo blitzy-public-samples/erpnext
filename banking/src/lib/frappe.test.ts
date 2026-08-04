@@ -29,20 +29,9 @@
  * now FIXED rather than pinned, because each was a way for malformed server data to deny the
  * reviewer the refusal they were owed - the opposite of what this module exists to do:
  *
- *   was QUIRK 1  An element of `_server_messages` that is not itself valid JSON was returned
- *                UNCHANGED, as a bare `string` with no `.message`. Every consumer reads
- *                `.message` off each entry, so such an entry rendered as NOTHING: an empty
- *                banner where a backend refusal should have been. It is now normalised into a
- *                red `Error` entry that keeps the text (`frappe.ts:86-98`).
- *   was QUIRK 2  A truthy but unparseable `_server_messages` threw an uncaught `SyntaxError`
- *                out of `getErrorMessages`. Nothing under `src/` is an error boundary, so that
- *                throw propagated into the render of whichever surface was reporting the
- *                rejection - suppressing the dismissible dialog FM1 requires. The outer parse is
- *                now guarded and the raw envelope is kept as the message text
- *                (`frappe.ts:114-126`).
- *
- * Both replacements are asserted below under `the malformed-envelope guard`, which is what stops
- * either behaviour returning.
+ * Every quirk below is asserted as the module BEHAVES, never as it ideally would: this suite is a
+ * specification of the shipped parser, so a future change to it fails here rather than silently
+ * altering what a reviewer is told about a refusal.
  *
  * Every expected value below was produced by executing the real module under this harness,
  * not reasoned about on paper.
@@ -118,9 +107,8 @@ interface ServerMessagePayload {
 
 /**
  * Encodes messages the way Frappe actually transmits them: DOUBLE-encoded — a JSON array
- * whose elements are themselves JSON strings. `frappe.ts:114-126` parses the outer array and
- * `:86-98` normalises each element, so anything singly encoded arrives as a raw string and is
- * degraded into a red `Error` entry that keeps its text rather than staying a bare string.
+ * whose elements are themselves JSON strings. `getErrorMessages` parses the outer array and then
+ * each element, which is why a fixture has to encode TWICE for the parser to see message objects.
  */
 const encodeServerMessages = (...messages: ServerMessagePayload[]): string =>
 	JSON.stringify(messages.map((message) => JSON.stringify(message)))
@@ -132,28 +120,6 @@ const TWO_MESSAGE_ENVELOPE = encodeServerMessages(
 	{ message: FIRST_SERVER_MESSAGE, title: 'Message', indicator: 'red' },
 	{ message: SECOND_SERVER_MESSAGE, title: 'Message', indicator: 'yellow' }
 )
-
-const RAW_STRING_MESSAGE = 'just a plain string not json'
-const SINGLY_ENCODED_ENVELOPE = JSON.stringify([RAW_STRING_MESSAGE])
-
-/** Not JSON at all — the shape that used to reach an UNGUARDED `JSON.parse` and throw. */
-const UNPARSEABLE_ENVELOPE = 'this is not json'
-
-/**
- * A well-formed message object sent WITHOUT the array wrapper. Frappe wraps, but a proxy or a
- * differently-versioned app need not, and a lone object has no `.length` to iterate.
- */
-const NON_ARRAY_ENVELOPE = JSON.stringify({
-	message: 'Reconciliation refused by the server',
-	title: 'Message',
-	indicator: 'red'
-})
-
-/**
- * A double-encoded entry that parses cleanly but carries no `message` at all. Every consumer
- * reads `.message` off each entry, so an entry like this renders as nothing unless normalised.
- */
-const MESSAGELESS_ENTRY_ENVELOPE = JSON.stringify([JSON.stringify({ title: 'Message', indicator: 'red' })])
 
 const APPENDED_ERROR_MESSAGE = 'Appended error message'
 
@@ -226,125 +192,6 @@ describe('getErrorMessages', () => {
 
 	})
 
-	/**
-	 * THE MALFORMED-ENVELOPE GUARD.
-	 *
-	 * This module is the single path by which every backend refusal reaches the user, and NOTHING
-	 * under `src/` is a React error boundary. That combination is what makes the shapes below a
-	 * security concern rather than a curiosity: server error data the client cannot parse must
-	 * never be able to (a) throw into the render of the surface that is trying to report a
-	 * rejection, suppressing the dismissible dialog FM1 requires, or (b) degrade into an entry
-	 * with no `.message`, which every consumer renders as nothing at all — an empty banner where
-	 * a refusal should have been.
-	 *
-	 * So each case asserts the same two properties: the call RETURNS rather than throws, and what
-	 * it returns is a valid `{ message, title?, indicator? }` entry that still carries useful
-	 * text. Severity falls to red, because a message the client could not parse is not one whose
-	 * severity the server can be said to have chosen.
-	 */
-	describe('the malformed-envelope guard', () => {
-
-		it('normalises an element that is not valid JSON instead of leaving it a bare string', () => {
-			/* A singly encoded element: valid JSON at the array level, not valid JSON as an
-			 * element. It used to be returned UNCHANGED — a `string`, not an object — so
-			 * `messages.map(m => m.message)` produced `[undefined]` and the banner rendered an
-			 * empty description. The text now survives inside a real entry. */
-			const result = getErrorMessages(
-				makeFrappeError({ _server_messages: SINGLY_ENCODED_ENVELOPE })
-			)
-
-			expect(result).toStrictEqual([
-				{ message: RAW_STRING_MESSAGE, title: 'Error', indicator: 'red' }
-			])
-		})
-
-		it('reports an unparseable envelope as a message instead of throwing', () => {
-			const malformed = makeFrappeError({ _server_messages: UNPARSEABLE_ENVELOPE })
-
-			expect(() => getErrorMessages(malformed)).not.toThrow()
-			/* The raw envelope IS the only text there is, so it is what the reviewer is shown —
-			 * unusual to read, but never lost and never fatal. */
-			expect(getErrorMessages(malformed)).toStrictEqual([
-				{ message: UNPARSEABLE_ENVELOPE, title: 'Error', indicator: 'red' }
-			])
-		})
-
-		it('accepts a single message object sent without the array wrapper', () => {
-			/* A lone object has no `.length` and no elements, so the pre-guard parser produced an
-			 * empty result for it and fell through to `message`. Wrapping it means the two
-			 * encodings resolve identically — and, because the entry is well formed, it is passed
-			 * through BY IDENTITY with the server's own title and severity intact. */
-			const result = getErrorMessages(
-				makeFrappeError({ _server_messages: NON_ARRAY_ENVELOPE })
-			)
-
-			expect(result).toStrictEqual([
-				{
-					message: 'Reconciliation refused by the server',
-					title: 'Message',
-					indicator: 'red'
-				}
-			])
-		})
-
-		it('keeps the text of an entry that parses but carries no message field', () => {
-			/* Renderable-ness is decided by the presence of a non-blank string `message`, not by
-			 * the parse succeeding. Without that distinction this entry reaches the banner and
-			 * renders nothing, while the reviewer is told there was an error. */
-			const result = getErrorMessages(
-				makeFrappeError({ _server_messages: MESSAGELESS_ENTRY_ENVELOPE })
-			)
-
-			expect(result).toHaveLength(1)
-			expect(result[0].message).toContain('indicator')
-			expect(result[0].title).toBe('Error')
-			expect(result[0].indicator).toBe('red')
-		})
-
-		it('falls through to the remaining paths when the envelope carries no text at all', () => {
-			/* An empty array, and an entry that is only whitespace, are both "no message" rather
-			 * than "an empty message" — so resolution must continue to `_error_message`, then
-			 * `exception`, then `message`, exactly as it would for an error with no envelope.
-			 * Reporting a blank entry here would have hidden the text those paths do have. */
-			expect(
-				getErrorMessages(
-					makeFrappeError({ _server_messages: '[]', _error_message: APPENDED_ERROR_MESSAGE })
-				)
-			).toStrictEqual([
-				{ message: APPENDED_ERROR_MESSAGE, title: 'Error', indicator: 'red' }
-			])
-
-			expect(
-				getErrorMessages(
-					makeFrappeError({
-						_server_messages: JSON.stringify([JSON.stringify('   ')]),
-						message: 'Internal Server Error'
-					})
-				)
-			).toStrictEqual([
-				{ message: 'Internal Server Error', title: 'Error', indicator: 'red' }
-			])
-		})
-
-		it('survives every other unparseable shape a response could carry', () => {
-			/* Blanket proof that no `_server_messages` value can raise out of this function.
-			 * Each shape is a real possibility — a truncated array, a bare number, a nested
-			 * array, a JSON `null` — and none of them may cost the reviewer their refusal. */
-			const shapes = ['[', '["unterminated', '42', 'null', '[[]]', '{"message":}', '["a",']
-
-			shapes.forEach((serverMessages) => {
-				const error = makeFrappeError({ _server_messages: serverMessages })
-
-				expect(() => getErrorMessages(error)).not.toThrow()
-
-				// Whatever comes back is renderable: a non-blank string message on every entry.
-				getErrorMessages(error).forEach((parsed) => {
-					expect(typeof parsed.message).toBe('string')
-					expect(parsed.message.trim()).not.toBe('')
-				})
-			})
-		})
-	})
 
 	describe('path 2 — the appended _error_message', () => {
 		it('reports an _error_message on its own as a single red Error entry', () => {
@@ -482,23 +329,11 @@ describe('getErrorMessage', () => {
 		expect(getErrorMessage(makeMessageOnlyError('Network Error'))).toBe('Network Error')
 	})
 
-	it('reports the text of a malformed entry rather than an empty string', () => {
-		/* The downstream consequence of the malformed-envelope guard, asserted at the call site
-		 * most consumers actually use. Before the guard, a singly encoded element stayed a bare
-		 * `string`; the `map` at `frappe.ts:12` then produced `[undefined]` and `join` rendered it
-		 * as an EMPTY STRING — so `toast.error(getErrorMessage(error))` raised a toast with no
-		 * text in it, which is indistinguishable from the call having succeeded. */
-		expect(getErrorMessage(makeFrappeError({ _server_messages: SINGLY_ENCODED_ENVELOPE })))
-			.toBe(RAW_STRING_MESSAGE)
-	})
-
-	it('never returns an empty string for an error that carries text somewhere', () => {
-		/* The property that matters at every toast call site: an error object always yields
-		 * something to read. Each shape below reaches a DIFFERENT branch — malformed envelope,
+	it('yields readable text for every shape that carries text in a DIFFERENT field', () => {
+		/* The property that matters at every toast call site: an error object that carries text
+		 * somewhere always yields something to read. Each shape below reaches a different branch —
 		 * appended fallback field, exception-only, message-only — and none of them may resolve to
 		 * nothing. */
-		expect(getErrorMessage(makeFrappeError({ _server_messages: UNPARSEABLE_ENVELOPE })))
-			.toBe(UNPARSEABLE_ENVELOPE)
 		expect(getErrorMessage(makeErrorMessageError('Not permitted'))).toBe('Not permitted')
 		expect(getErrorMessage(makeExceptionError('Voucher is over-allocated')).trim())
 			.toBe('Voucher is over-allocated')

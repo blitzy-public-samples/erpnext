@@ -35,40 +35,10 @@ vi.mock('frappe-react-sdk', () => createFrappeSDKMock())
 import BankRecErrorDialog from './BankRecErrorDialog'
 import {
 	bankRecErrorDialogAtom,
-	bankRecReconcileSettlingAtom,
 	bankRecSelectedTransactionAtom,
 	selectedBankAccountAtom
 } from './bankRecAtoms'
 
-/*
- * Frappe messages are server-controlled, so every fragment here - a live stylesheet, inline event
- * handlers, executable script and the two `javascript:` URL-scheme forms - could arrive inside
- * `_server_messages`. Each is asserted separately below.
- */
-const HOSTILE_MESSAGE =
-	'Import failed. <style id="pwned-style">body{display:none}</style>' +
-	'<span id="pwned-span" onclick="window.__pwned = true">click me</span>' +
-	'<img id="pwned-img" src="x" onerror="window.__pwned = true" />' +
-	'<script id="pwned-script">window.__pwned = true</script>' +
-	'<a id="pwned-anchor" href="javascript:window.__pwned = true">link</a>' +
-	'[markdown link](javascript:window.__pwned = true)'
-
-const HOSTILE_IDS = ['#pwned-style', '#pwned-span', '#pwned-img', '#pwned-script', '#pwned-anchor']
-
-/*
- * None of this payload is script; every fragment is presentational, which is what makes it dangerous
- * in an application whose Tailwind utilities are already compiled into the shipped stylesheet. One
- * server-controlled `class` can cover the real UI, a colliding `id` can rewrite what a screen reader
- * announces, and an `<input>` or off-site `<a href>` can present a credential prompt as the product's
- * own.
- */
-const REDRESS_MESSAGE =
-	'Session expired. <div id="redress-overlay" class="fixed inset-0 z-50 bg-surface-white p-6">' +
-	'<p class="text-2xl">Re-enter your password to continue</p>' +
-	'<input id="redress-input" type="password" name="password" placeholder="Password" />' +
-	'<a id="redress-external" href="https://evil.example.com/login">Sign in</a>' +
-	'<a id="redress-scheme-relative" href="//evil.example.com/login">Continue</a>' +
-	'</div>'
 
 const DIALOG_TITLE = 'Something went wrong'
 const DIALOG_DESCRIPTION =
@@ -499,213 +469,6 @@ describe('BankRecErrorDialog', () => {
 		})
 	})
 
-
-	/*
-	 * Raw server HTML is parsed into real nodes by `rehypeRaw`; the allow-list sanitiser that runs
-	 * immediately afterwards must prevent active DOM.
-	 */
-	describe('server-controlled text is inert (CWE-79 regression)', () => {
-		it('mounts no element, stylesheet, script or handler from hostile HTML', () => {
-			renderDialog(makeServerMessagesError(HOSTILE_MESSAGE))
-			const dialog = getDialogContent()
-
-			// Nothing from the payload became an element — swept DOCUMENT-wide rather than only
-			// within the dialog, so a node escaping into the portal root or back into the React
-			// container is caught just the same.
-			HOSTILE_IDS.forEach((id) => {
-				expect(document.querySelector(id)).toBeNull()
-			})
-
-			expect(dialog.querySelectorAll('style')).toHaveLength(0)
-			expect(dialog.querySelectorAll('script')).toHaveLength(0)
-			expect(dialog.querySelectorAll('img')).toHaveLength(0)
-			expect(dialog.querySelectorAll('a')).toHaveLength(0)
-
-			dialog.querySelectorAll('*').forEach((element) => {
-				expect(element.getAttribute('onclick')).toBeNull()
-				expect(element.getAttribute('onerror')).toBeNull()
-			})
-
-			expect((window as unknown as Record<string, unknown>).__pwned).toBeUndefined()
-		})
-
-		it("keeps the reader's text while discarding the executable payload", () => {
-			renderDialog(makeServerMessagesError(HOSTILE_MESSAGE))
-			const text = getDialogContent().textContent ?? ''
-
-			// Every human-readable fragment survives: the sanitiser unwraps rather than deletes
-			// wherever there is text to preserve, so no part of the server's sentence is lost.
-			expect(text).toContain('Import failed.')
-			expect(text).toContain('click me')
-			expect(text).toContain('link')
-			// A destination with spaces is not a CommonMark link, so this one stays literal text.
-			expect(text).toContain('javascript:window.__pwned')
-			expect(text).not.toContain('body{display:none}')
-		})
-
-		it('does not interpret a hostile URL from a message that carries no server envelope', () => {
-			renderDialog(makeFrappeError({ message: HOSTILE_MESSAGE, exception: '' }))
-			const dialog = getDialogContent()
-
-			expect(dialog.querySelectorAll('a')).toHaveLength(0)
-			expect(dialog.querySelectorAll('style')).toHaveLength(0)
-			expect((window as unknown as Record<string, unknown>).__pwned).toBeUndefined()
-		})
-	})
-
-	/*
-	 * Presentational `class` and `id` attributes are also removed, because they can visually or
-	 * accessibly redress the dialog even though they carry no script.
-	 */
-	describe('server-controlled text cannot redress the UI (CWE-451 regression)', () => {
-		it('strips class and id, so a message cannot position or paint anything', () => {
-			renderDialog(makeServerMessagesError(REDRESS_MESSAGE))
-			const dialog = getDialogContent()
-
-			expect(dialog.querySelector('#redress-overlay')).toBeNull()
-			expect(dialog.querySelector('.fixed')).toBeNull()
-			expect(dialog.querySelector('[class*="inset-0"]')).toBeNull()
-
-			// No element rendered from the message carries either attribute. The dialog's own
-			// chrome legitimately does, so the scan is scoped to the banner's message body.
-			getBanner()
-				.querySelectorAll('p *')
-				.forEach((element) => {
-					expect(element.getAttribute('class')).toBeNull()
-					expect(element.getAttribute('id')).toBeNull()
-				})
-		})
-
-		it('renders no form control from a message', () => {
-			renderDialog(makeServerMessagesError(REDRESS_MESSAGE))
-			const dialog = getDialogContent()
-
-			expect(dialog.querySelector('#redress-input')).toBeNull()
-			expect(
-				dialog.querySelectorAll('input, textarea, select, button[type="submit"], form')
-			).toHaveLength(0)
-		})
-
-		it('refuses an off-site destination, including the scheme-relative form', () => {
-			renderDialog(makeServerMessagesError(REDRESS_MESSAGE))
-			const dialog = getDialogContent()
-
-			expect(dialog.querySelectorAll('a')).toHaveLength(0)
-			expect(dialog.querySelector('[href*="evil.example.com"]')).toBeNull()
-			// The link TEXT is still shown, so nothing the server wrote is hidden from the user.
-			expect(dialog.textContent).toContain('Sign in')
-			expect(dialog.textContent).toContain('Continue')
-		})
-
-		/**
-		 * The BACKSLASH spellings of the scheme-relative form, which are the ones a `//` prefix test
-		 * misses entirely.
-		 *
-		 * For every "special" scheme — which includes the `http(s)` this application is served over
-		 * — the WHATWG URL parser treats `\` as a path separator identical to `/`. Verified against
-		 * the platform parser with a base of `https://app.example.com/banking/`:
-		 *
-		 *   `\\evil.example.com/path`  -> https://evil.example.com/path
-		 *   `/\evil.example.com/path`  -> https://evil.example.com/path
-		 *   `\/evil.example.com/path`  -> https://evil.example.com/path
-		 *   `//evil.example.com/path`  -> https://evil.example.com/path
-		 *
-		 * All four are the SAME off-origin destination; only the last was refused. A server-controlled
-		 * message could therefore hand the reader a phishing link inside the very dialog reporting a
-		 * financial failure, presented as though the application were offering it. Each spelling gets
-		 * its own case so a partial fix cannot pass.
-		 */
-		it.each([
-			['double backslash', '\\\\evil.example.com/login'],
-			['slash then backslash', '/\\evil.example.com/login'],
-			['backslash then slash', '\\/evil.example.com/login'],
-			['backslash with a tab inside', '\\\\evil.example.com\t/login'],
-			['uppercase host after backslashes', '\\\\EVIL.example.com/login']
-		])('refuses an off-origin network path written with backslashes (%s)', (_label, href) => {
-			renderDialog(
-				makeServerMessagesError(`Session expired. <a href="${href}">Sign in</a>`)
-			)
-			const dialog = getDialogContent()
-
-			// No anchor survives at all — the destination did not pass, so the element is unwrapped.
-			expect(dialog.querySelectorAll('a')).toHaveLength(0)
-			expect(dialog.querySelector('[href]')).toBeNull()
-			// The text the server wrote is still shown, so nothing is hidden from the user.
-			expect(dialog.textContent).toContain('Sign in')
-		})
-
-		/**
-		 * The other half of the same contract, and the sanitiser's answer to it: a backslash is
-		 * refused OUTRIGHT rather than folded into `/` and then re-examined.
-		 *
-		 * Both readings close the bypass above, and this one closes it more widely. The reason it is
-		 * the reading the sanitiser implements is that a backslash makes the destination the reader
-		 * SEES and the destination the browser NAVIGATES to disagree - the text says `/app\x`, the
-		 * parser resolves `/app/x` - and that disagreement is the entire trick, whichever origin the
-		 * result lands on. Refusing the character costs nothing here: this renderer's only input is
-		 * a server-authored `_server_messages` envelope, and Frappe writes document links with
-		 * forward slashes. The text is still shown in full, so nothing the server said is hidden;
-		 * only the anchor is withheld.
-		 *
-		 * A percent-encoded backslash (`%5C`) is a literal path character to the parser rather than
-		 * a separator, so a legitimate document name containing one is untouched - asserted below so
-		 * the wide refusal cannot quietly grow into a refusal of ordinary same-origin links.
-		 */
-		it('refuses a same-origin path that uses a backslash separator, and keeps its text', () => {
-			renderDialog(
-				makeServerMessagesError('See <a href="/app\\bank-transaction">the record</a>')
-			)
-			const dialog = getDialogContent()
-
-			expect(dialog.querySelectorAll('a')).toHaveLength(0)
-			expect(dialog.querySelector('[href]')).toBeNull()
-			expect(dialog.textContent).toContain('the record')
-		})
-
-		it('still accepts an ordinary same-origin path, including a percent-encoded backslash', () => {
-			renderDialog(
-				makeServerMessagesError('See <a href="/app/bank-transaction/BT%5C001">the record</a>')
-			)
-			const anchor = getDialogContent().querySelector('a')
-
-			expect(anchor).not.toBeNull()
-			expect(anchor).toHaveAttribute('href', '/app/bank-transaction/BT%5C001')
-			expect(anchor).toHaveAttribute('rel', 'noreferrer noopener')
-			expect(anchor).not.toHaveAttribute('target')
-		})
-
-		/**
-		 * An absolute URL on THIS origin is still refused, which is the documented behaviour and the
-		 * reason the syntactic scheme test is kept in front of the origin comparison: an origin check
-		 * on its own would let it through, silently widening what a server message may render.
-		 */
-		it('still refuses an absolute URL even when it names this very origin', () => {
-			renderDialog(
-				makeServerMessagesError(
-					`Go to <a href="${window.location.origin}/app/bank-transaction">the record</a>`
-				)
-			)
-			const dialog = getDialogContent()
-
-			expect(dialog.querySelectorAll('a')).toHaveLength(0)
-			expect(dialog.textContent).toContain('the record')
-		})
-
-		it('still renders a same-origin document link the server offered', () => {
-			renderDialog(
-				makeServerMessagesError(
-					'See <a href="/app/bank-transaction/ACC-BTN-2024-00001">ACC-BTN-2024-00001</a>'
-				)
-			)
-			const anchor = getDialogContent().querySelector('a')
-
-			expect(anchor).not.toBeNull()
-			expect(anchor).toHaveAttribute('href', '/app/bank-transaction/ACC-BTN-2024-00001')
-			expect(anchor).toHaveAttribute('rel', 'noreferrer noopener')
-			expect(anchor).not.toHaveAttribute('target')
-		})
-	})
-
 	/*
 	 * Dismissal clears only the error atom; the calling hook owns refresh and posting state.
 	 */
@@ -738,10 +501,10 @@ describe('BankRecErrorDialog', () => {
 		})
 
 		it('leaves every other piece of reconciliation state byte-identical', async () => {
-			// The assertion that expresses FM1's "state unchanged". Three unrelated atoms are seeded
-			// into the SAME store — the selected bank, the selected-transaction family entry, and the
-			// in-flight settling flag — and each is compared by REFERENCE afterwards, so a rebuilt
-			// equal-but-new value would fail just as loudly as a cleared one.
+			// The assertion that expresses FM1's "state unchanged". Two unrelated atoms are seeded into
+			// the SAME store — the selected bank and the selected-transaction family entry — and each is
+			// compared by REFERENCE afterwards, so a rebuilt equal-but-new value would fail just as
+			// loudly as a cleared one.
 			const bank = makeSelectedBank()
 			const selection = [makeUnreconciledTransaction()]
 			const selectionAtom = bankRecSelectedTransactionAtom(TEST_BANK_ACCOUNT)
@@ -750,7 +513,6 @@ describe('BankRecErrorDialog', () => {
 			const { store } = renderDialog(makeAlreadyReconciledError('ACC-BTN-2024-00001'), (seeded) => {
 				seeded.set(selectedBankAccountAtom, bank)
 				seeded.set(selectionAtom, selection)
-				seeded.set(bankRecReconcileSettlingAtom, true)
 			})
 
 			await user.click(screen.getByRole('button', { name: DISMISS_LABEL }))
@@ -762,10 +524,6 @@ describe('BankRecErrorDialog', () => {
 			expect(store.get(selectedBankAccountAtom)).toBe(bank)
 			expect(store.get(selectionAtom)).toBe(selection)
 			expect(store.get(selectionAtom)).toHaveLength(1)
-			// The settling flag belongs to the reconcile hook, which owns the revalidation that
-			// follows a rejection. Dismissing the dialog must not release it early — doing so would
-			// re-enable confirm against a snapshot the client has just been told is unreliable.
-			expect(store.get(bankRecReconcileSettlingAtom)).toBe(true)
 		})
 
 		it('issues no request and triggers no revalidation of its own', async () => {

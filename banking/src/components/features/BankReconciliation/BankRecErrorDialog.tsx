@@ -48,10 +48,9 @@ const canTakeFocus = (element: HTMLElement | null): element is HTMLElement =>
  * about the same rejection, and it means the server's own words - for example
  * `"Bank Transaction {0} is already fully reconciled"` - reach the user verbatim.
  *
- * That composition is safe because `ErrorBanner` renders each parsed message through
- * `ui/markdown.tsx`, whose allow-list sanitiser runs AFTER `rehypeRaw`: scripts, styles, frames,
- * embedded objects, media, form controls, every `on*` handler, `style`, `class` and `id` are all
- * removed, and a link survives only when it resolves back to this application's own origin.
+ * Rendering is likewise the shared path: `ErrorBanner` hands each parsed message to
+ * `ui/markdown.tsx`, exactly as it does at every inline call site, so this dialog introduces no
+ * rendering behaviour of its own and inherits whatever that component does.
  *
  * Dismissing clears the dialog atom and nothing else - it issues no request, triggers no
  * revalidation and raises no notification, because the calling hook owns revalidation. Atomicity

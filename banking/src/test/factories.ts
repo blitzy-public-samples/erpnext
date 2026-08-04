@@ -60,8 +60,8 @@ import { vi } from 'vitest'
 
 import { createContext, createElement, Fragment, type ReactNode } from 'react'
 
-import type { BankAccountWithCurrency, LinkedPayment, UnreconciledTransaction } from '@/components/features/BankReconciliation/utils'
-import type { ImportAttemptStatus, SelectedBank } from '@/components/features/BankReconciliation/bankRecAtoms'
+import type { LinkedPayment, UnreconciledTransaction } from '@/components/features/BankReconciliation/utils'
+import type { SelectedBank } from '@/components/features/BankReconciliation/bankRecAtoms'
 import type { BankTransaction } from '@/types/Accounts/BankTransaction'
 import type { BankTransactionPayments } from '@/types/Accounts/BankTransactionPayments'
 import type { BankStatementImportLog } from '@/types/Accounts/BankStatementImportLog'
@@ -283,6 +283,15 @@ export const makeCurrencyMismatchTransaction = (
  * `payment_document`, `payment_entry` and `allocated_amount` are REQUIRED by the child DocType;
  * `reconciliation_type` defaults to `Matched`, which is what `add_payment_entries` writes when the
  * voucher was matched rather than created (`bank_transaction.py:163-170`).
+ *
+ * THE ALLOCATED FIGURE IS THE SERVER'S, NOT THE CLIENT'S. `add_payment_entries` reads only
+ * `payment_doctype` and `payment_name` out of the request and appends the row at
+ * `allocated_amount: 0.0`; `allocate_payment_entries` then computes the real figure from the
+ * voucher's GL entries minus whatever is already allocated against other transactions, capped at the
+ * remaining unallocated amount. The `amount` the client sends alongside the two identity fields is a
+ * legacy member of the legacy Desk tool's payload and is IGNORED. So this value models what the
+ * server DERIVED, and a suite must never read it as evidence that a client-supplied figure was
+ * honoured.
  */
 export const makeBankTransactionPayment = (
 	overrides: Partial<BankTransactionPayments> = {}
@@ -548,13 +557,33 @@ export const makeSelectedBank = (overrides: Partial<SelectedBank> = {}): Selecte
  * the resolution failing.
  *
  * `order_by` is `is_default desc`, so the first row of a multi-row answer is the company's default
- * account; `is_default: 1` here matches that. Override `account_currency` with `undefined` to model
- * a row whose GL account carries no currency — an absence the currency advisory must read as
- * "nothing to compare" rather than as a mismatch.
+ * account; `is_default: 1` here matches that. Override `account_currency` with `null` to model a row
+ * whose GL account carries no currency — the endpoint always attaches the key and
+ * `Account.account_currency` is itself nullable, so a literal `null` is what arrives, and the
+ * currency advisory must read it as "nothing to compare" rather than as a mismatch.
+ *
+ * The row type is declared HERE rather than imported: `utils.ts` keeps `BankAccountWithCurrency`
+ * module-private, and exporting it purely to satisfy a fixture would widen the module's public
+ * surface for the benefit of a test.
  */
+export interface BankAccountListRow {
+	name: string
+	account?: string
+	company?: string
+	account_name?: string
+	is_default?: 0 | 1
+	bank?: string
+	account_type?: string
+	account_subtype?: string
+	bank_account_no?: string
+	last_integration_date?: string
+	is_credit_card?: 0 | 1
+	account_currency?: string | null
+}
+
 export const makeBankAccountListRow = (
-	overrides: Partial<BankAccountWithCurrency> = {}
-): BankAccountWithCurrency => ({
+	overrides: Partial<BankAccountListRow> = {}
+): BankAccountListRow => ({
 	name: TEST_BANK_ACCOUNT,
 	account: TEST_BANK_LEDGER_ACCOUNT,
 	company: TEST_COMPANY,
@@ -573,13 +602,76 @@ export const makeBankAccountListRow = (
 })
 
 /**
+ * The match indicators each branch of `get_linked_payments` actually sums into its `rank` column.
+ *
+ * Read straight off the five rank expressions in `bank_reconciliation_tool.py`, every one of which is
+ * `(<indicators summed> + 1)`:
+ *
+ *   Bank Transaction  ref + amount + party + unallocated + 1   -> 1..5   (L1298)
+ *   Payment Entry     ref + amount + party + 1                 -> 1..4   (L1358)
+ *   Journal Entry     ref + amount + 1                          -> 1..3   (L1442)
+ *   Sales Invoice     ref + party + amount + 1                  -> 1..4   (L1470)
+ *   Purchase Invoice  party + amount + 1                        -> 1..3   (L1505)
+ *
+ * Two consequences a fixture MUST respect. First, `rank` is not a score on a common scale: the SAME
+ * quality of match ranks 4 as a Payment Entry and 3 as a Journal Entry, because the Journal Entry
+ * branch has no party indicator at all. Second, a Purchase Invoice can never earn a reference point
+ * even when one would apply, because that branch projects a constant empty reference.
+ */
+const LINKED_PAYMENT_RANK_INDICATORS = {
+	'Bank Transaction': ['reference', 'amount', 'party', 'unallocated'],
+	'Payment Entry': ['reference', 'amount', 'party'],
+	'Journal Entry': ['reference', 'amount'],
+	'Sales Invoice': ['reference', 'party', 'amount'],
+	'Purchase Invoice': ['party', 'amount']
+} as const satisfies Record<string, readonly LinkedPaymentRankIndicator[]>
+
+export type LinkedPaymentRankIndicator = 'reference' | 'amount' | 'party' | 'unallocated'
+
+export type LinkedPaymentBranch = keyof typeof LINKED_PAYMENT_RANK_INDICATORS
+
+/**
+ * The `rank` the named branch would compute for a row matching the given indicators — DERIVED from
+ * the branch formula above rather than written out by hand.
+ *
+ * An indicator the branch does not measure is silently ignored, exactly as the SQL does: asking for
+ * `party` on a Journal Entry row adds nothing, because that query has no party term.
+ */
+export const linkedPaymentRank = (
+	branch: LinkedPaymentBranch,
+	matched: Partial<Record<LinkedPaymentRankIndicator, boolean>> = {}
+): number =>
+	1 + LINKED_PAYMENT_RANK_INDICATORS[branch].filter((indicator) => matched[indicator] === true).length
+
+/**
+ * Orders candidate vouchers the way the endpoint hands them over.
+ *
+ * `check_matching` concatenates every branch's rows and returns
+ * `sorted(matching_vouchers, key=lambda x: x["rank"], reverse=True)`
+ * (`bank_reconciliation_tool.py:1172`). Python's `sorted` is stable, and `Array.prototype.sort` is
+ * stable in every engine this SPA supports, so comparing on rank alone reproduces the endpoint's
+ * ordering exactly - including how it leaves equal-rank rows in branch-emission order.
+ *
+ * Suites answering `get_linked_payments` should pass their fixtures through this rather than writing
+ * an order out by hand, because the order is load-bearing: the suggestion predicate additionally
+ * requires `index === 0`, so which voucher the workbench proposes is decided by this sort.
+ */
+export const sortLinkedPaymentsAsEndpoint = (vouchers: LinkedPayment[]): LinkedPayment[] =>
+	[...vouchers].sort((left, right) => right.rank - left.rank)
+
+/**
  * A candidate voucher. Defaults agree with {@link makeUnreconciledTransaction} on amount, posting
- * date, reference date and reference number, so at list index 0 it satisfies the suggestion
+ * date, reference date, reference number and party, so at list index 0 it satisfies the suggestion
  * predicate — which also requires `index === 0`, so a voucher is only ever suggested when rendered
  * first.
+ *
+ * `rank` is DERIVED from the Payment Entry branch formula for a row matching reference, amount and
+ * party — the three indicators that branch measures — so it is 4, its branch maximum. It is not
+ * hardcoded, and it is not 1: a fixture that gave the best-matching candidate the LOWEST rank both
+ * misdescribed the endpoint and, once sorted as the endpoint sorts, would have placed it last.
  */
 export const makeLinkedPayment = (overrides: Partial<LinkedPayment> = {}): LinkedPayment => ({
-	rank: 1,
+	rank: linkedPaymentRank('Payment Entry', { reference: true, amount: true, party: true }),
 	doctype: 'Payment Entry',
 	name: 'ACC-PAY-2024-00001',
 	paid_amount: TEST_TRANSACTION_AMOUNT,
@@ -607,7 +699,8 @@ export const makeSuggestedLinkedPayment = (
 	overrides: Partial<LinkedPayment> = {}
 ): LinkedPayment =>
 	makeLinkedPayment({
-		rank: 1,
+		// The Payment Entry branch maximum: this row agrees on reference, amount and party.
+		rank: linkedPaymentRank('Payment Entry', { reference: true, amount: true, party: true }),
 		paid_amount: transaction.unallocated_amount ?? TEST_TRANSACTION_AMOUNT,
 		posting_date: transaction.date ?? TEST_TRANSACTION_DATE,
 		reference_date: transaction.date ?? TEST_TRANSACTION_DATE,
@@ -619,14 +712,19 @@ export const makeSuggestedLinkedPayment = (
 	})
 
 /**
- * A DIFFERENT voucher — the one a reviewer picks when overriding the suggestion. A `Journal Entry` at
- * `rank: 2` that disagrees with {@link makeUnreconciledTransaction} on amount and on both dates, and
- * whose reference is neither equal to nor a substring of the base reference or description, so the
- * row reads "No Match" rather than "Partial Match".
+ * A DIFFERENT voucher — the one a reviewer picks when overriding the suggestion. A `Journal Entry`
+ * that disagrees with {@link makeUnreconciledTransaction} on amount and on both dates, and whose
+ * reference is neither equal to nor a substring of the base reference or description, so the row
+ * reads "No Match" rather than "Partial Match".
+ *
+ * Rank is the Journal Entry branch MINIMUM — that branch sums reference and amount only, and this row
+ * matches neither — so it is 1, below the suggested Payment Entry's 4. Sorted as the endpoint sorts,
+ * it therefore lands AFTER the suggestion, which is what makes it a genuine manual override rather
+ * than a candidate the client happened to list second.
  */
 export const makeAlternateLinkedPayment = (overrides: Partial<LinkedPayment> = {}): LinkedPayment =>
 	makeLinkedPayment({
-		rank: 2,
+		rank: linkedPaymentRank('Journal Entry'),
 		doctype: 'Journal Entry',
 		name: 'ACC-JV-2024-00001',
 		paid_amount: TEST_ALTERNATE_AMOUNT,
@@ -657,7 +755,10 @@ export const makeAlternateLinkedPayment = (overrides: Partial<LinkedPayment> = {
  */
 export const makeBlankReferenceLinkedPayment = (overrides: Partial<LinkedPayment> = {}): LinkedPayment =>
 	makeLinkedPayment({
-		rank: 1,
+		// Purchase Invoice sums party and amount only. This row agrees on amount and not on party, so
+		// its rank is 2 of a possible 3 — and it can never earn a reference point, because the branch
+		// projects a constant empty reference.
+		rank: linkedPaymentRank('Purchase Invoice', { amount: true }),
 		doctype: 'Purchase Invoice',
 		name: 'ACC-PINV-2024-00001',
 		paid_amount: TEST_TRANSACTION_AMOUNT,
@@ -688,7 +789,9 @@ export const makeBlankReferenceLinkedPayment = (overrides: Partial<LinkedPayment
  */
 export const makeSalesInvoiceLinkedPayment = (overrides: Partial<LinkedPayment> = {}): LinkedPayment =>
 	makeLinkedPayment({
-		rank: 1,
+		// Sales Invoice sums reference, party and amount. This row agrees on reference, amount and
+		// party, so it is at the branch maximum of 4.
+		rank: linkedPaymentRank('Sales Invoice', { reference: true, amount: true, party: true }),
 		doctype: 'Sales Invoice',
 		name: 'ACC-SINV-2024-00001',
 		paid_amount: TEST_TRANSACTION_AMOUNT,
@@ -711,7 +814,9 @@ export const makeSalesInvoiceLinkedPayment = (overrides: Partial<LinkedPayment> 
  */
 export const makeNullReferenceLinkedPayment = (overrides: Partial<LinkedPayment> = {}): LinkedPayment =>
 	makeLinkedPayment({
-		rank: 1,
+		// Journal Entry sums reference and amount. The reference is NULL so it scores nothing there;
+		// the amount agrees, giving 2 of a possible 3.
+		rank: linkedPaymentRank('Journal Entry', { amount: true }),
 		doctype: 'Journal Entry',
 		name: 'ACC-JV-2024-00002',
 		paid_amount: TEST_TRANSACTION_AMOUNT,
@@ -978,31 +1083,31 @@ export const makeMessageOnlyError = (
 		...overrides
 	})
 
+/** The message `insert_transactions` rejects an unreadable or empty statement with. */
+export const IMPORT_FAILURE_MESSAGE = 'No tables found in the PDF file'
+
 /**
- * Builds the value held by `bankRecImportFailuresAtom`, whose type is `ImportAttemptMarkers` —
- * `Record<bankAccountName, Record<importLogName, ImportAttemptStatus>>`.
+ * Builds the value held by `bankRecImportFailuresAtom`: a `Map` from `Bank Statement Import Log` name
+ * to the message the server refused that import with.
  *
- * NESTED BY BANK ACCOUNT, deliberately, because that is the shape the atom actually has. The
- * importer list is a per-bank query with a per-bank row limit, so a marker's visibility and its
- * lifetime are both properties of one account; a flat map made the retention cap count markers
- * from accounts whose rows were not even on screen. A fixture that flattened this would let a
- * suite pass against a shape the application no longer uses.
+ * A `Map` because that is the atom's actual type, and it is a `Map` for a reason worth preserving in
+ * the fixture — a plain object answers a membership test for `__proto__`, `constructor` and
+ * `toString` whether or not anything was recorded under them, so a fixture built as `{}` could not
+ * distinguish "recorded" from "inherited".
  *
- * This map supplements — and never overrides — the document, because `Bank Statement Import
- * Log` has only two status values and no error field, so an import that rolls back persists
- * nothing at all. The marker is what the client established about ONE attempt, and it holds
- * no error object: `'failed'` means the SERVER refused and a follow-up read confirmed the log is
- * still not `Completed`, while `'unknown'` means nothing observed amounts to the server saying so.
- * An authoritative `Completed` always wins over either, so a suite asserting the badge must supply
- * the log's own `status` as well as the marker.
+ * The marker supplements, never replaces, the document: `Bank Statement Import Log` offers only
+ * `Not Started` and `Completed` and carries no error field, and a refused import rolls back, so the
+ * log persists nothing about the failure. It records exactly one observation — this session saw the
+ * server refuse an import of this log — and the importer list gives that precedence over the stored
+ * status, because a rolled-back import leaves the log saying `Not Started`, which is also what it says
+ * before anyone has tried.
  *
- * Accepts the log itself rather than a bare name so neither key can drift from the row it marks —
- * the bank key is read off the log's own `bank_account`.
+ * Accepts the log itself rather than a bare name so the key cannot drift from the row it marks.
  */
 export const makeImportFailures = (
 	log: BankStatementImportLog,
-	attempt: ImportAttemptStatus = 'failed'
-): Record<string, Record<string, ImportAttemptStatus>> => ({ [log.bank_account]: { [log.name]: attempt } })
+	message: string = IMPORT_FAILURE_MESSAGE
+): Map<string, string> => new Map([[log.name, message]])
 
 /* Every suite mocks the SDK through {@link createFrappeSDKMock}, so none hand-rolls a module mock or
  * omits a symbol. The `vi.mock('frappe-react-sdk', () => createFrappeSDKMock())` line must stay
@@ -1417,15 +1522,13 @@ export const makeReconcileSuccessResponse = (
 
 /**
  * The success payload of the statement import, shaped exactly as its hook declares it:
- * `useFrappePostCall<{ docs: BankStatementImportLog[] }>('run_doc_method')`
- * (`StatementDetails.tsx:98`).
+ * `useFrappePostCall<{ docs: BankStatementImportLog[] }>('run_doc_method')`.
  *
- * The importer reads `response.docs[0].start_date` and `.end_date` to move the reconciliation
- * date range (`StatementDetails.tsx:200-207`) — but only from a document whose `status` is
- * `Completed`, because nothing else in a response confirms that the import took effect
- * (`StatementDetails.tsx:53-69`). The factory's own default log is `Completed`, so the default
- * payload here is a CONFIRMING one; a suite that needs the unconfirmed path passes a log with a
- * nonterminal status, or no log at all.
+ * `run_doc_method` always appends the document it ran the method on (`frappe/handler.py:340`), and
+ * `insert_transactions` sets `status = "Completed"` and saves as its last act, so a returned
+ * document reports the terminal status. The import step reads `docs[0].start_date` / `.end_date` to
+ * move the reconciliation date range; it guards on both being present, so a suite can model a
+ * response carrying no usable range by passing a log without them, or `[]` for no document at all.
  */
 export const makeImportSuccessResponse = (
 	logs: BankStatementImportLog[] = [makeBankStatementImportLog()]

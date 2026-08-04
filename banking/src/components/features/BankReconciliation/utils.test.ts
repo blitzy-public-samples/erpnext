@@ -6,6 +6,7 @@ import Fuse from 'fuse.js'
 import { toast } from 'sonner'
 import {
 	TEST_BANK,
+	TEST_ALTERNATE_CURRENCY,
 	TEST_BANK_ACCOUNT,
 	TEST_COMPANY,
 	TEST_CURRENCY,
@@ -34,7 +35,6 @@ import {
 	makeRuleMatchedTransaction,
 	makeSalesInvoiceLinkedPayment,
 	makeSelectedBank,
-	makeServerMessagesError,
 	makeSuggestedLinkedPayment,
 	makeUnreconciledTransaction
 } from '@/test/factories'
@@ -46,13 +46,7 @@ import {
 vi.mock('frappe-react-sdk', () => createFrappeSDKMock())
 
 import {
-	bankRecBankTransactionsKey,
-	bankRecClosingBalanceAsPerStatementKey,
-	bankRecClosingBalanceKey,
-	bankRecUnreconciledTransactionsKey,
 	getSearchResults,
-	isFrappeErrorEnvelope,
-	toDisplayError,
 	useGetAccountClosingBalance,
 	useGetAccountClosingBalanceAsPerStatement,
 	useGetAccountOpeningBalance,
@@ -63,8 +57,8 @@ import {
 	useGetVouchersForTransaction,
 	useIsTransactionWithdrawal,
 	useReconcileTransaction,
-	useRefreshImportedTransactions,
 	useRefreshUnreconciledTransactions,
+	useSelectedBankAccountCurrency,
 	useTransactionSearch,
 	useUpdateActionLog,
 	type UnreconciledTransaction
@@ -75,26 +69,12 @@ import {
 	bankRecDateAtom,
 	bankRecErrorDialogAtom,
 	bankRecMatchFilters,
-	bankRecReconcileSettlingAtom,
 	bankRecSearchText,
 	bankRecSelectedTransactionAtom,
 	bankRecTransactionTypeFilter,
 	bankRecUnreconcileModalAtom,
-	classifyImportAttempt,
-	classifyParsedStatement,
-	getImportAttempt,
-	getPreImportFailures,
-	IMPORT_ATTEMPT_MARKER_LIMIT,
-	PRE_IMPORT_FAILURE_LIMIT,
-	preImportFailureScopeKey,
 	selectedBankAccountAtom,
-	withCompletedImportAttemptsRetired,
-	withImportAttempt,
-	withoutImportAttempt,
-	withPreImportFailure,
-	withoutPreImportFailure,
-	type ActionLog,
-	type ImportAttemptMarkers
+	type ActionLog
 } from './bankRecAtoms'
 import { selectedCompanyAtom } from '@/hooks/useCurrentCompany'
 
@@ -197,26 +177,6 @@ const ALL_TRANSACTIONS_KEY = `bank-reconciliation-bank-transactions-${TEST_BANK_
 const SELECTED_TRANSACTION_ATOM = bankRecSelectedTransactionAtom(TEST_BANK_ACCOUNT)
 
 /**
- * The endpoint the post-rejection authoritative read calls - the SAME one both transaction-list
- * queries use, which is the point: the read exists to obtain the rows those lists may no longer be
- * telling the truth about.
- */
-const GET_BANK_TRANSACTIONS_METHOD =
-	'erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.get_bank_transactions'
-
-/**
- * The third argument the invalidation carries. Stated once, because "evict" and "revalidate" are
- * different operations with different behaviour for an UNSUBSCRIBED key, and only the former
- * applies without a subscriber.
- */
-const EVICT_CACHE_ENTRY_ARGS = { revalidate: true, populateCache: true }
-
-/** Configures what the server answers the authoritative read with. */
-const serverReportsTransactions = (rows: UnreconciledTransaction[]) => {
-	frappeContextValue.call.get.mockResolvedValue({ message: rows })
-}
-
-/**
  * A store seeded with the state the reconcile seam reads: the selected account, the date range
  * that composes both cache keys, and the company the bank-account list is fetched for. Seeding
  * the dates explicitly is what makes the key assertions exact rather than dependent on the
@@ -232,830 +192,6 @@ const createSeededStore = () => {
 
 const withStore = (store: ReturnType<typeof createStore>) =>
 	({ children }: PropsWithChildren) => createElement(Provider, { store }, children)
-
-describe('useReconcileTransaction — rejection is resolved against the server, not guessed', () => {
-	let consoleError: ReturnType<typeof vi.spyOn>
-
-	beforeEach(() => {
-		consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
-	})
-
-	afterEach(() => {
-		consoleError.mockRestore()
-	})
-
-	describe('a rejection carrying no response', () => {
-		// `frappe-js-sdk` reads `error.response.data` with no guard, so when no response came back
-		// its own TypeError becomes the rejection value. There is no server text to preserve, and -
-		// critically - no server ANSWER either.
-		const transportFailure = new TypeError("Cannot read properties of undefined (reading 'data')")
-
-		const runRejectedReconcile = async () => {
-			const store = createSeededStore()
-			const transaction = makeUnreconciledTransaction()
-			store.set(SELECTED_TRANSACTION_ATOM, [transaction])
-			frappePostCall.mockImplementation(() => Promise.reject(transportFailure))
-
-			const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
-			await act(async () => {
-				result.current.reconcileTransaction(transaction, makeLinkedPayment())
-			})
-			return store
-		}
-
-		it('never claims that nothing was posted', async () => {
-			const store = await runRejectedReconcile()
-			const message = store.get(bankRecErrorDialogAtom)?.message ?? ''
-
-			// The whole point of the substitute copy. A lost response proves only that the client
-			// never learned the answer; the request may have been delivered, committed and
-			// acknowledged into a connection that had already gone away. Asserting otherwise is the
-			// client inventing a server-side fact, and it is the dangerous direction to be wrong in
-			// for a financial post - a reviewer told nothing happened will repeat the action.
-			expect(message).not.toMatch(/nothing was posted/i)
-			expect(message).not.toMatch(/was not (posted|recorded|saved)/i)
-			expect(message).not.toMatch(/no(thing)? (was )?(recorded|saved)/i)
-		})
-
-		it('states the outcome as unknown and sends the reviewer to the server for it', async () => {
-			const store = await runRejectedReconcile()
-			const message = store.get(bankRecErrorDialogAtom)?.message ?? ''
-
-			expect(message).toMatch(/no response arrived from the server/i)
-			expect(message).toMatch(/not known whether this request was recorded/i)
-			expect(message).toMatch(/check the current state of the affected records/i)
-		})
-
-		it('does not invite a blind retry', async () => {
-			const store = await runRejectedReconcile()
-			const message = store.get(bankRecErrorDialogAtom)?.message ?? ''
-
-			// "try again" - with no instruction to verify first - is exactly the prompt that turns
-			// one indeterminate post into two.
-			expect(message).not.toMatch(/try again/i)
-		})
-
-		it('reports the transport failure as HTTP 0 rather than inventing a status', async () => {
-			const store = await runRejectedReconcile()
-			const error = store.get(bankRecErrorDialogAtom)
-
-			expect(error?.httpStatus).toBe(0)
-			expect(error?.httpStatusText).toBe('Network Error')
-			expect(error?.exception).toBe('')
-		})
-
-		/*
-		 * The rejection is NOT copied to the console. It is surfaced in full to the reviewer through
-		 * the dismissible dialog and the toast, so a console copy would add nothing but a second,
-		 * unredacted record of a financial transport failure - a raw Frappe rejection carries the
-		 * whole response envelope. Asserted as an absence so the log cannot come back unnoticed, and
-		 * paired with the dialog assertion so "not logged" can never mean "not reported".
-		 */
-		it('does not copy the raw rejection reason to the console', async () => {
-			const store = await runRejectedReconcile()
-
-			expect(consoleError).not.toHaveBeenCalledWith(transportFailure)
-			expect(store.get(bankRecErrorDialogAtom)).not.toBeNull()
-		})
-	})
-
-	it('hands a genuine server envelope to the dialog BY IDENTITY', async () => {
-		const store = createSeededStore()
-		const transaction = makeUnreconciledTransaction()
-		store.set(SELECTED_TRANSACTION_ATOM, [transaction])
-
-		const serverRejection = makeAlreadyReconciledError(transaction.name)
-		frappePostCall.mockImplementation(() => Promise.reject(serverRejection))
-
-		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
-		await act(async () => {
-			result.current.reconcileTransaction(transaction, makeLinkedPayment())
-		})
-
-		// Not cloned, not reshaped, not re-titled: the server's own object, so its wording and its
-		// severity reach the reviewer verbatim.
-		expect(store.get(bankRecErrorDialogAtom)).toBe(serverRejection)
-		expect(store.get(bankRecErrorDialogAtom)?._server_messages).toContain(
-			formatAlreadyReconciledMessage(transaction.name)
-		)
-	})
-
-	it('EVICTS both transaction-list keys, byte for byte, and introduces no new key', async () => {
-		const store = createSeededStore()
-		const transaction = makeUnreconciledTransaction()
-		store.set(SELECTED_TRANSACTION_ATOM, [transaction])
-		frappePostCall.mockImplementation(() => Promise.reject(makeAlreadyReconciledError(transaction.name)))
-
-		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
-		await act(async () => {
-			result.current.reconcileTransaction(transaction, makeLinkedPayment())
-		})
-
-		// Emptied, not merely asked to revalidate. A bare `mutate(key)` runs the key's registered
-		// revalidator, and an UNMOUNTED key has none - so the populated entry would survive
-		// untouched and, with `revalidateIfStale` disabled on the unreconciled query, still be
-		// served after a remount. Writing `undefined` is a cache WRITE, which applies with or
-		// without a subscriber, and `revalidate: true` refills it immediately where one exists.
-		expect(frappeSWRMutate).toHaveBeenCalledWith(UNRECONCILED_KEY, undefined, EVICT_CACHE_ENTRY_ARGS)
-		expect(frappeSWRMutate).toHaveBeenCalledWith(ALL_TRANSACTIONS_KEY, undefined, EVICT_CACHE_ENTRY_ARGS)
-		const revalidatedKeys = frappeSWRMutate.mock.calls.map(([key]) => key)
-		expect(revalidatedKeys).toEqual([UNRECONCILED_KEY, ALL_TRANSACTIONS_KEY])
-	})
-
-	it('asks the SERVER for the transaction\'s true state, with the same arguments the list uses', async () => {
-		const store = createSeededStore()
-		const transaction = makeUnreconciledTransaction()
-		store.set(SELECTED_TRANSACTION_ATOM, [transaction])
-		frappePostCall.mockImplementation(() => Promise.reject(makeAlreadyReconciledError(transaction.name)))
-		serverReportsTransactions([makeReconciledTransaction({ name: transaction.name })])
-
-		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
-		await act(async () => {
-			result.current.reconcileTransaction(transaction, makeLinkedPayment())
-		})
-
-		// `all_transactions` is the load-bearing argument: without it the endpoint filters on
-		// `unallocated_amount > 0`, so a transaction the server now considers reconciled would come
-		// back MISSING rather than present with its true status.
-		expect(frappeContextValue.call.get).toHaveBeenCalledWith(GET_BANK_TRANSACTIONS_METHOD, {
-			bank_account: TEST_BANK_ACCOUNT,
-			from_date: FROM_DATE,
-			to_date: TO_DATE,
-			all_transactions: true
-		})
-	})
-
-	it('keeps the action closed until the refresh has landed, then reopens it', async () => {
-		const store = createSeededStore()
-		const transaction = makeUnreconciledTransaction()
-		store.set(SELECTED_TRANSACTION_ATOM, [transaction])
-		frappePostCall.mockImplementation(() => Promise.reject(makeAlreadyReconciledError(transaction.name)))
-
-		// The refresh is held open, so the window between "the post failed" and "the server has been
-		// re-read" becomes observable instead of collapsing into one microtask.
-		const refresh = createDeferred<undefined>()
-		frappeSWRMutate.mockImplementation(() => refresh.promise)
-
-		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
-
-		await act(async () => {
-			result.current.reconcileTransaction(transaction, makeLinkedPayment())
-		})
-
-		// The post has settled and the dialog is already up - but the client is still holding the
-		// pre-attempt snapshot, so the action must stay closed. This is the exact window in which a
-		// second post would be fired at state the reviewer has just been told is unreliable.
-		expect(store.get(bankRecErrorDialogAtom)).not.toBeNull()
-		expect(result.current.loading).toBe(false)
-		expect(result.current.isSettling).toBe(true)
-		expect(store.get(bankRecReconcileSettlingAtom)).toBe(true)
-
-		await act(async () => {
-			refresh.resolve(undefined)
-			await refresh.promise
-		})
-
-		expect(result.current.isSettling).toBe(false)
-		expect(store.get(bankRecReconcileSettlingAtom)).toBe(false)
-	})
-
-	it('replaces the selection with the server\u2019s refreshed row, status and all', async () => {
-		const store = createSeededStore()
-		const staleSnapshot = makeUnreconciledTransaction({ name: 'ACC-BTN-2024-00003' })
-		store.set(SELECTED_TRANSACTION_ATOM, [staleSnapshot])
-		frappePostCall.mockImplementation(() => Promise.reject(makeAlreadyReconciledError(staleSnapshot.name)))
-
-		// What the server actually holds: the same transaction, already fully reconciled. The
-		// authoritative read carries `all_transactions`, so it comes back PRESENT with its true
-		// status rather than being filtered out.
-		const serverRow = makeReconciledTransaction()
-		serverReportsTransactions([serverRow])
-
-		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
-		await act(async () => {
-			result.current.reconcileTransaction(staleSnapshot, makeLinkedPayment())
-		})
-
-		// Taken whole, so `status` and `unallocated_amount` - the two fields the confirm guard reads -
-		// can only be the server's values. The guard now disables the action instead of the row
-		// silently disappearing with no explanation.
-		expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([serverRow])
-		expect(store.get(SELECTED_TRANSACTION_ATOM)[0].status).toBe('Reconciled')
-		expect(store.get(SELECTED_TRANSACTION_ATOM)[0].unallocated_amount).toBe(0)
-	})
-
-	it('drops a selected entry the server no longer reports at all', async () => {
-		const store = createSeededStore()
-		const transaction = makeUnreconciledTransaction()
-		store.set(SELECTED_TRANSACTION_ATOM, [transaction])
-		frappePostCall.mockImplementation(() => Promise.reject(makeAlreadyReconciledError(transaction.name)))
-
-		// An empty ARRAY is a real answer - the account and range genuinely hold no such row - and is
-		// treated as one.
-		serverReportsTransactions([])
-
-		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
-		await act(async () => {
-			result.current.reconcileTransaction(transaction, makeLinkedPayment())
-		})
-
-		expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([])
-	})
-
-	it('leaves the selection untouched when the server could not be reached for its answer', async () => {
-		const store = createSeededStore()
-		const transaction = makeUnreconciledTransaction()
-		store.set(SELECTED_TRANSACTION_ATOM, [transaction])
-		frappePostCall.mockImplementation(() => Promise.reject(makeAlreadyReconciledError(transaction.name)))
-
-		// The authoritative read failed in turn, so nothing was established. Clearing the selection on
-		// the strength of a second failure would be discarding the reviewer's work over an absence of
-		// information - and inventing a row would be worse.
-		frappeContextValue.call.get.mockRejectedValue(new Error('read failed'))
-
-		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
-		await act(async () => {
-			result.current.reconcileTransaction(transaction, makeLinkedPayment())
-		})
-
-		expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([transaction])
-	})
-
-	it('reopens the action even when the read AND the eviction both fail', async () => {
-		const store = createSeededStore()
-		const transaction = makeUnreconciledTransaction()
-		store.set(SELECTED_TRANSACTION_ATOM, [transaction])
-		frappePostCall.mockImplementation(() => Promise.reject(makeAlreadyReconciledError(transaction.name)))
-		frappeContextValue.call.get.mockRejectedValue(new Error('read failed'))
-		frappeSWRMutate.mockImplementation(() => Promise.reject(new Error('revalidation failed')))
-
-		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
-		await act(async () => {
-			result.current.reconcileTransaction(transaction, makeLinkedPayment())
-		})
-
-		// The read swallows its own failure and `allSettled` absorbs the eviction's, so neither can
-		// escape as an unhandled rejection or wedge the affordance closed forever - and the selection
-		// is left as it was, because nothing authoritative came back.
-		expect(result.current.isSettling).toBe(false)
-		expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([transaction])
-	})
-})
-
-/*
- * Asserted against LITERAL strings, because these keys are a cross-module contract: four surfaces
- * outside this module spell them inline, and several of these queries disable `revalidateIfStale` and
- * `revalidateOnFocus`, so a key wrong by one character invalidates nothing and reports no error.
- */
-describe('cache-key builders produce the exact existing key strings', () => {
-
-	it('builds the unreconciled-transactions key', () => {
-		expect(bankRecUnreconciledTransactionsKey('Test Bank - Test Company', '2024-01-01', '2024-01-31'))
-			.toBe('bank-reconciliation-unreconciled-transactions-Test Bank - Test Company-2024-01-01-2024-01-31')
-	})
-
-	it('builds the all-transactions key', () => {
-		expect(bankRecBankTransactionsKey('Test Bank - Test Company', '2024-01-01', '2024-01-31'))
-			.toBe('bank-reconciliation-bank-transactions-Test Bank - Test Company-2024-01-01-2024-01-31')
-	})
-
-	it('builds the closing-balance key', () => {
-		expect(bankRecClosingBalanceKey('Test Bank - Test Company', '2024-01-31'))
-			.toBe('bank-reconciliation-account-closing-balance-Test Bank - Test Company-2024-01-31')
-	})
-
-	it('builds the closing-balance-as-per-statement key', () => {
-		expect(bankRecClosingBalanceAsPerStatementKey('Test Bank - Test Company', '2024-01-31'))
-			.toBe('bank-reconciliation-account-closing-balance-as-per-statement-Test Bank - Test Company-2024-01-31')
-	})
-
-	// The closing-balance and as-per-statement families share a prefix, which is exactly the kind
-	// of near-collision a careless edit could turn into an actual collision.
-	it('keeps the two balance families distinct', () => {
-		const balance = bankRecClosingBalanceKey(TEST_BANK_ACCOUNT, TO_DATE)
-		const statement = bankRecClosingBalanceAsPerStatementKey(TEST_BANK_ACCOUNT, TO_DATE)
-		expect(balance).not.toBe(statement)
-		expect(statement.startsWith('bank-reconciliation-account-closing-balance-as-per-statement-')).toBe(true)
-	})
-
-	it('agrees with the literal keys the reconcile path revalidates', () => {
-		expect(bankRecUnreconciledTransactionsKey(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)).toBe(UNRECONCILED_KEY)
-		expect(bankRecBankTransactionsKey(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)).toBe(ALL_TRANSACTIONS_KEY)
-	})
-})
-
-/*
- * `Not Started` is the INITIAL status and `insert_transactions` advances it to `Completed` only as its
- * final act, so it is nonterminal for the whole duration of a synchronous import. Observing it after
- * a lost response distinguishes nothing, and calling it "failed" would invent a server-side fact that
- * sends the reviewer to re-import.
- */
-describe('classifyImportAttempt', () => {
-
-	it('treats a confirmed Completed as completed, even when the server also refused', () => {
-		expect(classifyImportAttempt({ serverRejected: true, confirmedStatus: 'Completed' })).toBe('completed')
-	})
-
-	it('treats a confirmed Completed as completed after a lost response', () => {
-		expect(classifyImportAttempt({ serverRejected: false, confirmedStatus: 'Completed' })).toBe('completed')
-	})
-
-	it('marks failed only when the server refused AND the log is confirmed not completed', () => {
-		expect(classifyImportAttempt({ serverRejected: true, confirmedStatus: 'Not Started' })).toBe('failed')
-	})
-
-	// A nonterminal status observed after a lost response is not evidence of failure.
-	it('does NOT mark failed when a lost response leaves the log at Not Started', () => {
-		expect(classifyImportAttempt({ serverRejected: false, confirmedStatus: 'Not Started' })).toBe('unknown')
-	})
-
-	it('marks unknown when no status could be obtained at all', () => {
-		expect(classifyImportAttempt({ serverRejected: false, confirmedStatus: undefined })).toBe('unknown')
-	})
-
-	// A server refusal whose follow-up read also failed: the refusal is real, but nothing confirms
-	// the log's state, so the honest answer is still unknown.
-	it('marks unknown when the server refused but the log could not be read', () => {
-		expect(classifyImportAttempt({ serverRejected: true, confirmedStatus: undefined })).toBe('unknown')
-	})
-
-	it('never returns a status that asserts failure from an ambiguous observation', () => {
-		const ambiguous = [
-			{ serverRejected: false, confirmedStatus: undefined },
-			{ serverRejected: false, confirmedStatus: 'Not Started' as const },
-			{ serverRejected: true, confirmedStatus: undefined }
-		]
-		ambiguous.forEach((observation) => {
-			expect(classifyImportAttempt(observation)).not.toBe('failed')
-		})
-	})
-})
-
-/*
- * Markers are bank-scoped because visibility and retention are both per-account: the importer list
- * queries one bank with its own row limit, so a flat map would count other accounts' markers against
- * that budget and could evict a marker whose row is on screen.
- */
-describe('import-attempt marker storage is scoped per bank account', () => {
-
-	const OTHER_BANK = 'Other Bank - Test Company'
-
-	it('records a marker under its own bank', () => {
-		const markers = withImportAttempt({}, TEST_BANK_ACCOUNT, 'LOG-1', 'failed')
-		expect(getImportAttempt(markers, TEST_BANK_ACCOUNT, 'LOG-1')).toBe('failed')
-	})
-
-	it('does not leak a marker into a different bank', () => {
-		const markers = withImportAttempt({}, TEST_BANK_ACCOUNT, 'LOG-1', 'failed')
-		expect(getImportAttempt(markers, OTHER_BANK, 'LOG-1')).toBeUndefined()
-	})
-
-	it('returns undefined when no bank is selected', () => {
-		const markers = withImportAttempt({}, TEST_BANK_ACCOUNT, 'LOG-1', 'failed')
-		expect(getImportAttempt(markers, undefined, 'LOG-1')).toBeUndefined()
-	})
-
-	it('keeps two banks\' markers independent', () => {
-		let markers: ImportAttemptMarkers = {}
-		markers = withImportAttempt(markers, TEST_BANK_ACCOUNT, 'LOG-1', 'failed')
-		markers = withImportAttempt(markers, OTHER_BANK, 'LOG-2', 'unknown')
-		expect(getImportAttempt(markers, TEST_BANK_ACCOUNT, 'LOG-1')).toBe('failed')
-		expect(getImportAttempt(markers, OTHER_BANK, 'LOG-2')).toBe('unknown')
-	})
-
-	// Filling one bank to the cap must not disturb another bank's marker.
-	it('caps per bank, so a busy account cannot evict another account\'s visible marker', () => {
-		let markers: ImportAttemptMarkers = withImportAttempt({}, OTHER_BANK, 'KEEP-ME', 'failed')
-
-		for (let index = 0; index < IMPORT_ATTEMPT_MARKER_LIMIT + 5; index++) {
-			markers = withImportAttempt(markers, TEST_BANK_ACCOUNT, `LOG-${index}`, 'failed')
-		}
-
-		expect(getImportAttempt(markers, OTHER_BANK, 'KEEP-ME')).toBe('failed')
-		expect(Object.keys(markers[TEST_BANK_ACCOUNT])).toHaveLength(IMPORT_ATTEMPT_MARKER_LIMIT)
-	})
-
-	it('evicts oldest-first within a bank and retains the newest', () => {
-		let markers: ImportAttemptMarkers = {}
-		for (let index = 0; index < IMPORT_ATTEMPT_MARKER_LIMIT + 1; index++) {
-			markers = withImportAttempt(markers, TEST_BANK_ACCOUNT, `LOG-${index}`, 'failed')
-		}
-		expect(getImportAttempt(markers, TEST_BANK_ACCOUNT, 'LOG-0')).toBeUndefined()
-		expect(getImportAttempt(markers, TEST_BANK_ACCOUNT, `LOG-${IMPORT_ATTEMPT_MARKER_LIMIT}`)).toBe('failed')
-	})
-
-	it('returns the same object when re-recording an identical marker', () => {
-		const markers = withImportAttempt({}, TEST_BANK_ACCOUNT, 'LOG-1', 'failed')
-		expect(withImportAttempt(markers, TEST_BANK_ACCOUNT, 'LOG-1', 'failed')).toBe(markers)
-	})
-
-	it('retires one marker and drops the bank entry once it is empty', () => {
-		const markers = withImportAttempt({}, TEST_BANK_ACCOUNT, 'LOG-1', 'failed')
-		const cleared = withoutImportAttempt(markers, TEST_BANK_ACCOUNT, 'LOG-1')
-		expect(getImportAttempt(cleared, TEST_BANK_ACCOUNT, 'LOG-1')).toBeUndefined()
-		expect(TEST_BANK_ACCOUNT in cleared).toBe(false)
-	})
-
-	it('is a no-op when retiring a marker that was never recorded', () => {
-		const markers = withImportAttempt({}, TEST_BANK_ACCOUNT, 'LOG-1', 'failed')
-		expect(withoutImportAttempt(markers, TEST_BANK_ACCOUNT, 'ABSENT')).toBe(markers)
-		expect(withoutImportAttempt(markers, OTHER_BANK, 'LOG-1')).toBe(markers)
-	})
-
-	// Server truth retires markers, and only for the bank whose logs were actually re-read.
-	it('retires markers the server reports Completed, within that bank only', () => {
-		let markers: ImportAttemptMarkers = {}
-		markers = withImportAttempt(markers, TEST_BANK_ACCOUNT, 'LOG-1', 'unknown')
-		markers = withImportAttempt(markers, OTHER_BANK, 'LOG-1', 'failed')
-
-		const retired = withCompletedImportAttemptsRetired(markers, TEST_BANK_ACCOUNT, ['LOG-1'])
-
-		expect(getImportAttempt(retired, TEST_BANK_ACCOUNT, 'LOG-1')).toBeUndefined()
-		expect(getImportAttempt(retired, OTHER_BANK, 'LOG-1')).toBe('failed')
-	})
-
-	it('is a no-op when no retained marker is among the completed logs', () => {
-		const markers = withImportAttempt({}, TEST_BANK_ACCOUNT, 'LOG-1', 'failed')
-		expect(withCompletedImportAttemptsRetired(markers, TEST_BANK_ACCOUNT, ['LOG-9'])).toBe(markers)
-		expect(withCompletedImportAttemptsRetired(markers, OTHER_BANK, ['LOG-1'])).toBe(markers)
-	})
-
-	/*
-	 * FM2's zero-row marker is retired when the same file later parses to rows - but an `invalid`
-	 * marker and an attempt marker describe different things, so retiring one must not erase the
-	 * other. That is what the narrowed form is for.
-	 */
-	it('retires a marker of one status only, leaving another status in place', () => {
-		const invalidMarked = withImportAttempt({}, TEST_BANK_ACCOUNT, 'LOG-1', 'invalid')
-		expect(getImportAttempt(withoutImportAttempt(invalidMarked, TEST_BANK_ACCOUNT, 'LOG-1', 'invalid'), TEST_BANK_ACCOUNT, 'LOG-1'))
-			.toBeUndefined()
-
-		const failureMarked = withImportAttempt({}, TEST_BANK_ACCOUNT, 'LOG-1', 'failed')
-		expect(withoutImportAttempt(failureMarked, TEST_BANK_ACCOUNT, 'LOG-1', 'invalid')).toBe(failureMarked)
-	})
-})
-
-/*
- * The FM2 zero-row classification. It reads the SERVER's own parse result - the log's status and the
- * number of transactions the server built from the mapping it detected - and adds nothing to it: an
- * empty file and a file whose columns were not recognised both arrive as zero, and the client's whole
- * contribution is to record that the list can display it.
- */
-describe('classifyParsedStatement', () => {
-
-	it('calls a file the server recognised no transactions in invalid', () => {
-		expect(classifyParsedStatement({ status: 'Not Started', finalTransactionCount: 0 })).toBe('invalid')
-	})
-
-	it('calls a file with transactions nothing at all', () => {
-		expect(classifyParsedStatement({ status: 'Not Started', finalTransactionCount: 3 })).toBeUndefined()
-	})
-
-	it('never marks a completed import, whatever its file now parses to', () => {
-		// The import took effect, so the document is the record and there is no problem to report.
-		expect(classifyParsedStatement({ status: 'Completed', finalTransactionCount: 0 })).toBeUndefined()
-		expect(classifyParsedStatement({ status: 'Completed', finalTransactionCount: 3 })).toBeUndefined()
-	})
-
-	it('classifies on the count alone when no status came back', () => {
-		expect(classifyParsedStatement({ finalTransactionCount: 0 })).toBe('invalid')
-		expect(classifyParsedStatement({ finalTransactionCount: 1 })).toBeUndefined()
-	})
-})
-
-/*
- * Pre-log failures - a chain that failed before any import log existed - are nested by COMPANY AND
- * BANK ACCOUNT and then by file name, because the same statement file name recurs across accounts and
- * months. Keyed by name alone, one account's failure followed the reviewer into another, a same-named
- * retry elsewhere erased it, and the suppression of the inline hook banners was global.
- */
-describe('pre-log failure scoping', () => {
-
-	const SCOPE = preImportFailureScopeKey(TEST_COMPANY, TEST_BANK_ACCOUNT)
-	const OTHER_SCOPE = preImportFailureScopeKey(TEST_COMPANY, 'Second Bank - Test Company')
-	const FILE_NAME = 'statement-jan.csv'
-	const refusal = makeServerMessagesError('Invalid file type.')
-
-	it('composes a key only when both the company and the account are known', () => {
-		expect(SCOPE).toBe(`${TEST_COMPANY}::${TEST_BANK_ACCOUNT}`)
-		expect(preImportFailureScopeKey(undefined, TEST_BANK_ACCOUNT)).toBeUndefined()
-		expect(preImportFailureScopeKey(TEST_COMPANY, undefined)).toBeUndefined()
-	})
-
-	it('keeps two accounts\u2019 observations of the same file name apart', () => {
-		let failures = withPreImportFailure({}, SCOPE, FILE_NAME, refusal)
-		const otherRefusal = makeServerMessagesError('A statement for this period has already been imported.')
-		failures = withPreImportFailure(failures, OTHER_SCOPE, FILE_NAME, otherRefusal)
-
-		expect(getPreImportFailures(failures, SCOPE)).toEqual({ [FILE_NAME]: refusal })
-		expect(getPreImportFailures(failures, OTHER_SCOPE)).toEqual({ [FILE_NAME]: otherRefusal })
-	})
-
-	it('retires within one scope only', () => {
-		let failures = withPreImportFailure({}, SCOPE, FILE_NAME, refusal)
-		failures = withPreImportFailure(failures, OTHER_SCOPE, FILE_NAME, refusal)
-
-		const retired = withoutPreImportFailure(failures, SCOPE, FILE_NAME)
-
-		expect(getPreImportFailures(retired, SCOPE)).toEqual({})
-		expect(getPreImportFailures(retired, OTHER_SCOPE)).toEqual({ [FILE_NAME]: refusal })
-	})
-
-	it('drops a scope entirely once its last observation is retired', () => {
-		const failures = withPreImportFailure({}, SCOPE, FILE_NAME, refusal)
-
-		expect(Object.keys(withoutPreImportFailure(failures, SCOPE, FILE_NAME))).toEqual([])
-	})
-
-	it('answers an unknown or absent scope with an empty map', () => {
-		expect(getPreImportFailures({}, SCOPE)).toEqual({})
-		expect(getPreImportFailures({}, undefined)).toEqual({})
-	})
-
-	it('records nothing when there is no scope to record against', () => {
-		// The Upload control is disabled until both selections are made, so this is unreachable from
-		// the form - and a failure filed under no scope would be visible from every account.
-		const failures = { [SCOPE as string]: { [FILE_NAME]: refusal } }
-
-		expect(withPreImportFailure(failures, undefined, FILE_NAME, refusal)).toBe(failures)
-		expect(withoutPreImportFailure(failures, undefined, FILE_NAME)).toBe(failures)
-	})
-
-	it('is a no-op when retiring an observation that was never recorded', () => {
-		const failures = withPreImportFailure({}, SCOPE, FILE_NAME, refusal)
-
-		expect(withoutPreImportFailure(failures, SCOPE, 'never-uploaded.csv')).toBe(failures)
-		expect(withoutPreImportFailure(failures, OTHER_SCOPE, FILE_NAME)).toBe(failures)
-	})
-
-	it('bounds each scope, evicting that scope\u2019s oldest observation', () => {
-		let failures: ReturnType<typeof withPreImportFailure> = {}
-
-		for (let index = 0; index < PRE_IMPORT_FAILURE_LIMIT + 3; index++) {
-			failures = withPreImportFailure(failures, SCOPE, `statement-${index}.csv`, refusal)
-		}
-
-		const retained = Object.keys(getPreImportFailures(failures, SCOPE))
-
-		expect(retained).toHaveLength(PRE_IMPORT_FAILURE_LIMIT)
-		// The newest is kept and the oldest is gone: a long session cannot grow this without limit.
-		expect(retained).toContain(`statement-${PRE_IMPORT_FAILURE_LIMIT + 2}.csv`)
-		expect(retained).not.toContain('statement-0.csv')
-	})
-
-	it('replaces an existing observation of the same file rather than accumulating one', () => {
-		const superseded = makeServerMessagesError('The uploaded file could not be parsed.')
-		let failures = withPreImportFailure({}, SCOPE, FILE_NAME, superseded)
-		failures = withPreImportFailure(failures, SCOPE, FILE_NAME, refusal)
-
-		expect(getPreImportFailures(failures, SCOPE)).toEqual({ [FILE_NAME]: refusal })
-	})
-})
-
-/*
- * `useGetUnreconciledTransactions` runs with `revalidateIfStale` and `revalidateOnFocus` both
- * disabled, so remounting it - which navigating to the reconciliation page does - never refetches. A
- * populated entry for the imported range would be rendered in place of the new rows, so the exact
- * keys are mutated and awaited before navigation.
- */
-describe('useRefreshImportedTransactions', () => {
-
-	beforeEach(() => {
-		frappeSWRMutate.mockClear()
-		frappeSWRMutate.mockResolvedValue(undefined)
-	})
-
-	it('invalidates the four keys the imported range affects, byte-for-byte', async () => {
-		const { result } = renderHook(() => useRefreshImportedTransactions())
-
-		await act(async () => {
-			await result.current(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)
-		})
-
-		expect(frappeSWRMutate.mock.calls.map(([key]) => key)).toEqual([
-			`bank-reconciliation-unreconciled-transactions-${TEST_BANK_ACCOUNT}-${FROM_DATE}-${TO_DATE}`,
-			`bank-reconciliation-bank-transactions-${TEST_BANK_ACCOUNT}-${FROM_DATE}-${TO_DATE}`,
-			`bank-reconciliation-account-closing-balance-${TEST_BANK_ACCOUNT}-${TO_DATE}`,
-			`bank-reconciliation-account-closing-balance-as-per-statement-${TEST_BANK_ACCOUNT}-${TO_DATE}`
-		])
-	})
-
-	/*
-	 * A bare `mutate(key)` is served by invoking the key's registered revalidator, and revalidators
-	 * come from MOUNTED subscribers - so with the reconciliation page unmounted it silently fetches
-	 * nothing and the populated entry survives, after which `revalidateIfStale: false` skips the mount
-	 * fetch precisely because the entry still holds data. Passing `undefined` as the DATA argument is a
-	 * cache WRITE, which applies with or without a subscriber, so every call carries three arguments.
-	 */
-	it('EMPTIES each entry rather than merely asking it to revalidate', async () => {
-		const { result } = renderHook(() => useRefreshImportedTransactions())
-
-		await act(async () => {
-			await result.current(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)
-		})
-
-		expect(frappeSWRMutate).toHaveBeenCalledTimes(4)
-
-		frappeSWRMutate.mock.calls.forEach((call) => {
-			// Three arguments, not one: the length is what decides between a cache write and a
-			// revalidate-only request inside SWR.
-			expect(call).toHaveLength(3)
-			const [, data, options] = call
-			expect(data).toBeUndefined()
-			// `revalidate` covers the case where a subscriber IS mounted, so the emptied entry is
-			// refilled at once instead of waiting for a remount.
-			expect(options).toEqual({ revalidate: true, populateCache: true })
-		})
-	})
-
-	/**
-	 * THE WAIT IS BOUNDED, and that bound is what stops a hung follow-up from stranding the caller.
-	 *
-	 * Neither `mutate` nor the SDK call under it accepts an `AbortSignal`, and the Axios instance
-	 * sets no timeout, so a revalidation that never answers is a promise that never settles. This
-	 * hook is awaited before the reviewer is navigated to the workbench, and the reconcile hook's
-	 * equivalents are awaited while the confirm affordance is held closed - so an unbounded wait is a
-	 * screen that never moves on. Every invalidation is still DISPATCHED unconditionally: the cache
-	 * write always happens, only the waiting is capped.
-	 */
-	it('stops waiting on a revalidation that never answers, without rejecting', async () => {
-		vi.useFakeTimers()
-		try {
-			// Never settles - the shape of a request with no timeout behind it.
-			frappeSWRMutate.mockImplementation(() => new Promise<undefined>(() => undefined))
-
-			const { result } = renderHook(() => useRefreshImportedTransactions())
-
-			let settled = false
-			const pending = result.current(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE).then(() => {
-				settled = true
-			})
-
-			// All four writes were issued regardless.
-			expect(frappeSWRMutate).toHaveBeenCalledTimes(4)
-			await vi.advanceTimersByTimeAsync(1_000)
-			expect(settled).toBe(false)
-
-			await vi.advanceTimersByTimeAsync(20_000)
-			await pending
-
-			// Resolved, not rejected: the caller is awaiting convergence, and a deadline that passes
-			// simply means "stop waiting".
-			expect(settled).toBe(true)
-		} finally {
-			vi.useRealTimers()
-		}
-	})
-
-	/**
-	 * A follow-up that rejects AFTER its deadline has passed still has a rejection to deliver, and
-	 * nothing is left to await it - so it has to be absorbed at the point it is abandoned or it
-	 * surfaces as an `unhandledrejection` on a screen that has already moved on.
-	 */
-	it('absorbs a rejection that arrives after the deadline has passed', async () => {
-		vi.useFakeTimers()
-		const unhandled: unknown[] = []
-		const onUnhandled = (reason: unknown) => unhandled.push(reason)
-		process.on('unhandledRejection', onUnhandled)
-		try {
-			let rejectLate: (reason: unknown) => void = () => undefined
-			frappeSWRMutate.mockImplementation(
-				() => new Promise<undefined>((_resolve, reject) => { rejectLate = reject }))
-
-			const { result } = renderHook(() => useRefreshImportedTransactions())
-			const pending = result.current(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)
-
-			await vi.advanceTimersByTimeAsync(20_000)
-			await expect(pending).resolves.toBeUndefined()
-
-			rejectLate(new Error('revalidation answered far too late'))
-			await vi.advanceTimersByTimeAsync(0)
-			await Promise.resolve()
-
-			expect(unhandled).toEqual([])
-		} finally {
-			process.off('unhandledRejection', onUnhandled)
-			vi.useRealTimers()
-		}
-	})
-
-	// Nothing but emptiness is written. A hook that supplied its own payload could put a
-	// differently-parameterised response where a query's own answer belongs; the server stays the
-	// only source of what is displayed.
-	it('never writes data of its own into any entry', async () => {
-		const { result } = renderHook(() => useRefreshImportedTransactions())
-
-		await act(async () => {
-			await result.current(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)
-		})
-
-		expect(frappeSWRMutate.mock.calls.every(([, data]) => data === undefined)).toBe(true)
-	})
-
-	// The dates are arguments, not atom reads, precisely so the range invalidated is the one the
-	// import resolved rather than whatever the page was previously filtered to.
-	it('builds the keys from the dates it is given, not from the date atom', async () => {
-		const { result } = renderHook(() => useRefreshImportedTransactions())
-
-		await act(async () => {
-			await result.current(TEST_BANK_ACCOUNT, '2023-06-01', '2023-06-30')
-		})
-
-		const keys = frappeSWRMutate.mock.calls.map(([key]) => key)
-		expect(keys[0]).toBe(`bank-reconciliation-unreconciled-transactions-${TEST_BANK_ACCOUNT}-2023-06-01-2023-06-30`)
-		keys.forEach((key) => {
-			expect(key).not.toContain(FROM_DATE)
-			expect(key).not.toContain(TO_DATE)
-		})
-	})
-
-	// A balance query failing must not stop the transaction lists refreshing - the page the caller
-	// is continuing to takes its value from those lists.
-	it('still refreshes the remaining keys when one revalidation rejects, and does not throw', async () => {
-		frappeSWRMutate.mockRejectedValueOnce(new Error('balance unavailable'))
-
-		const { result } = renderHook(() => useRefreshImportedTransactions())
-
-		await act(async () => {
-			await expect(result.current(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)).resolves.toBeUndefined()
-		})
-
-		expect(frappeSWRMutate).toHaveBeenCalledTimes(4)
-	})
-})
-
-/*
- * The error-normalisation boundary has to satisfy two properties that pull in opposite directions: a
- * genuine server envelope must survive UNTOUCHED, so the backend's own message, title and severity
- * are what the user reads; and anything that is not an envelope must never reach the user, because
- * for a lost response the SDK hands back its own `TypeError` about `error.response.data`, which says
- * nothing about whether the work was recorded.
- */
-describe('error normalisation at the transport boundary', () => {
-
-	const SDK_INTERNAL_TEXT = "Cannot read properties of undefined (reading 'data')"
-
-	it('passes a genuine Frappe envelope through BY IDENTITY', () => {
-		const envelope = makeServerMessagesError('The bank account is disabled. Please enable it')
-
-		// toBe, not toEqual: a copy would be just as wrong as a rewrite, because it invites a
-		// later "improvement" to the copied fields.
-		expect(toDisplayError(envelope)).toBe(envelope)
-	})
-
-	it('converts a response-less SDK TypeError into indeterminate transport copy', () => {
-		const sdkFailure = new TypeError(SDK_INTERNAL_TEXT)
-
-		const displayed = toDisplayError(sdkFailure)
-
-		expect(displayed.httpStatus).toBe(0)
-		expect(displayed.httpStatusText).toBe('Network Error')
-		expect(displayed.message).toContain('No response arrived from the server')
-		expect(displayed.message).toContain('it is not known whether this request was recorded')
-		expect(displayed.message).toContain('Check the current state of the affected records')
-	})
-
-	it('never leaks the SDK implementation text to the surface', () => {
-		const rendered = JSON.stringify(toDisplayError(new TypeError(SDK_INTERNAL_TEXT)))
-
-		expect(rendered).not.toContain(SDK_INTERNAL_TEXT)
-		expect(rendered).not.toContain('Cannot read properties')
-		expect(rendered).not.toContain('undefined')
-		expect(rendered).not.toContain('TypeError')
-		expect(rendered).not.toContain('.data')
-	})
-
-	it('never claims the action failed or was not recorded', () => {
-		// The whole point of the copy: the outcome is UNKNOWN. Wording that asserts failure would
-		// invite a blind retry of work that may already have been committed.
-		const message = toDisplayError(new TypeError(SDK_INTERNAL_TEXT)).message.toLowerCase()
-
-		expect(message).not.toContain('failed')
-		expect(message).not.toContain('was not')
-		expect(message).not.toContain('no changes')
-	})
-
-	it.each([
-		['a plain Error', new Error('boom')],
-		['a string', 'boom'],
-		['undefined', undefined],
-		['null', null],
-		['an empty object', {}],
-		['an object with only a message', { message: 'boom' }]
-	])('treats %s as a lost response rather than an envelope', (_label, reason) => {
-		expect(isFrappeErrorEnvelope(reason)).toBe(false)
-		expect(toDisplayError(reason).httpStatus).toBe(0)
-	})
-
-	it('recognises an envelope carrying only the fallback error field', () => {
-		// Frappe does not always populate _server_messages; the fallback path must still count as
-		// a real server answer, or a genuine rejection would be relabelled as a transport loss.
-		const envelope = { httpStatus: 417, httpStatusText: 'Expectation Failed', message: 'x', exception: '' }
-
-		expect(isFrappeErrorEnvelope(envelope)).toBe(true)
-		expect(toDisplayError(envelope)).toBe(envelope)
-	})
-})
 
 /*
  * The transport contract: endpoints, parameters, cache keys and SWR options, asserted as LITERALS
@@ -1420,17 +556,28 @@ describe('the cache-key surface is closed at five families', () => {
 		expect(KEY_FAMILY_PREFIXES).toHaveLength(5)
 	})
 
-	it('agrees with the exported builders on all four builder-backed families', () => {
-		expect(familyOf(bankRecUnreconciledTransactionsKey(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)))
-			.toBe('bank-reconciliation-unreconciled-transactions-')
-		expect(familyOf(bankRecBankTransactionsKey(TEST_BANK_ACCOUNT, FROM_DATE, TO_DATE)))
-			.toBe('bank-reconciliation-bank-transactions-')
-		expect(familyOf(bankRecClosingBalanceKey(TEST_BANK_ACCOUNT, TO_DATE)))
-			.toBe('bank-reconciliation-account-closing-balance-')
-		expect(familyOf(bankRecClosingBalanceAsPerStatementKey(TEST_BANK_ACCOUNT, TO_DATE)))
-			.toBe('bank-reconciliation-account-closing-balance-as-per-statement-')
-		expect(familyOf(vouchersKeyFor('ACC-BTN-2024-00001', DEFAULT_JOINED_MATCH_FILTERS)))
-			.toBe('bank-reconciliation-vouchers-')
+	/*
+	 * The key strings themselves, spelled out. There is deliberately no exported builder to compare
+	 * against: every hook composes its key inline, and the rejection handler composes the two it
+	 * revalidates the same way. Restating them here is what makes a drift between the two composition
+	 * sites - which would silently revalidate a key nothing is subscribed to - fail as a test rather
+	 * than as an unrefreshed list.
+	 */
+	it('composes each family\'s key from the account and the date range, character for character', () => {
+		const store = createSeededStore()
+		const transaction = makeUnreconciledTransaction()
+
+		renderHook(() => useEveryKeyedQuery(transaction), { wrapper: withStore(store) })
+
+		const declaredKeys = frappeSDKMock.useFrappeGetCall.mock.calls
+			.map(([, , swrKey]) => swrKey)
+			.filter((swrKey): swrKey is string => typeof swrKey === 'string')
+
+		expect(declaredKeys).toContain(`bank-reconciliation-unreconciled-transactions-${TEST_BANK_ACCOUNT}-${FROM_DATE}-${TO_DATE}`)
+		expect(declaredKeys).toContain(`bank-reconciliation-bank-transactions-${TEST_BANK_ACCOUNT}-${FROM_DATE}-${TO_DATE}`)
+		expect(declaredKeys).toContain(`bank-reconciliation-account-closing-balance-${TEST_BANK_ACCOUNT}-${TO_DATE}`)
+		expect(declaredKeys).toContain(`bank-reconciliation-account-closing-balance-as-per-statement-${TEST_BANK_ACCOUNT}-${TO_DATE}`)
+		expect(declaredKeys).toContain(vouchersKeyFor(transaction.name, DEFAULT_JOINED_MATCH_FILTERS))
 	})
 
 	it('attributes a key from outside the five families to no family at all', () => {
@@ -1459,7 +606,7 @@ describe('useGetBankAccounts', () => {
 		expect(params).toEqual({ company: TEST_COMPANY })
 		// Unkeyed on purpose: SWR derives the key from method plus params, which is what lets
 		// `useSelectedBankAccountCurrency` share this very entry instead of opening a second
-		// request. That sharing is asserted in its own suite above.
+		// request. That sharing is asserted in its own suite below.
 		expect(swrKey).toBeUndefined()
 		expect(swrOptionsOf(options).revalidateOnFocus).toBe(false)
 		expect(swrOptionsOf(options).revalidateIfStale).toBe(false)
@@ -1544,6 +691,98 @@ describe('useGetBankAccounts', () => {
 		})
 
 		expect(result.current.banks.map((bank) => bank.name)).toEqual(['Card - TC'])
+	})
+})
+
+/*
+ * ─── THE CURRENT ACCOUNT CURRENCY, AND WHY IT IS NOT THE PERSISTED ONE ──────────────────────────
+ *
+ * `selectedBankAccountAtom` is `atomWithStorage` over localStorage with `getOnInit: true`, and
+ * `BankPicker` deliberately leaves the stored row alone whenever the account it names is still
+ * present in a fresh response. So the stored `account_currency` is written once and then never
+ * refreshed for the life of that account: repointing the bank account at an account in another
+ * currency, or editing `Account.account_currency`, changes the server's answer and not the snapshot.
+ *
+ * This hook exists so the FM5 advisory reads the server's answer instead. Every test below seeds the
+ * persisted snapshot with a DIFFERENT currency from the endpoint's, which is the only arrangement
+ * that can tell the two sources apart.
+ */
+describe('useSelectedBankAccountCurrency', () => {
+
+	const STALE_PERSISTED_CURRENCY = TEST_ALTERNATE_CURRENCY
+
+	const renderCurrency = (rows?: unknown[]) => {
+		const store = createStore()
+		store.set(selectedCompanyAtom, TEST_COMPANY)
+		store.set(selectedBankAccountAtom, makeSelectedBank({ account_currency: STALE_PERSISTED_CURRENCY }))
+
+		if (rows !== undefined) {
+			answerGetCall(BANK_ACCOUNT_GET_LIST, { message: rows })
+		}
+
+		return renderHook(() => useSelectedBankAccountCurrency(), { wrapper: withStore(store) })
+	}
+
+	it('returns the currency the CURRENT endpoint row carries, not the persisted one', () => {
+		const { result } = renderCurrency([makeBankAccountListRow({ account_currency: TEST_CURRENCY })])
+
+		expect(result.current).toBe(TEST_CURRENCY)
+		expect(result.current).not.toBe(STALE_PERSISTED_CURRENCY)
+	})
+
+	it('reads that row through the SAME request the bank picker already makes', () => {
+		renderCurrency([makeBankAccountListRow({ account_currency: TEST_CURRENCY })])
+
+		// One unkeyed call to the list endpoint, for this company. SWR derives the key from method
+		// plus params, so this hook deduplicates onto the picker's entry rather than opening a second
+		// request for the same rows.
+		const [method, params, swrKey] = lastGetCallFor(BANK_ACCOUNT_GET_LIST)
+		expect(method).toBe(BANK_ACCOUNT_GET_LIST)
+		expect(params).toEqual({ company: TEST_COMPANY })
+		expect(swrKey).toBeUndefined()
+	})
+
+	it('is undefined while the list has not answered', () => {
+		const { result } = renderCurrency()
+
+		// "Not known" - which the advisory must read as nothing to compare. Falling back to the
+		// persisted value here is exactly the defect this hook exists to remove.
+		expect(result.current).toBeUndefined()
+	})
+
+	it('is undefined when the endpoint attaches a literal null', () => {
+		const { result } = renderCurrency([makeBankAccountListRow({ account_currency: null })])
+
+		// `Account.account_currency` is nullable and the endpoint always attaches the key, so `null`
+		// is a real payload. It is normalised to `undefined` so callers have one absence to handle.
+		expect(result.current).toBeUndefined()
+	})
+
+	it('is undefined when the selected account is absent from the current list', () => {
+		const { result } = renderCurrency([
+			makeBankAccountListRow({ name: 'Other Bank - Test Company', account_currency: TEST_CURRENCY })
+		])
+
+		expect(result.current).toBeUndefined()
+	})
+
+	it('is undefined when no bank account is selected at all', () => {
+		const store = createStore()
+		store.set(selectedCompanyAtom, TEST_COMPANY)
+		answerGetCall(BANK_ACCOUNT_GET_LIST, { message: [makeBankAccountListRow()] })
+
+		const { result } = renderHook(() => useSelectedBankAccountCurrency(), { wrapper: withStore(store) })
+
+		expect(result.current).toBeUndefined()
+	})
+
+	it('picks the row matching the selection out of several accounts', () => {
+		const { result } = renderCurrency([
+			makeBankAccountListRow({ name: 'Other Bank - Test Company', account_currency: 'EUR' }),
+			makeBankAccountListRow({ name: TEST_BANK_ACCOUNT, account_currency: TEST_CURRENCY })
+		])
+
+		expect(result.current).toBe(TEST_CURRENCY)
 	})
 })
 
@@ -1795,26 +1034,14 @@ describe('useReconcileTransaction — the accepted post (TC4)', () => {
 		expect(store.get(bankRecUnreconcileModalAtom)).toBe(transaction.name)
 	})
 
-	// The confirm affordance is gated on `isSettling`, which must be back down once the accepted
-	// path has finished - otherwise the row stays closed after a perfectly successful post.
-	it('reopens the action once the accepted post has settled', async () => {
-		const { store } = await confirmMatch()
-
-		expect(store.get(bankRecReconcileSettlingAtom)).toBe(false)
-	})
-
 	/*
-	 * ⚠️ THE F7 REGRESSION. The accepted path's refresh is asynchronous - it invalidates the list and
-	 * the balance and then rebuilds the selection from what the list returns - and the settling flag
-	 * every candidate row's action is gated on used to clear the moment the POST settled, because the
-	 * refresh was started as a void call and never awaited. In that window the just-reconciled
-	 * transaction and the voucher it had already consumed were both actionable again, against a
-	 * snapshot the server had superseded.
-	 *
-	 * Holding the invalidation open makes the window observable: the flag must stay raised across it
-	 * and come down only once the refresh has converged.
+	 * The accepted path rebuilds the selection from the REFRESHED list rather than from the snapshot it
+	 * posted against, and it does so only once that list has been re-read. Holding the invalidation
+	 * open makes the ordering observable: until it resolves nothing has been written to the selection,
+	 * and when it does the selection is replaced by what the server returned - here nothing, because a
+	 * fully allocated transaction leaves the unreconciled list.
 	 */
-	it('keeps the action closed until the ACCEPTED path\'s refresh has converged', async () => {
+	it('rebuilds the selection only from the refreshed list, once it has converged', async () => {
 		const store = createSeededStore()
 		const transaction = makeUnreconciledTransaction()
 		store.set(SELECTED_TRANSACTION_ATOM, [transaction])
@@ -1829,20 +1056,18 @@ describe('useReconcileTransaction — the accepted post (TC4)', () => {
 			result.current.reconcileTransaction(transaction, makeLinkedPayment())
 		})
 
-		// The post has been accepted and the reviewer has already been told so - but the lists have
-		// not been re-read yet, so nothing may be offered against the old snapshot.
+		// The post has been accepted and the reviewer has already been told so - but the list has not
+		// been re-read, so nothing has been written from it.
 		expect(successToast).toHaveBeenCalledTimes(1)
 		expect(result.current.loading).toBe(false)
-		expect(result.current.isSettling).toBe(true)
-		expect(store.get(bankRecReconcileSettlingAtom)).toBe(true)
+		expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([transaction])
 
 		await act(async () => {
 			refresh.resolve(undefined)
 			await refresh.promise
 		})
 
-		expect(result.current.isSettling).toBe(false)
-		expect(store.get(bankRecReconcileSettlingAtom)).toBe(false)
+		expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([])
 	})
 
 	it('raises no error dialog on the accepted path', async () => {
@@ -1851,11 +1076,15 @@ describe('useReconcileTransaction — the accepted post (TC4)', () => {
 		expect(store.get(bankRecErrorDialogAtom)).toBeNull()
 	})
 })
-
 /*
- * A refused or lost post must leave the transaction unreconciled with its state unchanged. The proof
- * is structural: the client never writes a reconciliation it has not read back, so there is no
- * optimistic write to roll back and no window in which a rolled-back write is observable.
+ * A refused or lost post must leave the transaction unreconciled with its state unchanged, and must
+ * not leave the action available against the snapshot the server has just contradicted.
+ *
+ * The first half is structural: the client never writes a reconciliation it has not read back, so
+ * there is no optimistic write to roll back and no window in which a rolled-back write is
+ * observable. The second half is the FAIL-CLOSED handling asserted below - the selection is emptied,
+ * which withdraws the Reconcile affordance outright, and it is emptied WITHOUT WAITING to see whether
+ * the follow-up revalidation succeeds.
  */
 describe('a refused post leaves the client\'s state exactly as it was', () => {
 
@@ -1889,21 +1118,56 @@ describe('a refused post leaves the client\'s state exactly as it was', () => {
 	}
 
 	/*
-	 * ⚠️ THE assertion FM1 and C9 both reduce to. `toBe` is deliberate: the selected row is the
-	 * SAME OBJECT it was before the attempt, so nothing was patched, merged or re-flagged. A
-	 * client that had optimistically marked the row reconciled would fail this even if it then
-	 * reverted, because the reverted copy would not be the original object.
+	 * ⚠️ THE assertion FM1 reduces to. Nothing was patched, merged or re-flagged anywhere: the only
+	 * write the rejection path makes to transaction state is to EMPTY the selection, and an emptied
+	 * selection cannot claim a status.
 	 */
-	it('does not transition the row to reconciled, or touch it at all', async () => {
+	it('never writes a reconciled status anywhere, for any row', async () => {
 		const { store, transaction } = await refuseConfirm()
 
-		const selection = store.get(SELECTED_TRANSACTION_ATOM)
+		// The row object itself is untouched - the hook received it and did not mutate it.
+		expect(transaction.status).toBe('Unreconciled')
+		expect(transaction.unallocated_amount).toBe(TEST_TRANSACTION_AMOUNT)
 
-		expect(selection).toHaveLength(1)
-		expect(selection[0]).toBe(transaction)
-		expect(selection[0].status).toBe('Unreconciled')
-		expect(selection[0].status).not.toBe('Reconciled')
-		expect(selection[0].unallocated_amount).toBe(TEST_TRANSACTION_AMOUNT)
+		// And no row is left selected claiming otherwise.
+		expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([])
+	})
+
+	/*
+	 * ⚠️ THE FAIL-CLOSED assertion, and the reason the selection is cleared rather than refreshed.
+	 *
+	 * The refused attempt was made against a snapshot the server has contradicted, so that snapshot
+	 * may not be allowed to authorise a second attempt. Emptying the selection withdraws the
+	 * Reconcile affordance outright, because the voucher panel is rendered only while a transaction is
+	 * selected - and re-selecting can only come from the refreshed list.
+	 */
+	it('empties the selection, withdrawing the affordance the refusal invalidated', async () => {
+		const { store } = await refuseConfirm()
+
+		expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([])
+	})
+
+	/*
+	 * ...and it does so EVEN WHEN THE REFRESH ITSELF FAILS. This is the case the guard exists for: the
+	 * client has been told its snapshot is unreliable and cannot obtain a reliable one. A guard that
+	 * waited for an authoritative read and released on failure would reopen the action in precisely
+	 * the state where the client knows least.
+	 */
+	it('stays closed when the follow-up revalidation rejects', async () => {
+		const store = createSeededStore()
+		const transaction = makeUnreconciledTransaction()
+		store.set(SELECTED_TRANSACTION_ATOM, [transaction])
+		frappePostCall.mockRejectedValue(makeAlreadyReconciledError(transaction.name))
+		frappeSWRMutate.mockRejectedValue(new Error('revalidation unavailable'))
+
+		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+		await act(async () => {
+			result.current.reconcileTransaction(transaction, makeLinkedPayment())
+		})
+
+		expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([])
+		// The rejected revalidation is handled rather than left to become an unhandled rejection.
+		expect(frappeSWRMutate).toHaveBeenCalledTimes(2)
 	})
 
 	// One refusal, one attempt. A client that retried on rejection is exactly how a refused post
@@ -1934,98 +1198,28 @@ describe('a refused post leaves the client\'s state exactly as it was', () => {
 			.toContain(formatAlreadyReconciledMessage(transaction.name))
 	})
 
-	// FM3's "refresh status" half, part one: the two cached lists that between them display every
-	// `status` and `unallocated_amount` the reviewer sees are EMPTIED, so neither can go on showing
-	// the pre-attempt snapshot - including the one whose tab is unmounted and therefore has no
-	// revalidator a bare `mutate(key)` could have run.
-	it('evicts both cached transaction lists so a stale client is corrected', async () => {
+	/*
+	 * FM3's "refresh status" half. The two cached lists that between them display every `status` and
+	 * `unallocated_amount` the reviewer sees are revalidated, with the EXACT key strings the query
+	 * hooks construct - so re-selecting a row can only come from the server's current answer, and no
+	 * sixth cache-key family is introduced.
+	 */
+	it('revalidates both cached transaction lists, on their existing keys', async () => {
 		await refuseConfirm()
 
 		expect(frappeSWRMutate.mock.calls).toEqual([
-			[UNRECONCILED_KEY, undefined, EVICT_CACHE_ENTRY_ARGS],
-			[ALL_TRANSACTIONS_KEY, undefined, EVICT_CACHE_ENTRY_ARGS]
+			[UNRECONCILED_KEY],
+			[ALL_TRANSACTIONS_KEY]
 		])
 	})
 
-	// Part two: the GUARD is rebuilt from a read that cannot be served from a cache at all.
-	it('re-reads the transaction from the server rather than from either cache', async () => {
+	it('makes no imperative read of its own, because it asserts nothing about the row', async () => {
 		await refuseConfirm()
 
-		expect(frappeContextValue.call.get).toHaveBeenCalledTimes(1)
-		expect(frappeContextValue.call.get).toHaveBeenCalledWith(
-			GET_BANK_TRANSACTIONS_METHOD,
-			expect.objectContaining({ bank_account: TEST_BANK_ACCOUNT, all_transactions: true })
-		)
-	})
-
-	/*
-	 * ⚠️ THE F5 REGRESSION, and the reason the read is imperative.
-	 *
-	 * The Bank Transactions tab is unmounted - Radix unmounts inactive tab content - so its cache key
-	 * has NO registered revalidator. A bare `mutate(key)` on such a key does not fetch: it resolves
-	 * with whatever the entry already holds, which here is the PRE-ATTEMPT snapshot in which the
-	 * transaction is still `Unreconciled` with its full amount unallocated. Rebuilding the selection
-	 * from that value put the stale row straight back, with a positive unallocated amount, and
-	 * re-enabled Confirm on a transaction the server had just refused as already fully reconciled -
-	 * inviting the reviewer to post again against state they had been told was unreliable.
-	 *
-	 * The server's answer must win outright, and the stale cache must not contribute to the guard at
-	 * all.
-	 */
-	it('does not let an unmounted, stale cached list re-enable the action', async () => {
-		const store = createSeededStore()
-		const staleRow = makeUnreconciledTransaction()
-		store.set(SELECTED_TRANSACTION_ATOM, [staleRow])
-		frappePostCall.mockRejectedValue(makeAlreadyReconciledError(staleRow.name))
-
-		// What an UNSUBSCRIBED key's mutate does: hands back the cached entry, unfetched. The
-		// unreconciled key answers correctly (the row is gone from it, because the server filters on
-		// `unallocated_amount > 0`); the all-transactions key answers with the stale snapshot.
-		frappeSWRMutate.mockImplementation((key) =>
-			Promise.resolve(key === ALL_TRANSACTIONS_KEY ? { message: [staleRow] } : { message: [] })
-		)
-
-		// What the server actually holds.
-		const serverRow = makeReconciledTransaction({ name: staleRow.name })
-		serverReportsTransactions([serverRow])
-
-		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
-		await act(async () => {
-			result.current.reconcileTransaction(staleRow, makeLinkedPayment())
-		})
-
-		const selection = store.get(SELECTED_TRANSACTION_ATOM)
-
-		expect(selection).toHaveLength(1)
-		expect(selection[0]).toBe(serverRow)
-		// The two assertions the defect actually turned on: the guard reads `status` and
-		// `unallocated_amount`, and both must be the server's.
-		expect(selection[0].status).toBe('Reconciled')
-		expect(selection[0].unallocated_amount).toBe(0)
-		expect(selection[0]).not.toBe(staleRow)
-	})
-
-	/*
-	 * The complement of the case above: a transaction the server still reports as partly unallocated
-	 * stays selected, with the server's remaining figure, so the reviewer can carry on with it. The
-	 * refresh corrects the row - it does not simply discard everything it touches.
-	 */
-	it('keeps a still-unreconciled transaction selected, with the server\'s remaining figure', async () => {
-		const store = createSeededStore()
-		const transaction = makeUnreconciledTransaction()
-		store.set(SELECTED_TRANSACTION_ATOM, [transaction])
-		frappePostCall.mockRejectedValue(makeAlreadyReconciledError(transaction.name))
-
-		const refreshed = makeUnreconciledTransaction({ unallocated_amount: 4000 })
-		serverReportsTransactions([refreshed])
-
-		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
-		await act(async () => {
-			result.current.reconcileTransaction(transaction, makeLinkedPayment())
-		})
-
-		expect(store.get(SELECTED_TRANSACTION_ATOM)[0]).toBe(refreshed)
-		expect(store.get(SELECTED_TRANSACTION_ATOM)[0].unallocated_amount).toBe(4000)
+		// The rejection path does not need to know the row's new state: it withdrew the action
+		// regardless. Reading the document here would be inventing a second source of truth for a
+		// guard that is already closed.
+		expect(frappeContextValue.call.get).not.toHaveBeenCalled()
 	})
 
 	// The hook is instantiated during render, before a bank account has necessarily been chosen, so
@@ -2036,7 +1230,7 @@ describe('a refused post leaves the client\'s state exactly as it was', () => {
 		expect(() => renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })).not.toThrow()
 	})
 
-	it('does not attempt the authoritative read with no bank account to read for', async () => {
+	it('still reports the refusal when no bank account is selected', async () => {
 		const store = createStoreWithoutBank()
 		const transaction = makeUnreconciledTransaction()
 		frappePostCall.mockRejectedValue(makeAlreadyReconciledError(transaction.name))
@@ -2046,12 +1240,7 @@ describe('a refused post leaves the client\'s state exactly as it was', () => {
 			result.current.reconcileTransaction(transaction, makeLinkedPayment())
 		})
 
-		// A read without a bank account would ask the endpoint for a required argument it does not
-		// have, so it is not attempted at all - and the outcome is reported as unestablished rather
-		// than as an empty answer.
-		expect(frappeContextValue.call.get).not.toHaveBeenCalled()
 		expect(store.get(bankRecErrorDialogAtom)).not.toBeNull()
-		expect(result.current.isSettling).toBe(false)
 	})
 })
 
@@ -2384,38 +1573,6 @@ describe('useRefreshUnreconciledTransactions', () => {
 			await expect(Promise.resolve(result.current(first, makeBankTransaction({ unallocated_amount: 0 }))))
 				.resolves.toBeUndefined()
 		})
-	})
-
-	/*
-	 * The refresh is AWAITED by the reconcile hook so its shared settling flag can span convergence,
-	 * which makes "what happens when an invalidation rejects" a question with consequences: a
-	 * rejection escaping here would both surface as an unhandled rejection and reject the caller's
-	 * await, leaving the affordance closed after a reconciliation the server had ACCEPTED.
-	 */
-	it('resolves, and leaves the selection alone, when an invalidation rejects', async () => {
-		const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
-		const store = createSeededStore()
-		const first = makeUnreconciledTransaction()
-		store.set(SELECTED_TRANSACTION_ATOM, [first])
-		const invalidationFailure = new Error('revalidation failed')
-		frappeSWRMutate.mockRejectedValue(invalidationFailure)
-
-		const { result } = renderHook(() => useRefreshUnreconciledTransactions(), { wrapper: withStore(store) })
-
-		await act(async () => {
-			await expect(Promise.resolve(result.current(first, makeBankTransaction({ unallocated_amount: 0 }))))
-				.resolves.toBeUndefined()
-		})
-
-		// Reported rather than swallowed - as a FIXED diagnostic rather than as the caught object,
-		// which would put a whole Frappe response envelope in the browser console - and the
-		// reviewer's selection is not discarded over a failed cache refresh.
-		expect(consoleError).toHaveBeenCalledWith(
-			'Bank reconciliation: the post-reconciliation transaction refresh did not complete.'
-		)
-		expect(consoleError).not.toHaveBeenCalledWith(invalidationFailure)
-		expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([first])
-		consoleError.mockRestore()
 	})
 })
 

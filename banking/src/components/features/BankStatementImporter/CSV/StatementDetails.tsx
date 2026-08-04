@@ -2,7 +2,7 @@ import _ from '@/lib/translate'
 import { GetStatementDetailsResponse } from '../import_utils'
 import { flt, formatCurrency } from '@/lib/numbers'
 import { formatDate } from '@/lib/date'
-import { bankRecDateAtom, bankRecErrorDialogAtom, bankRecImportFailuresAtom, classifyImportAttempt, classifyParsedStatement, withImportAttempt, withoutImportAttempt, type ImportAttemptStatus } from '../../BankReconciliation/bankRecAtoms'
+import { bankRecDateAtom, bankRecErrorDialogAtom, bankRecImportFailuresAtom } from '../../BankReconciliation/bankRecAtoms'
 import { AlertCircleIcon, ChevronLeftIcon, ChevronRightIcon, ExternalLinkIcon, InfoIcon, Loader2Icon } from 'lucide-react'
 import { H2, H3, Paragraph } from '@/components/ui/typography'
 import { FileTypeIcon } from '@/components/ui/file-dropzone'
@@ -11,21 +11,22 @@ import { Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, Tabl
 import { Separator } from '@/components/ui/separator'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { FrappeContext, useFrappeEventListener, useFrappePostCall, type FrappeConfig, type FrappeError } from 'frappe-react-sdk'
+import { useFrappeEventListener, useFrappePostCall, type FrappeError } from 'frappe-react-sdk'
 import { toast } from 'sonner'
 import ErrorBanner from '@/components/ui/error-banner'
 import { Link, useNavigate } from 'react-router'
-import { useContext, useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Progress } from '@/components/ui/progress'
 import { useSetAtom } from 'jotai'
 import { useDirection } from '@/components/ui/direction'
 import BankLogo from '@/components/common/BankLogo'
-import { isFrappeErrorEnvelope, toDisplayError, useGetBankAccounts, useRefreshImportedTransactions, withDeadline } from '../../BankReconciliation/utils'
+import { useGetBankAccounts } from '../../BankReconciliation/utils'
 import { BankStatementImportLog } from '@/types/Accounts/BankStatementImportLog'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import BankRecErrorDialog from '../../BankReconciliation/BankRecErrorDialog'
+import { getErrorMessage } from '@/lib/frappe'
 
 const parseDateFormat = (dateFormat: string) => {
 
@@ -52,80 +53,6 @@ type Props = {
     data: GetStatementDetailsResponse,
 }
 
-/**
- * The ONE test for "the server says this import happened".
- *
- * `insert_transactions` sets `status = "Completed"` and saves as its LAST act
- * (`bank_statement_import_log.py:568-569`), and it early-returns a document already in that state,
- * so a completed status is the server's own record of the import having taken effect - and the only
- * evidence of it that exists. Nothing else in a response is a substitute: `run_doc_method` always
- * appends the document it ran the method on (`frappe/handler.py:340`), so a response WITHOUT one
- * cannot have come from a successful import, and a document that came back still saying
- * `Not Started` is the server reporting that the import did not complete.
- *
- * Used as a type guard so a confirmed document can be handed to a continuation that requires one.
- */
-const isConfirmedCompletedImport = (doc?: BankStatementImportLog): doc is BankStatementImportLog =>
-    doc?.status === 'Completed'
-
-/**
- * What the reviewer is shown when the request SUCCEEDED at the transport level but the response
- * carried no confirmation of the import - no document, an empty `docs`, or a document that still
- * reports a nonterminal status.
- *
- * Built here rather than through `toDisplayError`, which exists for the different case of a
- * rejection with no envelope at all and whose copy opens "No response arrived from the server".
- * That sentence would be false here - a response DID arrive - and a message the reviewer can tell
- * is wrong about what happened is worse than no message. The rest of the reasoning is identical to
- * that layer's, and deliberately so: a response that cannot be relied on proves only that the
- * client did not learn the answer, never that the server failed to apply the request, so the copy
- * names the outcome as unknown and sends the reviewer to the server's own record instead of
- * inviting a blind re-import of work that may already exist.
- *
- * A function rather than a constant, so the wording is resolved through the translation layer at
- * the moment it is needed rather than at module load.
- */
-/**
- * The realtime payload `insert_transactions` publishes on `bank-rec-statement-import-progress`.
- *
- * Both members are optional because the server sends two DIFFERENT shapes on the same channel: one
- * per inserted row carrying only `progress`, and a final one carrying `progress` and `total`
- * (`bank_statement_import_log.py`, `publish_realtime` calls). Typing it is what stops the two being
- * confused: the SDK's listener is generic over the payload and defaults to `any`, which is how a
- * percentage came to be rendered as a transaction count.
- */
-interface ImportProgressEvent {
-    /** A percentage, 0-100. `round(rows_inserted / total_rows * 100)`. */
-    progress?: number
-    /** The transaction COUNT, sent only on the final event. */
-    total?: number
-}
-
-/**
- * Narrows a realtime `progress` value to the server's own 0-100 contract, or `undefined` when the
- * payload carries no usable figure.
- *
- * Clamped rather than trusted, because a percentage is a claim about a ratio and a value outside
- * 0-100 cannot be one: the bar is `max={100}` and the label is read as a percentage, so an
- * out-of-range figure would render as an impossible "120%" - and a NaN would render as "NaN%".
- * Neither is something the client should be willing to display, and neither can be corrected by
- * guessing, so the range is enforced here at the single point the value enters the component.
- */
-const toProgressPercentage = (value: unknown): number | undefined => {
-    if (typeof value !== 'number' || !Number.isFinite(value)) {
-        return undefined
-    }
-
-    return Math.min(100, Math.max(0, Math.round(value)))
-}
-
-const unconfirmedImportError = (): FrappeError => ({
-    httpStatus: 0,
-    httpStatusText: 'Unconfirmed',
-    message: _('The server did not confirm this import, so it is not known whether the transactions were recorded. Open this import to check its current state before importing the file again.'),
-    exception: ''
-})
-
 const StatementDetails = ({ data }: Props) => {
     const dateFormat = parseDateFormat(data.date_format)
 
@@ -135,346 +62,70 @@ const StatementDetails = ({ data }: Props) => {
 
     const setDates = useSetAtom(bankRecDateAtom)
 
+    // FM2: the two sinks a refused import is reported through - the shared dismissible dialog, and the
+    // per-file marker the importer list reads to render its third badge state.
     const setErrorDialog = useSetAtom(bankRecErrorDialogAtom)
-
     const setImportFailures = useSetAtom(bankRecImportFailuresAtom)
-
-    // The authoritative read used to confirm what the server actually recorded for this import
-    // log after a rejection. `db.getDoc` rather than a cache revalidation because this component
-    // is passed no `mutate`, and it is the same imperative-read pattern the rest of the SPA uses.
-    const { db } = useContext(FrappeContext) as FrappeConfig
-
-    // F2: awaited cache invalidation for the imported range. F3: bounded wait for rule evaluation.
-    const refreshImportedTransactions = useRefreshImportedTransactions()
 
     const direction = useDirection()
 
-    /**
-     * The client's own view of where this import has got to, for the window in which neither of the
-     * two signals the Import control used to read is telling the truth.
-     *
-     *   - `data` is the PARENT's `get_statement_details` response. It is not revalidated anywhere in
-     *     the success continuation, so `data.doc.status` still reads `Not Started` for the whole
-     *     time that continuation runs - including after the server has recorded the import.
-     *   - `loading` from the post hook answers a narrower question still ("is the request in
-     *     flight?") and flips back to false the instant the response lands, which is BEFORE the
-     *     continuation - the bounded rule-evaluation wait and the cache invalidation - has finished.
-     *
-     * Between those two, the Import control re-rendered ENABLED, reading "Import N transactions",
-     * for work the server had already committed, and invited a re-click on it. (Re-clicking was
-     * never able to double-post: the server refuses a completed log and rejects a stale resubmit.
-     * The defect is that the affordance said the opposite of what was true.)
-     *
-     *   - `attempting` - a request is in flight, or its confirmed-completed continuation is still
-     *     running. The control stays closed for all of it.
-     *   - `completed`  - the server has CONFIRMED the import. The control is REPLACED by the same
-     *     green badge the server-derived status renders, which is the strongest form of closed:
-     *     there is nothing left to click.
-     *
-     * It returns to `idle` only when an attempt ends without the import having taken effect, which
-     * is exactly when a retry is legitimate. Local state, deliberately: this describes one
-     * component's attempt, not application state, and it must not survive a remount that re-reads
-     * the document.
-     */
-    const [attemptState, setAttemptState] = useState<'idle' | 'attempting' | 'completed'>('idle')
-
-    /** True whenever an attempt is being carried out, whether or not its request is still in flight. */
-    const isImporting = loading || attemptState === 'attempting'
-
-    /**
-     * True once EITHER the fetched document or this attempt says the import is done. The server's
-     * own status is still consulted first, so a log that was already completed before this screen
-     * was opened renders exactly as it did before.
-     */
-    const isImported = data.doc.status === 'Completed' || attemptState === 'completed'
-
-    /** Retires this log's attempt marker. A marker must never outlive the condition it described. */
-    const clearImportAttempt = () => {
-        setImportFailures((previousAttempts) => withoutImportAttempt(previousAttempts, data.doc.bank_account, data.doc.name))
-    }
-
-    /**
-     * FM2, zero-row case: whether the SERVER's own parse of this file recognised no transactions at
-     * all. Derived from the response - the log's status and the count of transactions the server
-     * built from the mapping it detected - so nothing here is a client judgement about the file.
-     */
-    const invalidStatement = classifyParsedStatement({
-        status: data.doc.status,
-        finalTransactionCount: data.final_transactions?.length ?? 0
-    })
-
-    /**
-     * Records that observation against this bank account and log, so the importer list can show a
-     * PER-FILE indicator for it.
-     *
-     * Without this, an unusable file was reported only on THIS screen: the Import control was
-     * disabled and an inline alert explained why, but `Bank Statement Import Log` has two status
-     * values and no error field, so the log sat at `Not Started` forever and Previous Imports
-     * presented it exactly like a statement merely waiting to be imported. FM2 requires the failure
-     * to be visible per file, and the marker is the only place it can live.
-     *
-     * It is also RETIRED when the file later parses to rows - a PDF whose tables the reviewer
-     * re-mapped, say - and the retirement is narrowed to the `invalid` status so it cannot erase a
-     * `failed` or `unknown` marker, which describe an import ATTEMPT rather than the file. The
-     * helpers return the same map when nothing needs changing, so this effect cannot loop.
-     *
-     * The marker the OTHER producer writes - the detail route, when the server refuses to produce
-     * the details at all - is retired by that route itself on the visit where the details do load,
-     * for the same reason and with the mirror-image narrowing. Splitting retirement the same way
-     * production is split is what keeps the two producers from erasing each other's work.
-     */
-    useEffect(() => {
-        setImportFailures((previousAttempts) => invalidStatement
-            ? withImportAttempt(previousAttempts, data.doc.bank_account, data.doc.name, invalidStatement)
-            : withoutImportAttempt(previousAttempts, data.doc.bank_account, data.doc.name, 'invalid'))
-    }, [invalidStatement, data.doc.bank_account, data.doc.name, setImportFailures])
-
-    /**
-     * Applies the outcome of an import the server has CONFIRMED as completed. Extracted so the
-     * rejection path can run the identical continuation when its authoritative re-read shows the
-     * import did complete after all - the two paths must not be allowed to drift apart.
-     *
-     * The parameter is REQUIRED, and every call site has to satisfy {@link isConfirmedCompletedImport}
-     * first. That is what makes "confirmed" structural rather than a promise: the first thing this
-     * function does is record success locally and its last is to navigate away, so it must never be
-     * reachable with a document that does not say the import happened. It used to accept an optional
-     * document and was called with `response.docs ? response.docs[0] : undefined`, so a 200 that
-     * carried no document at all - a truncated or rewritten response - was presented to the reviewer
-     * as a completed import, complete with success toast and hand-off.
-     *
-     * The order here is deliberate and each step depends on the one before it:
-     *
-     *  1. Resolve the date range from the SERVER's copy of the document. The import derives the
-     *     statement's start and end dates while parsing and returns them on the saved doc, so this
-     *     is the range the newly created transactions actually fall in - not the range the
-     *     reconciliation page happens to be filtered to.
-     *  2. Point the reconciliation page's filter at that range.
-     *  3. Give rule evaluation a bounded chance to stamp the new transactions, so the suggested
-     *     matches the reviewer is about to look for are present rather than arriving later.
-     *  4. AWAIT invalidation of that range's cache entries. The unreconciled query does not
-     *     revalidate on mount or when stale, so without this the page renders whatever it already
-     *     had cached for the range and the imported transactions are simply missing, silently.
-     *  5. Only then navigate.
-     *
-     * Steps 3 and 4 are bounded and never reject, so a slow or unavailable worker delays this
-     * hand-off but cannot strand the user on the import screen.
-     */
-    const onImportCompleted = async (doc: BankStatementImportLog) => {
-
-        // Recorded FIRST, before any awaiting: from here on the server has confirmed the import, so
-        // the Import control must be gone for the whole of the continuation below rather than
-        // reappearing the moment the request settles.
-        setAttemptState('completed')
-
-        const fromDate = doc.start_date
-        const toDate = doc.end_date
-
-        if (fromDate && toDate) {
-            setDates({
-                fromDate: fromDate,
-                toDate: toDate,
-            })
-        }
-
-        clearImportAttempt()
-
-        if (fromDate && toDate) {
-            /*
-             * The imported range is re-read, and that is ALL that happens here.
-             *
-             * The client does NOT re-enqueue rule evaluation and does not poll for it to converge.
-             * Doing so meant re-invoking a whitelisted background-job endpoint from the browser and
-             * then issuing up to eight `Bank Transaction` count queries per import, on every import,
-             * on a screen that had already finished its own work - a client-side orchestration of a
-             * server-side schedule that this work is not authorised to add. Rule evaluation is the
-             * scheduler's job (`hooks.py`), the stamped `matched_transaction_rule` shows up on the
-             * next read of the list either way, and nothing about the reconciliation workflow depends
-             * on the suggestion having arrived by the time the reviewer gets there.
-             */
-            await refreshImportedTransactions(data.doc.bank_account, fromDate, toDate)
-        }
-
-        toast.success(_("Bank statement imported."))
-        navigate(`/`)
-    }
-
-    /**
-     * Settles an attempt whose RESPONSE did not establish that the import completed - whether
-     * because the server refused it, or because what came back carried no confirmation.
-     *
-     * Neither of those is by itself evidence that the import did not happen: the request may have
-     * been received and committed with only the acknowledgement lost or rewritten. The server is
-     * therefore asked what the log actually says before anything is recorded or shown, and its
-     * answer decides:
-     *
-     *  - status `Completed`  -> server truth wins outright. No error is surfaced, no marker is
-     *    written, any earlier marker is retired, and the success continuation runs.
-     *  - the SERVER refused, and the log is confirmed not completed -> `failed`.
-     *  - anything else       -> `unknown`. In particular a lost response leaving the log at its
-     *    initial `Not Started` is NOT a failure: that status is nonterminal for the whole duration
-     *    of the import, so it cannot distinguish a rollback from a commit whose response went
-     *    missing. Claiming failure there would invite a re-import of work that may already exist.
-     *
-     * The classification itself lives in `classifyImportAttempt`, which takes an OBSERVATION rather
-     * than a verdict, so this function cannot express "mark it failed" - only "here is what I saw".
-     *
-     * Both entry points share this one function ON PURPOSE. An unconfirmed success used to be
-     * indistinguishable from a confirmed one, so it took the SUCCESS continuation; giving it its own
-     * private handler instead would have re-created the same class of divergence one layer down.
-     *
-     * `serverRejected` is the caller's OBSERVATION, never a re-derivation: only the rejection path
-     * has an envelope to judge, and a 200 that simply carried no document is not a refusal, so it
-     * must never be classified as one.
-     *
-     * Nothing here creates a transaction: only the server-side import does that.
-     */
-    const settleUnconfirmedImport = async (
-        { serverRejected, displayError, transientMessage }: {
-            serverRejected: boolean,
-            displayError: FrappeError,
-            transientMessage: string
-        }
-    ): Promise<void> => {
-        let confirmedLog: BankStatementImportLog | undefined
-        try {
-            // BOUNDED. The Import control stays closed for the whole of this confirming read, and
-            // neither `db.getDoc` nor the Axios instance under it accepts a timeout - so without a
-            // deadline a request that never answers leaves the reviewer unable to retry an import
-            // whose outcome they were never told. An expiry yields `undefined`, which the
-            // classification below already treats as "no status could be obtained" - i.e. `unknown`,
-            // never `failed`, because a lost answer is not evidence that nothing happened.
-            confirmedLog = await withDeadline(db.getDoc<BankStatementImportLog>('Bank Statement Import Log', data.doc.name))
-        } catch {
-            // The confirmation itself failed, so the outcome stays unknown rather than being guessed.
-            // Reported as a FIXED diagnostic rather than as the caught object: a Frappe rejection
-            // carries the whole response envelope, and a bank statement's transport detail does not
-            // belong in a browser console.
-            console.error('Bank statement import: the import log could not be re-read, so the outcome stays indeterminate.')
-        }
-
-        const outcome = classifyImportAttempt({
-            serverRejected,
-            confirmedStatus: confirmedLog?.status
-        })
-
-        if (outcome === 'completed' && isConfirmedCompletedImport(confirmedLog)) {
-            // The freshly fetched log is passed rather than the local copy: it is the document the
-            // import wrote, so it is the one carrying the resolved statement date range.
-            //
-            // The two conditions are ONE condition twice: `classifyImportAttempt` answers
-            // `completed` for exactly the status `isConfirmedCompletedImport` accepts. It is written
-            // as a guard rather than a cast so that if the two rules ever disagree, control falls
-            // through to the not-completed handling below - fail closed - instead of handing an
-            // unconfirmed document to a continuation that reports success.
-            await onImportCompleted(confirmedLog)
-            return
-        }
-
-        /*
-         * `completed` could only survive the guard above if the classification and the confirmation
-         * predicate disagreed, which they cannot by construction. If they ever did, the attempt is
-         * recorded as `unknown` - the honest reading of "the client could not establish what
-         * happened" - rather than as a completion nothing here was able to verify.
-         */
-        const marker: ImportAttemptStatus = outcome === 'completed' ? 'unknown' : outcome
-
-        // The attempt ended without the import having taken effect, so re-offering it is correct -
-        // this is the one path on which the control may legitimately reopen. The server refuses a
-        // log it has already completed, so a retry cannot double-import.
-        setAttemptState('idle')
-
-        // Normalised through the SAME layer the reconciliation seam uses, so a genuine envelope is
-        // passed through BY IDENTITY - the backend's own message, title and severity reach the user
-        // verbatim - while a rejection with no envelope becomes outcome-indeterminate transport copy
-        // instead of the SDK's internal TypeError text. Untrusted markup inside a server message is
-        // neutralised at the rendering boundary, not by rewriting the envelope here.
-        toast.error(transientMessage)
-        setErrorDialog(displayError)
-        setImportFailures((previousAttempts) => withImportAttempt(previousAttempts, data.doc.bank_account, data.doc.name, marker))
-    }
-
     const onImport = () => {
-
-        // Raised BEFORE the request is dispatched, so there is no render - however brief - in which
-        // an attempt is under way and nothing is holding the control closed.
-        setAttemptState('attempting')
-
-        // A retry supersedes whatever the previous attempt observed, so the stale marker is
-        // discarded BEFORE the request goes out rather than after it resolves - otherwise the
-        // importer list would keep flagging the file for the whole duration of a retry that may
-        // well succeed.
-        clearImportAttempt()
 
         call({
             docs: data.doc,
             method: 'insert_transactions'
         }).then((response) => {
-            const returnedLog = response?.docs?.[0]
-
-            if (isConfirmedCompletedImport(returnedLog)) {
-                return onImportCompleted(returnedLog)
+            const doc = response.docs ? response.docs[0] : undefined
+            if (doc && doc.start_date && doc.end_date) {
+                setDates({
+                    fromDate: doc.start_date,
+                    toDate: doc.end_date,
+                })
             }
+            toast.success(_("Bank statement imported."))
+            navigate(`/`)
+        }).catch((error: FrappeError) => {
+            toast.error(_("There was an error while importing the bank statement."))
 
             /*
-             * A 200 IS NOT A CONFIRMATION. `run_doc_method` returns the document it ran the method
-             * on, and the import's last act is to set the status to `Completed` and save - so a
-             * response with no document, an empty `docs`, or a document still reporting
-             * `Not Started` did not come from an import that took effect. It used to be treated as
-             * success anyway: the control was retired, a success toast was raised, the
-             * reconciliation range was moved and the reviewer was handed off to a workbench that
-             * had nothing new in it.
+             * FM2. This callback previously took NO argument at all, so the server's own account of
+             * why it refused the import - "Invalid Bank Account", "Disabled Bank Account", an
+             * unreadable or empty file, a missing PDF password, no tables detected, a missing
+             * dependency, insufficient permission - was discarded, and the reviewer was shown only
+             * the generic toast above.
              *
-             * It is not treated as a failure either, because that is equally unknowable from here.
-             * It is settled the same way a rejection is: ask the server what the log says and let
-             * THAT decide. `serverRejected` is false - nothing was refused - so a log that is not
-             * confirmed completed is recorded as `unknown`, which is the honest reading of "the
-             * response could not be relied on".
+             * The error is passed to the dialog UNMODIFIED so `ErrorBanner` parses
+             * `_server_messages` itself and the backend's wording reaches the reviewer verbatim.
              */
-            return settleUnconfirmedImport({
-                serverRejected: false,
-                displayError: unconfirmedImportError(),
-                transientMessage: _("The import could not be confirmed.")
-                // Terminated HERE rather than in the catch below, which would otherwise re-run the
-                // whole settlement and judge this handler's own failure as though the SERVER had
-                // refused the import.
-            }).catch(() => console.error('Bank statement import: the unconfirmed-import settlement did not complete.'))
-        }).catch((importError: unknown) => {
-            // Handled asynchronously because the server must be consulted before any outcome is
-            // recorded; the terminal catch keeps that handler from ever escaping as an unhandled
-            // rejection.
-            return settleUnconfirmedImport({
-                // A genuine Frappe envelope is the evidence that the server answered at all. Without
-                // one there is no response to reason about - `frappe-js-sdk` dereferences
-                // `error.response.data` unguarded, so a lost response surfaces as its own TypeError.
-                serverRejected: isFrappeErrorEnvelope(importError),
-                displayError: toDisplayError(importError),
-                transientMessage: _("There was an error while importing the bank statement.")
-                // Fixed diagnostic only; see the note on the confirming read above.
-            }).catch(() => console.error('Bank statement import: the refused-import settlement did not complete.'))
+            setErrorDialog(error)
+
+            /*
+             * ...and recorded against this import log, because the dialog is dismissible and the row
+             * has to keep saying so afterwards. `Bank Statement Import Log` offers only
+             * `Not Started` and `Completed` and has no error field, and a refused import rolls back,
+             * so the log stays at `Not Started` - visually identical to a statement merely waiting to
+             * be imported. This marker is the only per-file failure signal that can exist.
+             *
+             * The map is replaced rather than mutated so jotai sees a new reference; the message is
+             * the same parsed text the toast shows, so the chip's tooltip and the dialog cannot
+             * disagree.
+             *
+             * NO TRANSACTION IS CREATED HERE. Only the server-side import inserts Bank Transactions,
+             * and this path is reached precisely when it did not.
+             */
+            setImportFailures((previous) => {
+                const next = new Map(previous)
+                next.set(data.doc.name, getErrorMessage(error))
+                return next
+            })
         })
 
     }
 
-    /**
-     * The import's realtime progress, as the SERVER's own unit: a PERCENTAGE, 0-100.
-     *
-     * `insert_transactions` publishes `round(rows_inserted / total_rows * 100)` per row, so reading
-     * the figure as a transaction count made a three-row statement announce "33 transactions" at its
-     * first row and a 300-row one never report more than 100. The progress BAR was always right - it
-     * is fed `max={100}` - so the label and the bar disagreed with each other on the same screen.
-     */
     const [progress, setProgress] = useState(0)
 
-    useFrappeEventListener<ImportProgressEvent>("bank-rec-statement-import-progress", (event) => {
-        const percentage = toProgressPercentage(event?.progress)
-
-        // An unusable payload leaves the last known figure alone rather than resetting the bar to
-        // zero: a malformed push is not evidence that the import has gone backwards.
-        if (percentage === undefined) {
-            return
-        }
-
-        setProgress(percentage)
+    useFrappeEventListener("bank-rec-statement-import-progress", (event) => {
+        setProgress(event.progress)
     })
 
     const file_name = data.doc.file.split("/").pop() ?? ""
@@ -489,6 +140,9 @@ const StatementDetails = ({ data }: Props) => {
 
     return (
         <div className='flex flex-col gap-4'>
+            {/* FM2: the same atom-driven dialog the reconciliation workbench mounts. This surface needs
+                its own mount because `/statement-importer/:id` is a different route tree, and both
+                mounts read one shared atom so they can never disagree. */}
             <BankRecErrorDialog />
             <div className='flex flex-col gap-4'>
                 <div className='flex justify-between items-center'>
@@ -498,16 +152,10 @@ const StatementDetails = ({ data }: Props) => {
                             {_("Back")}
                         </Link>
                     </Button>
-                    {/*
-                      * The control is driven by `isImported` / `isImporting` rather than by
-                      * `data.doc.status` and `loading` directly, so that the window between the
-                      * server confirming the import and this screen being replaced cannot present an
-                      * enabled "Import" action for work that is already recorded. See `attemptState`.
-                      */}
-                    {isImported ? <Badge theme='green'>{_("Completed")}</Badge> :
-                        <Button onClick={onImport} disabled={isImporting || data.final_transactions?.length === 0} size='sm' type='button'>
-                            {isImporting ? <Loader2Icon className='size-4 animate-spin' /> : null}
-                            {isImporting ? _("Importing...") : _("Import {0} transactions", [data.final_transactions?.length?.toString() || "0"])}</Button>
+                    {data.doc.status === 'Completed' ? <Badge theme='green'>{_("Completed")}</Badge> :
+                        <Button onClick={onImport} disabled={loading || data.final_transactions?.length === 0} size='sm' type='button'>
+                            {loading ? <Loader2Icon className='size-4 animate-spin' /> : null}
+                            {loading ? _("Importing...") : _("Import {0} transactions", [data.final_transactions?.length?.toString() || "0"])}</Button>
                     }
                 </div>
                 <div className='flex items-start gap-4'>
@@ -523,43 +171,12 @@ const StatementDetails = ({ data }: Props) => {
                     </div>
                 </div>
 
-                {/*
-                  * The label states the server's own unit. `progress` is a PERCENTAGE (see
-                  * `toProgressPercentage`), so it is rendered as one - which also makes it agree
-                  * with the bar beside it, which has always been `max={100}`.
-                  */}
                 {progress > 0 && <div className='flex flex-col gap-2'><Progress value={progress} max={100} size="lg" />
-                    <span className='text-sm'>{_("Importing transactions - {0}% complete", [progress.toString()])}
+                    <span className='text-sm'>{_("Importing {0} transactions", [progress.toString()])}
                     </span>
                 </div>}
 
-                {/*
-                  * The import call's own hook error. Normalised through the shared layer for the
-                  * same reason the dialog is: when the response is lost there is no envelope to
-                  * render, and the SDK's unguarded read of `error.response.data` surfaces as a raw
-                  * `TypeError` that tells the user nothing about what was or was not recorded.
-                  * A genuine envelope is passed through by identity and keeps the server's wording.
-                  */}
-                {error && <ErrorBanner error={toDisplayError(error)} />}
-
-                {/*
-                  * FM2, zero-row case. A file the server parsed without raising - an empty
-                  * statement, or one whose rows the detected mapping matched none of - yields no
-                  * transactions to import, and the Import control above is disabled as a result.
-                  * Disabling it alone left the reason entirely unstated, which reads as the page
-                  * being broken rather than the file being unusable. The condition is derived from
-                  * the SERVER's parse result, so nothing here is a client-side judgement about the
-                  * file, and no marker is involved: the log exists and its status is accurate.
-                  */}
-                {data.doc.status !== 'Completed' && data.final_transactions?.length === 0 && (
-                    <Alert theme="red">
-                        <AlertCircleIcon />
-                        <AlertTitle>{_("No transactions found in this statement")}</AlertTitle>
-                        <AlertDescription>
-                            {_("This file could not be read as a bank statement, so there is nothing to import. It may be empty, or its columns may not have been recognised. Check the file against the expected columns and upload it again.")}
-                        </AlertDescription>
-                    </Alert>
-                )}
+                {error && <ErrorBanner error={error} />}
 
                 <Table>
                     <TableBody>
@@ -601,15 +218,15 @@ const StatementDetails = ({ data }: Props) => {
                         </TableRow>
                         <TableRow>
                             <TableHead>{_("Total Debits")}</TableHead>
-                            <TableCell><span className='font-numeric'>{formatCurrency(flt(data.doc.total_debits, 2), data.doc.currency)}</span> <span className='text-ink-gray-5 font-sans'>({data.doc.total_debit_transactions} {data.doc.total_debit_transactions === 1 ? _("transaction") : _("transactions")})</span></TableCell>
+                            <TableCell><span className='font-numeric'>{formatCurrency(flt(data.doc.total_debits, 2), data.currency)}</span> <span className='text-ink-gray-5 font-sans'>({data.doc.total_debit_transactions} {data.doc.total_debit_transactions === 1 ? _("transaction") : _("transactions")})</span></TableCell>
                         </TableRow>
                         <TableRow>
                             <TableHead>{_("Total Credits")}</TableHead>
-                            <TableCell><span className='font-numeric'>{formatCurrency(flt(data.doc.total_credits, 2), data.doc.currency)}</span> <span className='text-ink-gray-5 font-sans'>({data.doc.total_credit_transactions} {data.doc.total_credit_transactions === 1 ? _("transaction") : _("transactions")})</span></TableCell>
+                            <TableCell><span className='font-numeric'>{formatCurrency(flt(data.doc.total_credits, 2), data.currency)}</span> <span className='text-ink-gray-5 font-sans'>({data.doc.total_credit_transactions} {data.doc.total_credit_transactions === 1 ? _("transaction") : _("transactions")})</span></TableCell>
                         </TableRow>
                         <TableRow>
                             <TableHead>{_("Closing Balance as of {}", [formatDate(data.doc.end_date, "Do MMMM YYYY")])}</TableHead>
-                            <TableCell className='font-numeric'>{formatCurrency(flt(data.doc.closing_balance, 2), data.doc.currency)}</TableCell>
+                            <TableCell className='font-numeric'>{formatCurrency(flt(data.doc.closing_balance, 2), data.currency)}</TableCell>
                         </TableRow>
                         <TableRow>
                             <TableHead>
@@ -680,8 +297,8 @@ const StatementDetails = ({ data }: Props) => {
                                         <TableCell>{formatDate(transaction.date)}</TableCell>
                                         <TableCell className='max-w-[200px] w-fit overflow-hidden text-ellipsis'>{transaction.description}</TableCell>
                                         <TableCell className='max-w-[100px] w-fit overflow-hidden text-ellipsis'>{transaction.reference}</TableCell>
-                                        <TableCell className='text-end font-numeric'>{formatCurrency(transaction.withdrawal, data.doc.currency)}</TableCell>
-                                        <TableCell className='text-end font-numeric'>{formatCurrency(transaction.deposit, data.doc.currency)}</TableCell>
+                                        <TableCell className='text-end font-numeric'>{formatCurrency(transaction.withdrawal, data.currency)}</TableCell>
+                                        <TableCell className='text-end font-numeric'>{formatCurrency(transaction.deposit, data.currency)}</TableCell>
                                     </TableRow>
                                 ))}
                             </TableBody>

@@ -3,6 +3,34 @@ import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 
+/**
+ * The frontend units this work delivers, and therefore the single source of truth for BOTH the
+ * coverage measurement scope and the coverage gate. See the `coverage` block below for why the two
+ * must be generated from one array rather than maintained as two lists.
+ */
+const COVERED_UNITS = [
+	// The reconciliation API-client layer: every backend call the workflow makes, its cache keys, and
+	// the fail-closed post-rejection handling the confirm guard depends on.
+	'src/components/features/BankReconciliation/utils.ts',
+	// The feature's state store, including the per-file import-failure markers behind FM2.
+	'src/components/features/BankReconciliation/bankRecAtoms.ts',
+	// The dismissible error dialog required by FM1/FM3.
+	'src/components/features/BankReconciliation/BankRecErrorDialog.tsx',
+	// The reconciliation workbench: list, suggested match, override, confirm, guards, currency advisory.
+	'src/components/features/BankReconciliation/MatchAndReconcile.tsx',
+	// The statement import step, including the FM2 backend-error surfacing path.
+	'src/components/features/BankStatementImporter/CSV/StatementDetails.tsx',
+	// The importer surface: upload chain, per-file failure indicator, import log list.
+	'src/pages/BankStatementImporter.tsx',
+	// The shared helpers those surfaces resolve errors, companies and currencies through.
+	'src/lib/frappe.ts',
+	'src/lib/company.ts',
+	'src/lib/currency.ts'
+] as const
+
+/** The line-coverage floor the specification requires, applied globally AND per unit. */
+const LINE_COVERAGE_THRESHOLD = 80
+
 // https://vitest.dev/config/
 // Keep tests independent of vite.config.ts: it imports proxyOptions.ts, whose
 // module-scope bench-config read fails when the external bench file is absent.
@@ -37,9 +65,8 @@ export default defineConfig({
 		 *
 		 * Set globally rather than per test: the cost is a property of the harness, not of any one
 		 * scenario, and a per-test override would have to be repeated on whichever test happens to be
-		 * slowest next. Nothing here waits on a timer for its own sake - the bounded rule-evaluation
-		 * wait is the only polling loop in the SPA and its tests resolve it explicitly - so a longer
-		 * ceiling cannot mask a hang: a genuinely stuck test still fails, just later.
+		 * slowest next. None of the units gated below polls or retries, so a longer ceiling cannot mask
+		 * a hang here: a genuinely stuck test still fails, just later.
 		 */
 		testTimeout: 30000,
 		coverage: {
@@ -54,35 +81,26 @@ export default defineConfig({
 			 * run and the headline percentage can never disagree. Measuring the whole SPA while gating
 			 * only part of it produced precisely that disagreement - a passing run advertising 43.58%.
 			 *
-			 * Every entry below is a unit this work created or rewrote: the dismissible error dialog,
-			 * the reconciliation API-client layer and its state store, the workbench, the statement
-			 * import step, the importer surface, and the three shared helpers those surfaces resolve
-			 * errors, companies and currencies through. The remaining ~107 modules of the SPA - the
-			 * 500-1200 line modal bodies, the PDF table editor, the 43 design-system primitives and the
-			 * other pre-existing pages - are untouched by this work, carry no suite of their own, and
-			 * are therefore neither measured nor gated here.
+			 * Every entry below is a unit this work created or edited: the dismissible error dialog, the
+			 * reconciliation API-client layer and its state store, the workbench, the statement import
+			 * step, the importer surface, and the three shared helpers those surfaces resolve errors,
+			 * companies and currencies through. The remaining ~107 modules of the SPA - the 500-1200
+			 * line modal bodies, the PDF table editor, the 43 design-system primitives and the other
+			 * pre-existing pages - are untouched by this work, carry no suite of their own, and are
+			 * therefore neither measured nor gated here.
 			 *
-			 * Three files did receive small hardening edits during review remediation but are not
-			 * listed: src/components/ui/markdown.tsx, the BankReconciliation bank picker, and the
-			 * import-log detail page. They are pre-existing components rather than units this work
-			 * owns, and gating them would require suites this work does not deliver. They are recorded
-			 * here rather than silently omitted - and the rule is applied to all three alike, including
-			 * the one that would happen to pass, so the list is derived rather than curated.
+			 * THIS LIST AND THE `thresholds` KEYS BELOW ARE IDENTICAL, AND THAT EQUALITY IS ENFORCED
+			 * MECHANICALLY: `include` is derived from the single `COVERED_UNITS` constant above and each
+			 * threshold key is generated from the same array. A threshold naming a file that `include`
+			 * omits does not fail - Vitest builds an empty coverage map for it, the reporter returns
+			 * `Unknown`, and the comparison silently passes - so a hand-maintained pair of lists can
+			 * drift into a gate that gates nothing. Deriving both from one array makes that impossible
+			 * rather than merely unlikely.
 			 *
-			 * Adding a component or API-client module to this work means adding it here AND to the
-			 * per-unit thresholds below.
+			 * Adding a component or API-client module to this work means adding ONE entry to
+			 * `COVERED_UNITS`.
 			 */
-			include: [
-				'src/components/features/BankReconciliation/utils.ts',
-				'src/components/features/BankReconciliation/bankRecAtoms.ts',
-				'src/components/features/BankReconciliation/BankRecErrorDialog.tsx',
-				'src/components/features/BankReconciliation/MatchAndReconcile.tsx',
-				'src/components/features/BankStatementImporter/CSV/StatementDetails.tsx',
-				'src/pages/BankStatementImporter.tsx',
-				'src/lib/frappe.ts',
-				'src/lib/company.ts',
-				'src/lib/currency.ts'
-			],
+			include: [...COVERED_UNITS],
 			/*
 			 * Retained as a guard rather than as an active filter: the `include` above is an explicit
 			 * file list, so nothing here can match today. It stays so that broadening `include` back to
@@ -121,27 +139,12 @@ export default defineConfig({
 			 */
 			thresholds: {
 				// The aggregate of every file measured by `include` above.
-				lines: 80,
-				// The reconciliation API-client layer: every backend call the workflow makes, its cache
-				// keys, and the post-rejection refresh the confirm guard depends on.
-				'src/components/features/BankReconciliation/utils.ts': { lines: 80 },
-				// The feature's state store, including the import-attempt markers behind FM2.
-				'src/components/features/BankReconciliation/bankRecAtoms.ts': { lines: 80 },
-				// The dismissible error dialog required by FM1/FM3.
-				'src/components/features/BankReconciliation/BankRecErrorDialog.tsx': { lines: 80 },
-				// The reconciliation workbench: list, suggested match, override, confirm, guards.
-				'src/components/features/BankReconciliation/MatchAndReconcile.tsx': { lines: 80 },
-				// The statement import step, including the FM2 backend-error surfacing path.
-				'src/components/features/BankStatementImporter/CSV/StatementDetails.tsx': { lines: 80 },
-				// The importer surface: upload chain, per-file failure indicator, import log list.
-				'src/pages/BankStatementImporter.tsx': { lines: 80 },
-				// The import-log detail route: the only surface that exists when the statement-details
-				// endpoint refuses, and therefore the FM2 producer for a genuinely unreadable file.
-				'src/pages/ViewBankStatementImportLog.tsx': { lines: 80 },
-				// The shared helpers those surfaces resolve errors, companies and currencies through.
-				'src/lib/frappe.ts': { lines: 80 },
-				'src/lib/company.ts': { lines: 80 },
-				'src/lib/currency.ts': { lines: 80 }
+				lines: LINE_COVERAGE_THRESHOLD,
+				// ...and the same threshold per unit, generated from the SAME array `include` is built
+				// from, so the two can never name different files.
+				...Object.fromEntries(
+					COVERED_UNITS.map((unit) => [unit, { lines: LINE_COVERAGE_THRESHOLD }])
+				)
 			}
 		}
 	}

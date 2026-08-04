@@ -120,21 +120,8 @@ export interface GetStatementDetailsResponse {
     }>,
     date_format: string,
     raw_data: Array<Array<string>>,
+    currency: string,
     pdf_tables?: PDFTable[],
-    /*
-     * NOTE: there is deliberately NO top-level `currency` member here.
-     *
-     * `get_statement_details` returns exactly `doc`, `date_format`, `conflicting_transactions`,
-     * `final_transactions` and `raw_data` - plus `pdf_tables` on the PDF branch
-     * (`bank_statement_import_log.py:1156-1177`). A response-level currency was declared here but
-     * never sent, so every consumer reading it received `undefined` and `formatCurrency` silently
-     * fell back to the SYSTEM default: a statement on a non-default-currency bank account had every
-     * one of its amounts labelled with the wrong symbol, while the type asserted the opposite.
-     *
-     * The currency of a statement is `doc.currency`, a native read-only field on
-     * `Bank Statement Import Log` populated from the bank account's GL account currency. Read it
-     * from there.
-     */
 }
 
 export const useGetStatementDetails = (id: string) => {
