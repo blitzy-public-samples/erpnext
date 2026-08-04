@@ -67,15 +67,18 @@ import {
 	useUpdateActionLog,
 	readErrorText,
 	readServerMessages,
-	type UnreconciledTransaction
+	type UnreconciledTransaction,
+	// The shared single-flight guard lives with the hook that owns it, not in the feature's atom
+	// store — see the note on its declaration in `./utils`.
+	bankRecReconcileInFlightAtom
 } from './utils'
 import {
 	bankRecActionLog,
 	bankRecAmountFilter,
 	bankRecDateAtom,
 	bankRecErrorDialogAtom,
+	bankRecImportFailuresAtom,
 	bankRecMatchFilters,
-	bankRecReconcileInFlightAtom,
 	bankRecSearchText,
 	bankRecSelectedTransactionAtom,
 	bankRecTransactionTypeFilter,
@@ -85,7 +88,6 @@ import {
 	type SelectedBank
 } from './bankRecAtoms'
 import { selectedCompanyAtom } from '@/hooks/useCurrentCompany'
-import { installRoleProfile } from '@/test/setup'
 import { canCancelDocument, canReadDocument, canWriteDocument } from '@/lib/permissions'
 
 /**
@@ -1642,6 +1644,142 @@ describe('useReconcileTransaction — the accepted post (TC4)', () => {
 		])
 	})
 
+	/*
+	 * ══════════════════════════════════════════════════════════════════════════════════════════════
+	 * A CLIENT FAULT AFTER THE SERVER HAS COMMITTED  (CR-02, FM1)
+	 *
+	 * Everything the success handler does is client bookkeeping, and every part of it can throw:
+	 * `addToActionLog` writes to `sessionStorage`, which throws on a quota overrun or when storage is
+	 * denied; the cache/selection handling reads SWR; `toast.success` renders.
+	 *
+	 * The hook used to attach its failure handler as a trailing `.catch`, so all of those faults were
+	 * routed into the SERVER-REFUSAL path. The consequence was not cosmetic: the reviewer was shown a
+	 * refusal dialog for a reconciliation the server had ACCEPTED AND COMMITTED, the selection was
+	 * cleared as "contradicted", and they were invited to post again against a transaction that had in
+	 * fact already been allocated against - the exact double-post FM1 forbids.
+	 *
+	 * The handler is now the SECOND ARGUMENT of `.then`, so it sees RPC rejections and nothing else.
+	 * These cases force a realistic post-success fault and pin the distinction.
+	 * ══════════════════════════════════════════════════════════════════════════════════════════════ */
+	describe('when the client throws AFTER the server accepted the post', () => {
+
+		let warningToast: ReturnType<typeof vi.spyOn>
+		let errorToast: ReturnType<typeof vi.spyOn>
+
+		beforeEach(() => {
+			warningToast = vi.spyOn(toast, 'warning').mockReturnValue('toast-id')
+			errorToast = vi.spyOn(toast, 'error').mockReturnValue('toast-id')
+		})
+
+		afterEach(() => {
+			warningToast.mockRestore()
+			errorToast.mockRestore()
+		})
+
+		/**
+		 * Confirms a match with `sessionStorage.setItem` refusing, which is what a real quota overrun
+		 * looks like: the action log is an `atomWithStorage` over `sessionStorage`, so the very FIRST
+		 * thing the success handler does is a synchronous write that can throw - which is also why this
+		 * is the strongest available trigger, since nothing after it gets to run.
+		 *
+		 * Spied on `Storage.prototype` rather than on `window.sessionStorage`, and that is not
+		 * interchangeable: jsdom implements a `Storage` instance as a Proxy, so a spy installed on the
+		 * instance is never consulted and the fault would silently not happen - a green test proving
+		 * nothing. The prototype method is the one the Proxy forwards to.
+		 */
+		const confirmWithStorageRefused = async () => {
+			const store = createSeededStore()
+			const transaction = makeUnreconciledTransaction()
+			const voucher = makeSuggestedLinkedPayment(transaction)
+			store.set(SELECTED_TRANSACTION_ATOM, [transaction])
+			frappePostCall.mockResolvedValue(makeReconcileSuccessResponse())
+
+			const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+
+			// Installed only around the dispatch. The seeding above writes localStorage-backed atoms
+			// through the same prototype method, so a spy installed earlier would fail the setup instead
+			// of the success handler under test.
+			const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+				throw new DOMException('The quota has been exceeded.', 'QuotaExceededError')
+			})
+
+			try {
+				await act(async () => {
+					result.current.reconcileTransaction(transaction, voucher)
+				})
+			} finally {
+				setItem.mockRestore()
+			}
+
+			return { store, transaction, voucher }
+		}
+
+		it('does NOT raise the refusal dialog, because nothing was refused', async () => {
+			const { store } = await confirmWithStorageRefused()
+
+			// The whole point. A dialog here would tell the reviewer the post failed when it did not.
+			expect(store.get(bankRecErrorDialogAtom)).toBeNull()
+			expect(errorToast).not.toHaveBeenCalled()
+		})
+
+		it('reports it as a screen-out-of-date WARNING that names the server as the authority', async () => {
+			await confirmWithStorageRefused()
+
+			expect(warningToast).toHaveBeenCalledTimes(1)
+			expect(warningToast.mock.calls[0][0]).toBe('Reconciled, but this screen could not be updated.')
+			expect((warningToast.mock.calls[0][1] as { description: string }).description)
+				.toBe('The reconciliation was recorded by the server. Refresh to see the current status.')
+		})
+
+		it('re-reads the authoritative lists, so the row shows what the server has', async () => {
+			await confirmWithStorageRefused()
+
+			const revalidatedKeys = frappeSWRMutate.mock.calls.map(([key]) => key)
+
+			expect(revalidatedKeys).toContain(UNRECONCILED_KEY)
+			expect(revalidatedKeys).toContain(ALL_TRANSACTIONS_KEY)
+			// Still only known key families - the recovery introduces no new cache key.
+			expect(revalidatedKeys.filter((key) => familyOf(key) === undefined)).toEqual([])
+		})
+
+		it('does NOT clear the selection, because the snapshot was not contradicted', async () => {
+			// The FM3 clear exists to withdraw an affordance the server has just refused. Applying it
+			// here would take the reviewer's row away after a reconciliation that succeeded.
+			const { store, transaction } = await confirmWithStorageRefused()
+
+			expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([transaction])
+		})
+
+		it('releases the single-flight guard, so the reviewer is not stranded', async () => {
+			const { store } = await confirmWithStorageRefused()
+
+			await waitFor(() => {
+				expect(store.get(bankRecReconcileInFlightAtom)).toBeNull()
+			})
+		})
+
+		it('still reports a GENUINE server refusal as a refusal, so the split is not vacuous', async () => {
+			// The companion case. Without it, "no dialog" above could be satisfied by a hook that never
+			// raised one at all.
+			const store = createSeededStore()
+			const transaction = makeUnreconciledTransaction()
+			const voucher = makeSuggestedLinkedPayment(transaction)
+			store.set(SELECTED_TRANSACTION_ATOM, [transaction])
+			const refusal = makeAlreadyReconciledError(transaction.name)
+			frappePostCall.mockRejectedValue(refusal)
+
+			const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+			await act(async () => {
+				await result.current.reconcileTransaction(transaction, voucher)
+			})
+
+			expect(store.get(bankRecErrorDialogAtom)).toBe(refusal)
+			expect(errorToast).toHaveBeenCalledTimes(1)
+			expect(warningToast).not.toHaveBeenCalled()
+			expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([])
+		})
+	})
+
 	it('confirms the reconciliation to the reviewer and offers to undo it', async () => {
 		const { store, transaction } = await confirmMatch()
 
@@ -2202,6 +2340,116 @@ describe('useRefreshUnreconciledTransactions', () => {
 	})
 })
 
+/*
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════
+ * THE PERSISTED KEYS ARE SCOPED TO THE SITE AND THE USER
+ *
+ * Everything this feature persists is financial metadata about one person's work: the selected bank
+ * account carries its GL account, its company and its `bank_account_no`, and the action log carries
+ * transaction and voucher identifiers. `localStorage` and `sessionStorage` are keyed by ORIGIN, not by
+ * session, so an unscoped key is shared by every user who signs in from the same browser and by every
+ * site served from that origin - a second reviewer on a shared workstation would read the first one's
+ * selection and history.
+ *
+ * Asserted on the STORED KEY rather than on the atom, because the atom behaves identically either way;
+ * the key is the only observable difference and the only thing that provides the isolation.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════ */
+describe('persisted state is namespaced per site and per user', () => {
+
+	/** The namespace the harness's boot payload implies: `boot.sitename` and `boot.user.name`. */
+	const NAMESPACE = `${window.frappe.boot.sitename}::${window.frappe.boot.user.name}`
+
+	it('stores the selected bank account under a site- and user-scoped key', () => {
+		const store = createStore()
+		const bank = makeSelectedBank()
+
+		store.set(selectedBankAccountAtom, bank)
+
+		expect(localStorage.getItem(`bank-rec-selected-bank::${NAMESPACE}`)).toBe(JSON.stringify(bank))
+		// And NOT under the bare key, which is what any other user of this browser would read.
+		expect(localStorage.getItem('bank-rec-selected-bank')).toBeNull()
+	})
+
+	it('stores the date range and the match filters the same way', () => {
+		const store = createStore()
+
+		store.set(bankRecDateAtom, { fromDate: FROM_DATE, toDate: TO_DATE })
+		store.set(bankRecMatchFilters, ['payment_entry'])
+
+		expect(localStorage.getItem(`bank-rec-date::${NAMESPACE}`))
+			.toBe(JSON.stringify({ fromDate: FROM_DATE, toDate: TO_DATE }))
+		expect(localStorage.getItem(`bank-rec-match-filters::${NAMESPACE}`)).toBe(JSON.stringify(['payment_entry']))
+		expect(localStorage.getItem('bank-rec-date')).toBeNull()
+		expect(localStorage.getItem('bank-rec-match-filters')).toBeNull()
+	})
+
+	it('scopes the session-backed action log too, which carries voucher identifiers', () => {
+		const store = createStore()
+		const entry: ActionLog = {
+			type: 'match',
+			isBulk: false,
+			timestamp: 1_700_000_000_000,
+			items: []
+		}
+
+		store.set(bankRecActionLog, [entry])
+
+		expect(sessionStorage.getItem(`bank-rec-action-log::${NAMESPACE}`)).toBe(JSON.stringify([entry]))
+		expect(sessionStorage.getItem('bank-rec-action-log')).toBeNull()
+	})
+
+	it('leaves an entry written by another user unread, which is the isolation itself', () => {
+		// A previous reviewer's selection, left in this browser under THEIR namespace.
+		localStorage.setItem(
+			'bank-rec-selected-bank::test.localhost::someone.else@example.com',
+			JSON.stringify(makeSelectedBank({ name: 'Someone Elses Bank - Test Company' }))
+		)
+
+		// `getOnInit: true` reads at creation, so a fresh store is the strongest available check.
+		expect(createStore().get(selectedBankAccountAtom)).toBeNull()
+	})
+
+	/*
+	 * The FAIL-SAFE, and why it is worth a test rather than a comment: the namespace is computed at
+	 * MODULE LOAD, so if the boot payload were ever absent - a bundle loaded outside the Frappe host
+	 * page, a boot parse that failed - an unguarded read would throw there and take the whole feature
+	 * down with it. Re-importing the module with `window.frappe` removed is the only way to reach that
+	 * path, since the namespace is fixed for the lifetime of an import.
+	 */
+	it('falls back to a namespace no signed-in user shares when the boot payload is absent', async () => {
+		const boot = window.frappe
+		delete (window as unknown as Record<string, unknown>).frappe
+		vi.resetModules()
+
+		try {
+			const freshAtoms = await import('./bankRecAtoms')
+			const freshStore = createStore()
+
+			freshStore.set(freshAtoms.selectedBankAccountAtom, makeSelectedBank())
+
+			expect(localStorage.getItem('bank-rec-selected-bank::unknown-site::unknown-user')).not.toBeNull()
+			expect(localStorage.getItem('bank-rec-selected-bank')).toBeNull()
+		} finally {
+			window.frappe = boot
+			vi.resetModules()
+		}
+	})
+
+	it('keeps the failure-path atoms OUT of storage, because each records one observation', () => {
+		const store = createStore()
+
+		store.set(bankRecErrorDialogAtom, makeAlreadyReconciledError('ACC-BTN-2024-00001'))
+		store.set(bankRecImportFailuresAtom, new Map([['import-log-1', 'Invalid Bank Account']]))
+
+		// A stale dialog or a stale marker must not survive a reload: the server is re-read on mount, so
+		// a persisted value could only assert something nobody has re-checked.
+		expect(
+			Object.keys(localStorage).concat(Object.keys(sessionStorage))
+				.filter((key) => key.startsWith('bank-rec-error') || key.startsWith('bank-rec-import'))
+		).toEqual([])
+	})
+})
+
 describe('useIsTransactionWithdrawal', () => {
 
 	/*
@@ -2543,11 +2791,28 @@ describe('a refusal under a narrowed role profile is handled exactly like any ot
 		return { store, transaction, voucher: makeSuggestedLinkedPayment(transaction) }
 	}
 
-	it('models the real DocPerm rows, so an Accounts User cannot cancel a Bank Transaction', () => {
-		// The premise the rest of this block rests on: the harness derives its permission arrays from the
-		// real rows, so a narrowed profile genuinely differs. `Bank Transaction` grants cancel to System
-		// Manager and Accounts Manager but NOT to Accounts User.
-		installRoleProfile(['Accounts User'])
+	/**
+	 * Narrows the authorisation profile the SPA reads.
+	 *
+	 * `src/lib/permissions.ts` asks nothing more than whether a DocType appears in one of the eight
+	 * `can_*` arrays on `boot.user`, so overwriting those arrays IS the narrowing. The harness rebuilds
+	 * the profile after every test, so this cannot leak.
+	 */
+	const narrowProfileTo = (rights: Partial<Record<'can_read' | 'can_write' | 'can_cancel', string[]>>) => {
+		Object.assign(window.frappe.boot.user, rights)
+	}
+
+	/** An accounting-only profile: it may read and write a Bank Transaction but not cancel one. */
+	const ACCOUNTS_ONLY = {
+		can_read: ['Bank Transaction', 'Bank Account', 'Payment Entry'],
+		can_write: ['Bank Transaction', 'Bank Account', 'Payment Entry'],
+		can_cancel: ['Payment Entry']
+	}
+
+	it('reads a narrowed profile straight off boot.user, so a denial is genuinely a denial', () => {
+		// The premise the rest of this block rests on: a narrowed profile really does differ, so the
+		// refusals below are being handled under one rather than under a blanket grant.
+		narrowProfileTo(ACCOUNTS_ONLY)
 
 		expect(canReadDocument('Bank Transaction')).toBe(true)
 		expect(canWriteDocument('Bank Transaction')).toBe(true)
@@ -2555,7 +2820,7 @@ describe('a refusal under a narrowed role profile is handled exactly like any ot
 	})
 
 	it('surfaces a PERMISSION refusal in the server\'s own words and clears the selection', async () => {
-		installRoleProfile(['Accounts User'])
+		narrowProfileTo(ACCOUNTS_ONLY)
 
 		const refusal = makeServerMessagesError('Insufficient Permission for Bank Transaction')
 		const { store, transaction, voucher } = seedForReconcile()
@@ -2586,7 +2851,7 @@ describe('a refusal under a narrowed role profile is handled exactly like any ot
 	it('does not retry a refused post, whatever the reason for the refusal', async () => {
 		// A permission refusal is not a transient fault. Retrying would be a second post made without
 		// knowing the outcome of the first, which is the one thing the single-flight guard exists to stop.
-		installRoleProfile(['Accounts User'])
+		narrowProfileTo(ACCOUNTS_ONLY)
 
 		const { store, transaction, voucher } = seedForReconcile()
 		frappePostCall.mockRejectedValue(makeServerMessagesError('Insufficient Permission for Bank Transaction'))
@@ -2607,7 +2872,7 @@ describe('a refusal under a narrowed role profile is handled exactly like any ot
 	})
 
 	it('holds no role at all and still reports a refusal rather than swallowing it', async () => {
-		installRoleProfile([])
+		narrowProfileTo({ can_read: [], can_write: [], can_cancel: [] })
 
 		const refusal = makeServerMessagesError('Not permitted')
 		const { store, transaction, voucher } = seedForReconcile()

@@ -43,7 +43,7 @@
  * `getCompanyCurrency` (`company.ts:4`) and `getCompanyCostCenter` (`company.ts:9`) index the
  * root as `locals[':Company']?.…`, leaving `locals` itself un-chained, while `getCompany`
  * (`company.ts:14`) writes `locals?.[':Company']?.…`. The bare global must therefore exist for
- * all three, which the harness guarantees (`src/test/setup.ts:601`). That asymmetry is existing,
+ * all three, which the harness guarantees (`src/test/setup.ts`). That asymmetry is existing,
  * authoritative behaviour: this suite documents it and does not harmonise it, so the
  * cache-absent tests below replace the map rather than removing the binding.
  *
@@ -58,7 +58,7 @@
  *    untyped: `lib/company.ts` (3), `lib/currency.ts` (4), `hooks/useDocType.ts` (2),
  *    `main.tsx` (4). Typing it would orphan all thirteen and fail the build with TS2578. The
  *    tests that vary the cache reach it through the same untyped `globalThis` cast
- *    `src/test/setup.ts:598` uses, which carries no type information.
+ *    `src/test/setup.ts` uses, which carries no type information.
  *  - Imports are limited to `vitest` and the subject. These are pure functions over a global the
  *    harness already installs, so the suite needs no DOM utilities, no fixture builder and no
  *    module stubbing. Expected values are declared locally, mirroring the harness, each cited to
@@ -72,7 +72,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { getCompany, getCompanyCostCenter, getCompanyCurrency } from '@/lib/company'
 
 /* ── The harness contract these assertions mirror ────────────────────────────────────
- * `src/test/setup.ts:423-445` builds `locals` from a declared document set using the production
+ * `src/test/setup.ts` builds `locals` from a declared document set using the production
  * `add_to_locals` rule, and registers exactly ONE `:Company` document — so that record is the
  * entire universe these readers can resolve, and every other name is a guaranteed miss.
  *
@@ -89,10 +89,10 @@ import { getCompany, getCompanyCostCenter, getCompanyCurrency } from '@/lib/comp
  */
 const TEST_COMPANY = 'Test Company'
 
-/** `src/test/setup.ts:77`, stamped onto the record at `src/test/setup.ts:404`. */
+/** `src/test/setup.ts:77`, stamped onto the record at `src/test/setup.ts`. */
 const EXPECTED_DEFAULT_CURRENCY = 'INR'
 
-/** `src/test/setup.ts:73`, stamped onto the record at `src/test/setup.ts:405`. */
+/** `src/test/setup.ts:73`, stamped onto the record at `src/test/setup.ts`. */
 const EXPECTED_COST_CENTER = 'Main - TC'
 
 /** A name the boot payload never carried, so all three readers must miss on it. */
@@ -103,9 +103,9 @@ const UNKNOWN_COMPANY = 'Nonexistent Company'
  * the `:Company` key — the state a page reaches when the boot payload carried no company
  * documents at all.
  *
- * The global is reached through the same untyped cast `src/test/setup.ts:598` uses, for the
+ * The global is reached through the same untyped cast `src/test/setup.ts` uses, for the
  * reason given in the header. The harness re-points the global in its own `beforeEach`
- * (`src/test/setup.ts:688,692`), so the restore below is a second line of defence rather than
+ * (`src/test/setup.ts,692`), so the restore below is a second line of defence rather than
  * the only one; it is unconditional and restores the very object the harness installed, which
  * keeps this suite order-independent and unable to leak into `currency.test.ts`, which reads the
  * same map.
@@ -200,7 +200,7 @@ describe('getCompany', () => {
 
 	/*
 	 * Asserted structurally, deliberately not by exact equality. The harness stamps FIVE fields
-	 * onto the record (`src/test/setup.ts:401-407`: `doctype`, `name`, `default_currency`,
+	 * onto the record (`src/test/setup.ts`: `doctype`, `name`, `default_currency`,
 	 * `cost_center`, `country`) and a live Desk `locals` carries more still, so a whole-object
 	 * literal would pin the fixture's shape instead of this reader's contract and would break the
 	 * moment the harness grew a field. What matters is that the record the field readers project

@@ -1,8 +1,7 @@
 import BankPicker from "@/components/features/BankReconciliation/BankPicker"
-import { bankRecErrorDialogAtom, bankRecImportFailuresAtom, bankRecPreLogImportFailuresAtom, preLogImportFailureKey, selectedBankAccountAtom } from "@/components/features/BankReconciliation/bankRecAtoms"
+import { bankRecErrorDialogAtom, bankRecImportFailuresAtom, selectedBankAccountAtom } from "@/components/features/BankReconciliation/bankRecAtoms"
 import BankRecErrorDialog from "@/components/features/BankReconciliation/BankRecErrorDialog"
 import CompanySelector from "@/components/features/BankReconciliation/CompanySelector"
-import { readErrorText } from "@/components/features/BankReconciliation/utils"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
@@ -23,7 +22,7 @@ import { BankStatementImportLog } from "@/types/Accounts/BankStatementImportLog"
 import { useFrappeCreateDoc, useFrappeDeleteDoc, useFrappeFileUpload, useFrappeGetDocList, useFrappeUpdateDoc, type FrappeError } from "frappe-react-sdk"
 import { useAtom, useAtomValue, useSetAtom } from "jotai"
 import { ListIcon, Loader2Icon } from "lucide-react"
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { useNavigate } from "react-router"
 import { toast } from "sonner"
 
@@ -57,7 +56,6 @@ const BankStatementImporter = () => {
     const { deleteDoc } = useFrappeDeleteDoc()
 
     const setErrorDialog = useSetAtom(bankRecErrorDialogAtom)
-    const setPreLogFailures = useSetAtom(bankRecPreLogImportFailuresAtom)
 
     /**
      * Points the uploaded private `File` at the import log the server minted, retrying ONCE, and
@@ -141,23 +139,9 @@ const BankStatementImporter = () => {
         uploadInFlight.current = true
         setIsChainRunning(true)
 
-        // Captured now: both are free to change under the reviewer while the chain is in flight, and
-        // every step below - including the failure record - must describe the attempt that was made.
+        // Captured now: it is free to change under the reviewer while the chain is in flight, and every
+        // step below must describe the attempt that was actually made.
         const bankAccountName = selectedBankAccount.name
-        const failureKey = preLogImportFailureKey(bankAccountName, file)
-
-        /*
-         * FM2: a retry retires the previous verdict about this exact account/file pair before the new
-         * attempt runs, for the same reason the import step does it - a marker records one observation
-         * of one refusal, and leaving it up while a fresh attempt is in flight asserts a failure that is
-         * being actively re-tested.
-         */
-        setPreLogFailures((previous) => {
-            if (!previous.has(failureKey)) return previous
-            const next = new Map(previous)
-            next.delete(failureKey)
-            return next
-        })
 
         // For protected PDFs, persist the password on the Bank Account so it is reused for
         // every statement of this account (and is available before the import doc is created).
@@ -219,8 +203,21 @@ const BankStatementImporter = () => {
                     throw createError
                 })
             })
-        ).then(({ uploaded, doc }) =>
+        ).then(
             /*
+             * EVERYTHING FROM HERE ON RUNS WITH AN IMPORT LOG THAT EXISTS, and it is deliberately inside
+             * the FULFILMENT handler of the same `.then` whose REJECTION handler reports a pre-log
+             * refusal. That pairing is the fix, and the ordering is the whole of it.
+             *
+             * The rejection handler used to be attached AFTER this step, as a trailing
+             * `.then(undefined, handler)`. A promise rejection handler sees everything that rejects
+             * EARLIER IN THE CHAIN THAN ITSELF - so despite the comment that once claimed otherwise, that
+             * handler also caught faults thrown HERE: a `toast.warning` that failed to render, or a
+             * `navigate` that threw. Each of those would have been reported as a refusal of the upload,
+             * for a `Bank Statement Import Log` the server had already created. Pairing the two handlers
+             * on the SAME `.then` makes the rejection handler structurally incapable of seeing them,
+             * because a fulfilment handler's own faults never reach its sibling.
+             *
              * F-15, second half: point the private `File` at the name the SERVER chose.
              * `File.validate_attachment_references` permits exactly this update, and it is what makes
              * the statement appear among the log's attachments and share its lifecycle.
@@ -230,50 +227,71 @@ const BankStatementImporter = () => {
              * importable and blocking here would strand a reviewer whose upload in fact succeeded. But it
              * is not nothing either, and it used to be swallowed into a development-only console line:
              * the statement then sits outside the log's attachment list, so deleting the log does not
-             * take it with it, and nobody is in a position to know. So the failure is now surfaced as an
+             * take it with it, and nobody is in a position to know. So the failure is surfaced as an
              * actionable warning naming the log, which is the identity a reviewer or administrator needs
-             * to finish the job by hand. No per-file FAILED marker is written, because nothing the
-             * reviewer asked for was refused.
+             * to finish the job by hand.
              */
-            relinkStatementFile(uploaded.name, doc.name).then((relinked) => {
-                if (!relinked) {
-                    toast.warning(_("The statement file could not be linked to its import log."), {
-                        duration: 8000,
-                        description: _("The import itself is unaffected and can proceed. Ask an administrator to attach the file to import log {0} so it is removed with it.", [doc.name])
-                    })
-                }
+            ({ uploaded, doc }) => relinkStatementFile(uploaded.name, doc.name)
+                .then((relinked) => {
+                    if (!relinked) {
+                        toast.warning(_("The statement file could not be linked to its import log."), {
+                            duration: 8000,
+                            description: _("The import itself is unaffected and can proceed. Ask an administrator to attach the file to import log {0} so it is removed with it.", [doc.name])
+                        })
+                    }
 
-                navigate(`/statement-importer/${doc.name}`)
-            })
-        ).then(undefined, (error: FrappeError) => {
-            /*
-             * F-03. This chain previously had NO rejection handler at all, so every refusal reachable
-             * before a log exists - insufficient permission (the DocType is System Manager only), an
-             * invalid or disabled bank account, a file the storage layer would not take, an empty or
-             * unreadable statement, a wrong PDF password - produced nothing but whichever generic hook
-             * banner happened to be rendered, and left no per-file record whatsoever. FM2 requires the
-             * import status view to indicate failure PER FILE, and before this there was no file to
-             * indicate against.
-             *
-             * Attached as the second argument of `.then` rather than as a trailing `.catch`, for the
-             * same reason as the import step: a trailing `.catch` would also swallow a fault thrown by
-             * the navigation above and report a successful upload as a refused one.
-             *
-             * The error reaches the dialog UNMODIFIED so `ErrorBanner` parses `_server_messages` itself
-             * and the backend's own wording is what the reviewer reads; the SAME parsed text is stored
-             * on the marker, so the chip's tooltip and the dialog cannot disagree.
-             */
-            setErrorDialog(error)
-            setPreLogFailures((previous) => {
-                const next = new Map(previous)
-                next.set(failureKey, {
-                    bankAccount: bankAccountName,
-                    fileName: file.name,
-                    message: readErrorText(error)
+                    navigate(`/statement-importer/${doc.name}`)
                 })
-                return next
-            })
-        }).finally(() => {
+                .catch((postCreateFault: unknown) => {
+                    /*
+                     * A CLIENT FAULT WITH THE LOG ALREADY CREATED. `relinkStatementFile` never rejects, so
+                     * anything arriving here came from the warning render or from the navigation - and the
+                     * statement IS stored and IS importable either way.
+                     *
+                     * It is reported as a warning naming the log, never as an upload refusal, and it does
+                     * NOT open the shared error dialog: that surface is for errors the SERVER raised, and
+                     * nothing here was refused. The log's name is the one thing the reviewer needs, since
+                     * the automatic hand-off is what failed.
+                     */
+                    if (import.meta.env.DEV) {
+                        console.warn('[bank-rec] import log created, hand-off failed', {
+                            import_log: doc.name,
+                            fault: postCreateFault instanceof Error ? postCreateFault.name : typeof postCreateFault
+                        })
+                    }
+
+                    toast.warning(_("The statement was uploaded, but this page could not open it."), {
+                        duration: 8000,
+                        closeButton: true,
+                        description: _("Import log {0} was created and can be opened from the list below.", [doc.name])
+                    })
+                }),
+            (error: FrappeError) => {
+                /*
+                 * F-03, AND ONLY REFUSALS REACHED BEFORE A LOG EXISTS. This chain previously had NO
+                 * rejection handler at all, so every refusal reachable here - insufficient permission (the
+                 * DocType is System Manager only), an invalid or disabled bank account, a file the storage
+                 * layer would not take, an empty or unreadable statement, a wrong PDF password - produced
+                 * nothing but whichever generic hook banner happened to be rendered.
+                 *
+                 * Paired with the fulfilment handler above rather than attached after it, so it cannot see
+                 * a post-create client fault; see that handler's note for why the previous position was
+                 * wrong. Every rejection that DOES arrive here comes from the passphrase save, the upload,
+                 * or the log insert - the three steps that run before any log exists.
+                 *
+                 * The error reaches the dialog UNMODIFIED so `ErrorBanner` parses `_server_messages` itself
+                 * and the backend's own wording is what the reviewer reads.
+                 *
+                 * NO per-file marker is written here, and the omission is deliberate. FM2's indicator is
+                 * specified as per import log and is keyed by log name; a refusal reachable before the log
+                 * exists has no log to be keyed by, and the row it would attach to is exactly what failed
+                 * to come into being. The dismissible dialog IS the report for those refusals - it carries
+                 * the server's own words, and the importer list below then shows the truth, which is that
+                 * no statement was added.
+                 */
+                setErrorDialog(error)
+            }
+        ).finally(() => {
             // Released on BOTH outcomes: a chain that failed must be retryable, and one that succeeded
             // has already navigated away.
             uploadInFlight.current = false
@@ -500,12 +518,6 @@ const StatementImportLog = () => {
      */
     const [importFailures, setImportFailures] = useAtom(bankRecImportFailuresAtom)
 
-    /*
-     * F-03: the failures that never reached a log. Filtered to the account on screen, because the key
-     * is account-scoped and a refusal recorded against another bank account says nothing about this one.
-     */
-    const preLogFailures = useAtomValue(bankRecPreLogImportFailuresAtom)
-
     const { data, error } = useFrappeGetDocList<BankStatementImportLog>("Bank Statement Import Log", {
         /*
          * F-13: `currency` is projected because the closing balance below is formatted with it. It was
@@ -550,13 +562,6 @@ const StatementImportLog = () => {
         })
     }, [data, setImportFailures])
 
-    const preLogRows = useMemo(
-        () => bankAccount
-            ? [...preLogFailures].filter(([, failure]) => failure.bankAccount === bankAccount.name)
-            : [],
-        [preLogFailures, bankAccount]
-    )
-
     const navigate = useNavigate()
 
     const onViewDetails = (name: string) => {
@@ -569,7 +574,7 @@ const StatementImportLog = () => {
 
             {error && <ErrorBanner error={error} />}
 
-            {(data && data.length > 0) || preLogRows.length > 0 ? (
+            {data && data.length > 0 ? (
 
                 <Table>
                     <TableHeader>
@@ -583,27 +588,6 @@ const StatementImportLog = () => {
                         </TableRow>
                     </TableHeader>
                     <TableBody>
-                        {/*
-                          * F-03: the upload attempts that never became logs, listed FIRST because they
-                          * are the most recent thing that happened and the list is newest-first.
-                          *
-                          * Every server-owned cell reads "-" rather than a fabricated value: there is no
-                          * import date, no transaction range, no count and no closing balance, because
-                          * there is no document. The file name is plain text rather than a link for the
-                          * same reason - on the paths that fail before or during the upload there may be
-                          * no stored file to link to, and offering one would invite a dead download. The
-                          * row is not click-through either: there is nothing to open.
-                          */}
-                        {preLogRows.map(([key, failure]) => (
-                            <TableRow key={key} className="bg-surface-red-1">
-                                <TableCell className="text-ink-gray-5">-</TableCell>
-                                <TableCell><ImportStatusBadge status="Not Started" failureMessage={failure.message} /></TableCell>
-                                <TableCell className="text-ink-gray-5">-</TableCell>
-                                <TableCell className="text-end text-ink-gray-5">-</TableCell>
-                                <TableCell className="text-end text-ink-gray-5">-</TableCell>
-                                <TableCell className="text-ink-gray-6">{failure.fileName}</TableCell>
-                            </TableRow>
-                        ))}
                         {data?.map((item) => (
                             <TableRow key={item.name} onClick={() => onViewDetails(item.name)} className="cursor-pointer hover:bg-surface-gray-2">
                                 <TableCell>{formatDate(item.creation, 'Do MMM YYYY')}</TableCell>

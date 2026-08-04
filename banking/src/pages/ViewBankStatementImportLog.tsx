@@ -22,10 +22,22 @@ const ViewBankStatementImportLog = () => {
 
     const direction = useDirection()
 
-    if (!data || !data.message) {
-        return null
-    }
-
+    /*
+     * GUARD ORDER: loading -> error -> no data, and it has to be that way round.
+     *
+     * `useFrappeGetCall` reports `data` as `undefined` for a read that is still pending AND for one that
+     * was refused, so "no data" is the WEAKEST of the three conditions and says nothing on its own.
+     * Testing it first - as this component used to - meant a refused `get_statement_details` returned
+     * `null` before the error branch was ever reached: the reviewer saw a completely blank page, with no
+     * message explaining the refusal and no way back to the list. Insufficient permission on
+     * `Bank Statement Import Log` (the DocType is System Manager only) and a deleted or renamed log both
+     * land there.
+     *
+     * Ordering the guards by decreasing information puts each answer under the condition that actually
+     * implies it: a pending read renders the loader, a refused one renders the server's own message with
+     * a Back control, and only a settled, successful read with nothing in it falls through to the last
+     * branch.
+     */
     if (isLoading) {
         return <div>Loading...</div>
     }
@@ -43,6 +55,11 @@ const ViewBankStatementImportLog = () => {
             <ErrorBanner error={error} />
         </div>
     }
+
+    if (!data || !data.message) {
+        return null
+    }
+
     const isPdf = data.message.doc.file?.toLowerCase().endsWith('.pdf')
 
     if (isPdf) {

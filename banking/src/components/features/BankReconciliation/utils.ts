@@ -1,5 +1,5 @@
-import { ActionLog, bankRecActionLog, bankRecAmountFilter, bankRecDateAtom, bankRecErrorDialogAtom, bankRecMatchFilters, bankRecReconcileInFlightAtom, bankRecSearchText, bankRecSelectedTransactionAtom, bankRecTransactionTypeFilter, bankRecUnreconcileModalAtom, SelectedBank, selectedBankAccountAtom } from './bankRecAtoms'
-import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
+import { ActionLog, bankRecActionLog, bankRecAmountFilter, bankRecDateAtom, bankRecErrorDialogAtom, bankRecMatchFilters, bankRecSearchText, bankRecSelectedTransactionAtom, bankRecTransactionTypeFilter, bankRecUnreconcileModalAtom, SelectedBank, selectedBankAccountAtom } from './bankRecAtoms'
+import { atom, useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
 import { useEffect, useMemo } from 'react'
 import { FrappeError, SWRConfiguration, useFrappeGetCall, useFrappeGetDoc, useFrappePostCall, useSWRConfig } from 'frappe-react-sdk'
 import { BankTransaction } from '@/types/Accounts/BankTransaction'
@@ -366,6 +366,36 @@ export const useRefreshUnreconciledTransactions = () => {
 
 }
 
+/**
+ * The `Bank Transaction` a `reconcile_vouchers` post is CURRENTLY IN FLIGHT for, or `null` when none
+ * is. It is the single-flight guard for the only financial write this feature performs (FM1's "no
+ * partial or duplicate postings"), and it lives HERE, beside the hook that owns it, rather than in the
+ * feature's atom store: it is not feature state a screen reads, it is one internal detail of
+ * {@link useReconcileTransaction}, and the atom store's addition is exactly the two atoms the plan
+ * prescribes.
+ *
+ * WHY IT CANNOT BE HOOK STATE. `useFrappePostCall` exposes a `loading` flag, and that flag is per HOOK
+ * INSTANCE - but every candidate voucher row calls the hook for itself, so each row owns a private
+ * `loading` and learns nothing about any other row's request. A reviewer could therefore start a post
+ * from the suggested match and, while it was still open, start a SECOND post for the same transaction
+ * from another candidate. Both would be accepted by the client and both would reach the server, which
+ * allocates against whatever the transaction still has unallocated at the moment each arrives - so the
+ * outcome depended on interleaving rather than on intent. Lifting "a post is open" into shared state is
+ * what makes that impossible, because every row reads the same value.
+ *
+ * It holds a NAME rather than a boolean so the guard can be reported and asserted precisely, and so a
+ * stale release from an unrelated transaction cannot silence a fresh one.
+ *
+ * PLAIN IN-MEMORY: it describes one request that is open right now, and a reload cannot leave a request
+ * open, so a persisted value could only ever be a lie that permanently disabled the affordance.
+ *
+ * NOTE FOR CALLERS: reading this through `useAtomValue` is correct for RENDERING the disabled state,
+ * but it is NOT sufficient for the guard itself - a React state read is a snapshot of the last render,
+ * so two clicks dispatched in one tick would both see `null`. The hook therefore check-and-sets it
+ * SYNCHRONOUSLY through the jotai store (`useStore`), which is the only read that cannot be stale.
+ */
+export const bankRecReconcileInFlightAtom = atom<string | null>(null)
+
 export const useReconcileTransaction = () => {
 
     const { call, loading } = useFrappePostCall<{ message: BankTransaction }>('erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.reconcile_vouchers')
@@ -406,6 +436,22 @@ export const useReconcileTransaction = () => {
     const store = useStore()
     const inFlight = useAtomValue(bankRecReconcileInFlightAtom)
 
+    /**
+     * Re-reads the two lists whose rows drive the already-reconciled guard, so the transaction's true
+     * server state replaces whatever the client is holding.
+     *
+     * The key strings are the ones `useGetUnreconciledTransactions` and `useGetBankTransactions`
+     * construct above and must stay character-identical to them; no new cache-key family is introduced.
+     * Rejections are swallowed individually: this is a recovery, so a refresh that fails must not throw
+     * out of the handler that called it and abandon the rest of it.
+     */
+    const revalidateTransactionReads = () => {
+        mutate(`bank-reconciliation-unreconciled-transactions-${selectedBank?.name}-${dates.fromDate}-${dates.toDate}`)
+            .catch(() => { /* a failed refresh changes nothing the caller depends on */ })
+        mutate(`bank-reconciliation-bank-transactions-${selectedBank?.name}-${dates.fromDate}-${dates.toDate}`)
+            .catch(() => { /* as above */ })
+    }
+
     const reconcileTransaction = (transaction: UnreconciledTransaction, voucher: LinkedPayment) => {
 
         // Refuse rather than queue. A second post is not a request the reviewer needs served later -
@@ -430,37 +476,87 @@ export const useReconcileTransaction = () => {
                 "amount": voucher.paid_amount
             }])
         }).then((res) => {
-            addToActionLog({
-                type: 'match',
-                timestamp: (new Date()).getTime(),
-                isBulk: false,
-                items: [
-                    {
-                        bankTransaction: res.message,
-                        voucher: {
-                            reference_doctype: voucher.doctype,
-                            reference_name: voucher.name,
-                            reference_no: voucher.reference_no,
-                            reference_date: voucher.reference_date,
-                            posting_date: voucher.posting_date,
-                        }
-                    }
-                ]
-            })
-            onReconcileTransaction(transaction, res.message)
-            toast.success(_("Reconciled"), {
-                duration: 4000,
-                closeButton: true,
-                action: {
-                    label: _("Undo"),
-                    onClick: () => setBankRecUnreconcileModalAtom(transaction.name)
-                },
-                actionButtonStyle: {
-                    backgroundColor: "rgb(0, 138, 46)"
-                }
-            })
-        }).catch((error) => {
             /*
+             * THE SERVER HAS ACCEPTED AND COMMITTED. Everything below is bookkeeping on the client, and
+             * every line of it can throw: `addToActionLog` writes to `sessionStorage`, which throws on a
+             * quota overrun or when storage is denied; `onReconcileTransaction` reads the SWR cache and
+             * re-selects a row; `toast.success` renders.
+             *
+             * A single `try` around the whole block, rather than a trailing `.catch` on the promise, is
+             * what keeps those faults out of the refusal handler below - see the comment on that handler
+             * for why routing them there was actively wrong. The reconciliation IS recorded whatever
+             * happens here, so the fault is reported as a client-side warning and the authoritative reads
+             * are refreshed; the transaction's true state then comes from the server, not from this
+             * bookkeeping.
+             */
+            try {
+                addToActionLog({
+                    type: 'match',
+                    timestamp: (new Date()).getTime(),
+                    isBulk: false,
+                    items: [
+                        {
+                            bankTransaction: res.message,
+                            voucher: {
+                                reference_doctype: voucher.doctype,
+                                reference_name: voucher.name,
+                                reference_no: voucher.reference_no,
+                                reference_date: voucher.reference_date,
+                                posting_date: voucher.posting_date,
+                            }
+                        }
+                    ]
+                })
+                onReconcileTransaction(transaction, res.message)
+                toast.success(_("Reconciled"), {
+                    duration: 4000,
+                    closeButton: true,
+                    action: {
+                        label: _("Undo"),
+                        onClick: () => setBankRecUnreconcileModalAtom(transaction.name)
+                    },
+                    actionButtonStyle: {
+                        backgroundColor: "rgb(0, 138, 46)"
+                    }
+                })
+            } catch (clientFault) {
+                if (import.meta.env.DEV) {
+                    console.error('[bank-rec] reconcile_vouchers committed, client bookkeeping failed', {
+                        bank_transaction: transaction.name,
+                        fault: clientFault instanceof Error ? clientFault.name : typeof clientFault
+                    })
+                }
+
+                /*
+                 * Deliberately NOT an error, and deliberately NOT the error dialog. The server accepted
+                 * the post, so telling the reviewer it was refused would be false and would invite a
+                 * second post against a transaction that has already been allocated against. The wording
+                 * says exactly what is known: it was recorded, and the screen may be behind.
+                 */
+                toast.warning(_("Reconciled, but this screen could not be updated."), {
+                    duration: 8000,
+                    closeButton: true,
+                    description: _("The reconciliation was recorded by the server. Refresh to see the current status.")
+                })
+
+                // The one recovery that is always safe: re-read the authoritative lists so the row's
+                // real state replaces whatever this render was left holding.
+                revalidateTransactionReads()
+            }
+        }, (error: FrappeError) => {
+            /*
+             * THE SERVER'S REFUSAL, and NOTHING ELSE.
+             *
+             * Attached as the SECOND argument of `.then` rather than as a trailing `.catch`, and the
+             * distinction is load-bearing rather than stylistic. A trailing `.catch` also catches
+             * anything the success handler above throws - a `sessionStorage` write refused on a quota
+             * overrun is a realistic trigger - so a client-side fault AFTER the server had ACCEPTED and
+             * COMMITTED the reconciliation was reported here as a server refusal: the dialog claimed the
+             * post had failed, the selection was cleared as contradicted, and the reviewer was invited to
+             * try again against a transaction that had in fact already been allocated against. This
+             * handler now sees rejections of the RPC and nothing else, which is what makes every
+             * statement below mean what it says.
+             *
              * A FIXED, redacted diagnostic (CWE-532/CWE-209). This used to be `console.error(error)`,
              * which dumped the whole `FrappeError` - including `exc`, the server's full Python
              * traceback, and `exception`, which names the failing module and line. A browser console
@@ -520,17 +616,9 @@ export const useReconcileTransaction = () => {
              */
             setSelectedTransaction([])
 
-            /*
-             * Revalidate the two reads whose rows drive the already-reconciled guard. The key strings
-             * are the ones `useGetUnreconciledTransactions` and `useGetBankTransactions` construct
-             * above and must stay character-identical to them; no new cache-key family is introduced.
-             * Rejections are swallowed for the same reason as above - the affordance is already
-             * closed, so a failed refresh has nothing left to protect.
-             */
-            mutate(`bank-reconciliation-unreconciled-transactions-${selectedBank?.name}-${dates.fromDate}-${dates.toDate}`)
-                .catch(() => { /* refresh failure changes nothing: the selection is already cleared */ })
-            mutate(`bank-reconciliation-bank-transactions-${selectedBank?.name}-${dates.fromDate}-${dates.toDate}`)
-                .catch(() => { /* as above */ })
+            // Revalidate the two authoritative reads, so the refreshed rows - and the guard they drive -
+            // reflect the state the server has just asserted rather than the snapshot it contradicted.
+            revalidateTransactionReads()
         }).finally(() => {
             /*
              * Released on BOTH outcomes, and only here. Releasing in the success handler alone would

@@ -58,7 +58,7 @@
  *  - anything under `frappe` is written through `window.frappe`, which needs no cast because
  *    it is already `any`;
  *  - `locals` has no `Window` declaration, so it is reached through the same untyped
- *    `globalThis` cast `src/test/setup.ts:598` itself uses, which carries no type
+ *    `globalThis` cast `src/test/setup.ts` itself uses, which carries no type
  *    information.
  *
  * `frappe.boot` is FALSIFIED, never removed, and `locals` is REPLACED, never deleted:
@@ -69,7 +69,7 @@
  * Every mutation captures the value it displaces FIRST and restores that captured value in
  * an `afterEach` owned by the narrowest `describe` that needs it, so no test restores state
  * it never touched. The harness rebuilds this runtime in its own `beforeEach`
- * (`src/test/setup.ts:692`) and again in its `afterEach` (`src/test/setup.ts:835`), so these
+ * (`src/test/setup.ts`) and again in its `afterEach` (`src/test/setup.ts`), so these
  * restores are a second line of defence rather than the only one — which is precisely why
  * they are unconditional: the suite stays order-independent and cannot leak into
  * `company.test.ts`, which reads the same document cache.
@@ -88,7 +88,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { getCurrencyNumberFormat, getCurrencyProperty, getCurrencySymbol } from '@/lib/currency'
 
 /* ── The harness contract these assertions mirror ────────────────────────────────────
- * `src/test/setup.ts:415-427` builds the document cache from a declared set using the
+ * `src/test/setup.ts` builds the document cache from a declared set using the
  * production `add_to_locals` rule and registers exactly TWO `:Currency` documents — so those
  * two are the entire universe these readers can resolve, and every other code is a
  * guaranteed miss.
@@ -99,24 +99,24 @@ import { getCurrencyNumberFormat, getCurrencyProperty, getCurrencySymbol } from 
  * harness change fails loudly here and points straight at its own cause.
  * ────────────────────────────────────────────────────────────────────────────────── */
 
-/** `src/test/setup.ts:77`, registered as a `:Currency` document at `src/test/setup.ts:425`. */
+/** `src/test/setup.ts:77`, registered as a `:Currency` document at `src/test/setup.ts`. */
 const TEST_CURRENCY = 'INR'
 
-/** The symbol stamped onto that document at `src/test/setup.ts:425`. */
+/** The symbol stamped onto that document at `src/test/setup.ts`. */
 const EXPECTED_SYMBOL = '₹'
 
 /**
- * `src/test/setup.ts:78`, registered at `src/test/setup.ts:426`. A SECOND currency exists in
+ * `src/test/setup.ts:78`, registered at `src/test/setup.ts`. A SECOND currency exists in
  * the fixture on purpose: without it, nothing could distinguish a reader that resolves per
  * currency from one that returns the site default for everything — and that distinction is
  * what the workbench's currency-mismatch advisory depends on.
  */
 const ALTERNATE_CURRENCY = 'USD'
 
-/** The symbol stamped onto that document at `src/test/setup.ts:426`. */
+/** The symbol stamped onto that document at `src/test/setup.ts`. */
 const EXPECTED_ALTERNATE_SYMBOL = '$'
 
-/** `src/test/setup.ts:84`, stamped onto BOTH currency documents at `src/test/setup.ts:420`. */
+/** `src/test/setup.ts:84`, stamped onto BOTH currency documents at `src/test/setup.ts`. */
 const EXPECTED_NUMBER_FORMAT = '#,###.##'
 
 /** A code the boot payload never carried, so every reader must miss on it. */
@@ -128,24 +128,24 @@ const UNKNOWN_CURRENCY = 'XXX'
  */
 const SYMBOLS_HIDDEN = 'Yes'
 
-/** What `src/test/setup.ts:516` actually installs, and what must NOT suppress anything. */
+/** What `src/test/setup.ts` actually installs, and what must NOT suppress anything. */
 const SYMBOLS_SHOWN = 'No'
 
 /* ── Reaching the two bare globals ───────────────────────────────────────────────────
  * Both captures happen at module load, before any test in this file can reassign them, and
  * both target bindings whose identity the harness preserves across its own resets: it
- * re-points `frappe.boot` at the same object (`src/test/setup.ts:680`) and rebuilds the
- * document cache in place rather than replacing it (`src/test/setup.ts:633-640`). Restoring
+ * re-points `frappe.boot` at the same object (`src/test/setup.ts`) and rebuilds the
+ * document cache in place rather than replacing it (`src/test/setup.ts`). Restoring
  * the captured reference therefore restores the very object the harness installed, rather
  * than a payload reconstructed here that could silently diverge from it.
  * ────────────────────────────────────────────────────────────────────────────────── */
 
 const globalScope = globalThis as unknown as Record<string, unknown>
 
-/** The document cache `src/test/setup.ts:601` installs. */
+/** The document cache `src/test/setup.ts` installs. */
 const INSTALLED_LOCALS = globalScope.locals
 
-/** The boot payload `src/test/setup.ts:584` installs, via a property already typed `any`. */
+/** The boot payload `src/test/setup.ts` installs, via a property already typed `any`. */
 const INSTALLED_BOOT = window.frappe.boot
 
 describe('getCurrencySymbol', () => {
@@ -156,7 +156,7 @@ describe('getCurrencySymbol', () => {
 	 * QUIRK 1. The comparison is a loose `==` against the STRING "Yes". It is asserted from
 	 * both sides because each side fails differently: a truthiness test in its place would
 	 * suppress the symbol for the installed `'No'` as well, and a stricter comparison would
-	 * stop suppressing it for the live `'0'` that `src/test/setup.ts:866` records. Only the
+	 * stop suppressing it for the live `'0'` that `src/test/setup.ts` records. Only the
 	 * `'Yes'` / `'No'` pair distinguishes the implementation that exists from both.
 	 */
 	describe('when the site hides currency symbols', () => {
@@ -164,7 +164,7 @@ describe('getCurrencySymbol', () => {
 		/**
 		 * Re-read for every test rather than captured once at module load, because the
 		 * harness replaces the whole `sysdefaults` OBJECT in its own `beforeEach`
-		 * (`src/test/setup.ts:674`) — so this holds the value belonging to the object THIS
+		 * (`src/test/setup.ts`) — so this holds the value belonging to the object THIS
 		 * test was handed, and the restore below cannot write onto a stale one.
 		 */
 		let installedSuppressionSetting: unknown
@@ -308,7 +308,7 @@ describe('getCurrencySymbol', () => {
 	 * module divides sharply: a named currency still resolves, and an empty argument throws.
 	 *
 	 * This pair is asserted because it is the whole justification for the harness installing
-	 * `sysdefaults.currency` (`src/test/setup.ts:514`, whose own comment cites this line).
+	 * `sysdefaults.currency` (`src/test/setup.ts`, whose own comment cites this line).
 	 * Pinning the throw records the real contract rather than wishing the read were chained —
 	 * adding that chaining is a change to the subject, which is out of bounds here.
 	 */
@@ -396,7 +396,7 @@ describe('getCurrencyProperty', () => {
 	/*
 	 * QUIRK — `symbol_on_right` is the NUMBER 0, which is FALSY, and it must survive as 0
 	 * rather than being coerced or defaulted. Verified against a live site and recorded at
-	 * `src/test/setup.ts:849-850`.
+	 * `src/test/setup.ts`.
 	 *
 	 * The literal `0` is written inline, and the matcher is an identity matcher, on purpose.
 	 * A truthiness matcher would pass just as happily for `undefined`, `false` or `''`, and

@@ -26,11 +26,40 @@ export interface SelectedBank extends Pick<BankAccount, 'name' | 'bank' | 'is_cr
      */
     account_currency?: string | null
 }
-export const selectedBankAccountAtom = atomWithStorage<SelectedBank | null>('bank-rec-selected-bank', null, undefined, {
+
+/**
+ * Namespaces a browser-storage key with the site and the signed-in user.
+ *
+ * WHY THE KEYS ARE SCOPED. Everything this feature persists is financial metadata about a specific
+ * person's work: the selected bank account carries its GL account, company and `bank_account_no`, and
+ * the action log carries transaction and voucher identifiers. `localStorage` and `sessionStorage` are
+ * keyed by ORIGIN, not by session, so an unscoped key is shared by every user who signs in to the same
+ * Frappe site from the same browser - and by every site served from that origin. A second reviewer on
+ * a shared workstation would read the first one's selection and history until something overwrote it,
+ * and a reviewer with access to two companies' sites on one host would cross them over.
+ *
+ * Scoping the key is what makes each of those a different entry rather than the same one. It is
+ * additive: the storage mechanism, the shapes and the defaults are unchanged, so the only observable
+ * effect is that state stops being shared between users - a previous user's entry is simply never read
+ * again, and is left for the browser's own storage lifecycle to reclaim rather than being deleted from
+ * under a session that may still be open in another tab.
+ *
+ * Read at module load, which is safe: `index.html` parses the Frappe boot payload into
+ * `window.frappe.boot` before `main.tsx` mounts, and `App.tsx` refuses to render for a `Guest`. The
+ * fallbacks exist only so a missing boot cannot throw here and take the whole feature down with it;
+ * they resolve to a namespace no signed-in user shares.
+ */
+const scopedStorageKey = (base: string): string => {
+    const site = window.frappe?.boot?.sitename ?? 'unknown-site'
+    const user = window.frappe?.boot?.user?.name ?? 'unknown-user'
+    return `${base}::${site}::${user}`
+}
+
+export const selectedBankAccountAtom = atomWithStorage<SelectedBank | null>(scopedStorageKey('bank-rec-selected-bank'), null, undefined, {
     getOnInit: true
 })
 
-export const bankRecDateAtom = atomWithStorage<{ fromDate: string, toDate: string }>("bank-rec-date", {
+export const bankRecDateAtom = atomWithStorage<{ fromDate: string, toDate: string }>(scopedStorageKey("bank-rec-date"), {
     fromDate: getDatesForTimePeriod('This Month').fromDate,
     toDate: getDatesForTimePeriod('This Month').toDate
 })
@@ -55,7 +84,7 @@ export const bankRecRecordJournalEntryModalAtom = atom(false)
 
 export const bankRecUnreconcileModalAtom = atom<string>('')
 
-export const bankRecMatchFilters = atomWithStorage<string[]>('bank-rec-match-filters', ['payment_entry', 'journal_entry'])
+export const bankRecMatchFilters = atomWithStorage<string[]>(scopedStorageKey('bank-rec-match-filters'), ['payment_entry', 'journal_entry'])
 
 export const bankRecSearchText = atom<string>('')
 export const bankRecAmountFilter = atom<{ value: number, stringValue?: string | number }>({
@@ -95,55 +124,21 @@ export interface ActionLogItem {
 
 const actionLogStorage = createJSONStorage<ActionLog[]>(() => sessionStorage)
 
-export const bankRecActionLog = atomWithStorage<ActionLog[]>('bank-rec-action-log', [], actionLogStorage, {
+export const bankRecActionLog = atomWithStorage<ActionLog[]>(scopedStorageKey('bank-rec-action-log'), [], actionLogStorage, {
     getOnInit: true,
 })
 
 /* ================================================================================================
- * Failure-path state (FM1, FM2, FM3)
+ * Failure-path state (FM1, FM2)
  *
- * PERSISTENCE. Every construct below is a PLAIN IN-MEMORY atom, and that deliberately diverges from
- * every atom above it: the bank selection, date range and match filters are `atomWithStorage` over
- * localStorage and the action log is `createJSONStorage` over sessionStorage. None of these may be
- * persisted, because each describes a single observation of a single request. A reload re-reads the
- * server, so a dialog, a marker or an in-flight guard that survived one would be asserting something
- * about state nobody has re-checked - and, for the guard, would permanently disable an affordance no
- * request is actually open for.
+ * TWO atoms, which is the whole of this file's addition. Both are PLAIN IN-MEMORY atoms, and that
+ * deliberately diverges from every atom above them: the bank selection, date range and match filters
+ * are `atomWithStorage` over localStorage and the action log is `createJSONStorage` over
+ * sessionStorage. Neither of these may be persisted, because each describes a single observation of a
+ * single request. A reload re-reads the server, so a dialog or a marker that survived one would be
+ * asserting something about state nobody has re-checked.
  *
- * ─── AAP STATE-CONTRACT RECONCILIATION ──────────────────────────────────────────────────────────
- *
- * The Agent Action Plan's change list for this file (sections 0.6.1.3 and 0.9.1.3) is "two additive
- * atoms": the error-dialog payload and the import-failure map. FIVE constructs are delivered. Each
- * additional one is traced to the binding requirement that forces it and to the reason it cannot be
- * folded into one of the two planned atoms, so the divergence is auditable rather than implicit:
- *
- *   1. `bankRecErrorDialogAtom`          — PLANNED. FM1/FM3's dismissible dialog payload.
- *   2. `bankRecImportFailuresAtom`       — PLANNED. FM2's per-file marker, keyed by import-log name
- *                                          exactly as section 0.3.1.6 specifies.
- *   3. `bankRecPreLogImportFailuresAtom` — FM2, second half. Section 0.3.1.6 requires the indicator
- *                                          "per file", and the entire first half of the upload chain
- *                                          runs BEFORE any import log exists, so its refusals have no
- *                                          log name to be keyed by. They cannot live in (2) without
- *                                          making "is this log known to have failed?" answerable by
- *                                          something that is not a log name. See the atom's own note.
- *   4. `preLogImportFailureKey`          — the key function for (3). A pure helper, not state; it is
- *                                          here rather than in a consumer because both the writer
- *                                          (the upload chain) and the reader (the importer list) must
- *                                          compute the identical key.
- *   5. `bankRecReconcileInFlightAtom`    — FM1's "no partial or duplicate postings". Section 0.4.2.6
- *                                          judged in-flight duplication already covered by the
- *                                          existing per-hook `loading` disable; that judgement does
- *                                          not hold, because every candidate voucher row instantiates
- *                                          `useReconcileTransaction` for ITSELF, so `loading` is
- *                                          per-instance and one row learns nothing about another
- *                                          row's open request. Two candidates for the same
- *                                          transaction could each dispatch a `reconcile_vouchers`
- *                                          post. Shared state is the only thing every row can read,
- *                                          which is why this is an atom and not hook state.
- *
- * Nothing here changes any of the sixteen pre-existing atoms, and no persisted key is added, renamed
- * or re-shaped - so the AAP's other state commitment, that the existing persistence conventions are
- * preserved (sections 0.2.10 and 0.8.4), holds exactly.
+ * Nothing here changes any of the sixteen pre-existing atoms.
  * ============================================================================================== */
 
 /**
@@ -179,86 +174,3 @@ export const bankRecErrorDialogAtom = atom<FrappeError | null>(null)
  * composite-key encoding to stay collision-free.
  */
 export const bankRecImportFailuresAtom = atom<Map<string, string>>(new Map())
-
-/** One observed refusal of an upload that never got as far as producing an import log. */
-export interface PreLogImportFailure {
-    /** The `Bank Account` the upload was attempted against. */
-    bankAccount: string
-    /** The chosen file's name, as the browser reported it - the only identity the reviewer can see. */
-    fileName: string
-    /** The server's own words, parsed by the shared error parser. */
-    message: string
-}
-
-/**
- * Import failures that happened BEFORE a `Bank Statement Import Log` existed, keyed by
- * {@link preLogImportFailureKey}.
- *
- * WHY A SECOND MAP RATHER THAN A KEY IN THE ONE ABOVE. The map above is keyed by log name, and these
- * failures are defined by NOT HAVING ONE. The whole first half of the upload chain runs before any
- * log is created - saving a PDF password onto the `Bank Account`, uploading the private `File`, and
- * the `Bank Statement Import Log` insert itself - and every refusal available there is a refusal the
- * reviewer most needs explaining: no permission on the bank account (the DocType is System Manager
- * only), a disabled or mis-configured account, a file the storage layer rejected, a file that is
- * empty or unreadable, a PDF whose password is wrong. None of those could be recorded per file,
- * because the row they would attach to is exactly what failed to come into being. Mixing a synthetic
- * key into a map the importer list membership-tests by log name would also make "is this log known
- * to have failed?" answerable by something that is not a log name.
- *
- * These entries are what the importer list renders as extra rows above the server's own, so a
- * pre-log refusal still produces the per-file failure indicator FM2 requires instead of vanishing
- * once the generic hook banner is replaced by the next render.
- *
- * PLAIN IN-MEMORY for the same reason as every other atom in this block: it records one observation
- * of one failed request, and a reload re-reads the server.
- */
-export const bankRecPreLogImportFailuresAtom = atom<Map<string, PreLogImportFailure>>(new Map())
-
-/**
- * The identity of an upload attempt: the bank account it targeted, plus enough of the chosen file to
- * tell one selection from another.
- *
- * `name` alone is not an identity - re-exporting a statement produces the same file name with
- * different contents - so `size` and `lastModified` are folded in. They are the only other
- * properties a browser `File` exposes without reading it, and together they distinguish a retry of
- * the SAME file (which must replace the previous verdict) from a genuinely different upload (which
- * must not).
- *
- * Joined with NUL rather than a printable separator: a file name may legally contain any of the
- * characters a reader would reach for first, and a name carrying the separator could otherwise
- * collide with a different account/file pair.
- */
-export const preLogImportFailureKey = (
-    bankAccount: string,
-    file: Pick<File, 'name' | 'size' | 'lastModified'>
-) => [bankAccount, file.name, file.size, file.lastModified].join('\u0000')
-
-/**
- * The `Bank Transaction` a `reconcile_vouchers` post is CURRENTLY IN FLIGHT for, or `null` when
- * none is. It is the single-flight guard for the only financial write this feature performs.
- *
- * WHY THIS CANNOT BE HOOK STATE. `useReconcileTransaction` exposes a `loading` flag from
- * `useFrappePostCall`, and that flag is per HOOK INSTANCE - but every candidate voucher row calls
- * the hook for itself, so each row owns a private `loading` and learns nothing about any other
- * row's request. A reviewer could therefore start a post from the suggested match and, while it was
- * still open, start a SECOND post for the same transaction from another candidate. Both would be
- * accepted by the client and both would reach the server, which allocates against whatever the
- * transaction still has unallocated at the moment each arrives - so the outcome depended on
- * interleaving rather than on intent. Lifting the fact of "a post is open" into shared state is what
- * makes that impossible, because every row reads the same value.
- *
- * WHY IT HOLDS A NAME RATHER THAN A BOOLEAN. The name is what lets the guard be reported precisely
- * and asserted precisely, and it keeps a stale write from an unrelated transaction from silencing a
- * fresh one.
- *
- * PLAIN IN-MEMORY, for the same reason as the two atoms above: it describes one request that is open
- * right now. A reload cannot leave a request open, so a persisted value could only ever be a lie
- * that permanently disabled the affordance.
- *
- * NOTE FOR CALLERS: reading this through `useAtomValue` is correct for RENDERING the disabled state,
- * but it is NOT sufficient for the guard itself - a React state read is a snapshot of the last
- * render, so two clicks dispatched in one tick would both see `null`. The hook therefore
- * check-and-sets it SYNCHRONOUSLY through the jotai store (`useStore`), which is the only read that
- * cannot be stale.
- */
-export const bankRecReconcileInFlightAtom = atom<string | null>(null)

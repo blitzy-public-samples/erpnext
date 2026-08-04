@@ -81,8 +81,9 @@ const { toastError, toastSuccess, toastWarning } = vi.hoisted(() => ({
 	toastSuccess: vi.fn<(message: string) => void>(),
 	// The UNCONFIRMED-outcome channel. It is a distinct member rather than a reuse of `error`, because
 	// the client observed no refusal and must not announce one; omitting it from this mock made
-	// `toast.warning` throw, which the rejection handler then reported as a server refusal.
-	toastWarning: vi.fn<(message: string) => void>()
+	// `toast.warning` throw, which the rejection handler then reported as a server refusal. The options
+	// argument is typed because the unconfirmed-outcome copy carries its explanation in `description`.
+	toastWarning: vi.fn<(message: string, options?: { description?: string }) => void>()
 }))
 
 vi.mock('sonner', () => ({ toast: { error: toastError, success: toastSuccess, warning: toastWarning } }))
@@ -106,11 +107,11 @@ const RUN_DOC_METHOD = 'run_doc_method'
  * The whitelisted rule evaluator, spelt exactly as the server exposes it — and asserted here as an
  * endpoint this surface MUST NOT CALL.
  *
- * `run_rule_evaluation` authorises an UNSCOPED background write across every company and every bank
- * account on nothing more than `Bank Transaction` READ permission
- * (`bank_transaction_rule.py:237-241`). Calling it from the import step would let any reviewer who can
- * merely read transactions trigger a global re-stamp, which is not this surface's decision to make.
- * Evaluation of the rows an import created is server-owned: `insert_transactions` calls it itself.
+ * Evaluation of the rows an import created is server-owned: `insert_transactions` queues it through
+ * `enqueue_rule_evaluation(bank_account=self.bank_account)` after saving the log and after the rows
+ * commit, so the worker is guaranteed to see them and the scope comes from the log rather than from a
+ * client. `run_rule_evaluation` itself now requires `Bank Transaction` WRITE permission, which makes it
+ * a manager-level action rather than something a review surface should fire implicitly.
  *
  * A client-side call was present at one point and has been removed, so the constant is retained
  * purely as the negative assertion's subject.
@@ -695,8 +696,13 @@ describe('StatementDetails', () => {
 		 * contain the import, with a toast asserting it had happened.
 		 *
 		 * It is equally not a FAILURE: no refusal was observed, so no per-file failure marker may be
-		 * written. It is reported as an unknown, and the reviewer is kept on this page - where the
-		 * statement's own status is the server's answer.
+		 * written. It is reported through the WARNING channel and the reviewer is kept on this page -
+		 * where the statement's own status badge is the server's answer.
+		 *
+		 * And it is reported as a TOAST, never through the shared dismissible dialog. That dialog renders
+		 * whatever `_server_messages` it is handed, so putting a client-authored envelope into it would
+		 * present words the server never said on the one surface whose entire purpose is to carry the
+		 * server's own.
 		 */
 		it('does NOT announce success when the response carries no document at all', async () => {
 			importCall.mockResolvedValue({ docs: [] })
@@ -705,7 +711,7 @@ describe('StatementDetails', () => {
 			await clickImport()
 
 			await waitFor(() => {
-				expect(store.get(bankRecErrorDialogAtom)).not.toBeNull()
+				expect(toastWarning).toHaveBeenCalledTimes(1)
 			})
 
 			expect(screen.queryByText(RECONCILIATION_SENTINEL)).not.toBeInTheDocument()
@@ -714,11 +720,11 @@ describe('StatementDetails', () => {
 				fromDate: PREVIOUS_START_DATE,
 				toDate: PREVIOUS_END_DATE
 			})
-			// No refusal was observed, so nothing claims one: the WARNING channel is used, not the
-			// error channel, and no per-file failure marker is written.
-			expect(toastWarning).toHaveBeenCalledTimes(1)
+			// No refusal was observed, so nothing claims one: no error toast, no per-file marker, and no
+			// dialog carrying a message the server did not send.
 			expect(toastError).not.toHaveBeenCalled()
 			expect(store.get(bankRecImportFailuresAtom).size).toBe(0)
+			expect(store.get(bankRecErrorDialogAtom)).toBeNull()
 		})
 
 		it('does NOT announce success when the returned document is still Not Started', async () => {
@@ -728,31 +734,31 @@ describe('StatementDetails', () => {
 			await clickImport()
 
 			await waitFor(() => {
-				expect(store.get(bankRecErrorDialogAtom)).not.toBeNull()
+				expect(toastWarning).toHaveBeenCalledTimes(1)
 			})
 
 			expect(screen.queryByText(RECONCILIATION_SENTINEL)).not.toBeInTheDocument()
 			expect(toastSuccess).not.toHaveBeenCalled()
 			expect(store.get(bankRecImportFailuresAtom).size).toBe(0)
+			expect(store.get(bankRecErrorDialogAtom)).toBeNull()
 		})
 
 		it('describes the unknown outcome honestly, without claiming either result', async () => {
 			importCall.mockResolvedValue({ docs: [] })
 
-			const { store } = renderStatementDetails(makeStatementDetails())
+			renderStatementDetails(makeStatementDetails())
 			await clickImport()
 
 			await waitFor(() => {
-				expect(store.get(bankRecErrorDialogAtom)).not.toBeNull()
+				expect(toastWarning).toHaveBeenCalledTimes(1)
 			})
 
-			// Amber rather than red, because the server refused nothing; and the copy must say that
-			// transactions MAY have been created, since the client genuinely cannot tell.
-			const messages = JSON.parse(String(store.get(bankRecErrorDialogAtom)?._server_messages)) as string[]
-			const first = JSON.parse(messages[0]) as { message: string, title: string, indicator: string }
-			expect(first.indicator).toBe('yellow')
-			expect(first.title).toBe('Import not confirmed')
-			expect(first.message).toContain('may or may not have been created')
+			// The copy must say that transactions MAY have been created, since the client genuinely
+			// cannot tell, and it must not read as either a success or a refusal.
+			expect(toastWarning.mock.calls[0][0]).toBe('The import could not be confirmed.')
+			const description = (toastWarning.mock.calls[0][1] as { description: string }).description
+			expect(description).toContain('may or may not have been created')
+			expect(description).toContain('Reload this page to see its current status')
 		})
 
 		it('neither evaluates rules nor refreshes caches for an unconfirmed outcome', async () => {
@@ -760,11 +766,11 @@ describe('StatementDetails', () => {
 			// outcome nobody confirmed would enqueue work and evict caches on a guess.
 			importCall.mockResolvedValue({ docs: [] })
 
-			const { store } = renderStatementDetails(makeStatementDetails())
+			renderStatementDetails(makeStatementDetails())
 			await clickImport()
 
 			await waitFor(() => {
-				expect(store.get(bankRecErrorDialogAtom)).not.toBeNull()
+				expect(toastWarning).toHaveBeenCalledTimes(1)
 			})
 
 			expect(otherPostCall).not.toHaveBeenCalled()
@@ -786,14 +792,12 @@ describe('StatementDetails', () => {
 		 *       the very common case of importing a statement covering the range already on screen, the
 		 *       import appeared to have done nothing at all.
 		 *
-		 *  TC2  is deliberately NOT this client's job. `insert_transactions` calls
-		 *       `run_rule_evaluation()` server-side, and the whitelisted endpoint authorises an unscoped
-		 *       global write on read permission alone — so this surface does not call it. The ordering
-		 *       weakness that follows is the server's and is recorded as a residual risk rather than
-		 *       worked around here: the enqueue happens BEFORE `status = "Completed"` is saved, so the
-		 *       job can start against an open transaction, see none of the new rows and stamp nothing,
-		 *       leaving the first review without suggested matches until the nightly scheduler runs. The
-		 *       negative assertions above are what keep the client out of it.
+		 *  TC2  is deliberately NOT this client's job. `insert_transactions` queues evaluation itself,
+		 *       scoped to the log's own bank account, after the log is saved and after the imported rows
+		 *       commit — so the worker is guaranteed to see them and the first review has its suggested
+		 *       matches. The whitelisted endpoint is a manager-level action requiring `Bank Transaction`
+		 *       WRITE permission, so this surface does not call it; the negative assertions below are
+		 *       what keep the client out of it.
 		 * ══════════════════════════════════════════════════════════════════════════════════════════ */
 		describe('the handover to review', () => {
 
@@ -834,6 +838,35 @@ describe('StatementDetails', () => {
 				)
 			})
 
+			/*
+			 * THE CALL SHAPE IS THE FIX, so it is asserted as such rather than left implied.
+			 *
+			 * `mutate(key)` and `mutate(key, undefined, { revalidate: true })` are DIFFERENT OPERATIONS in
+			 * SWR, not two spellings of one: the first only notifies revalidators that a MOUNTED hook has
+			 * registered, while the second writes `data: undefined` into the cache entry first. The
+			 * workbench hooks are unmounted at this moment, so only the second does anything at all. The
+			 * real-cache regression below proves that difference against SWR itself; this pins the shape
+			 * the page actually uses, so a "simplification" back to one argument fails here.
+			 */
+			it('passes the eviction arguments, not a bare revalidation request', async () => {
+				completedImport()
+
+				renderStatementDetails(makeStatementDetails())
+				await clickImport()
+
+				await waitFor(() => {
+					expect(screen.getByText(RECONCILIATION_SENTINEL)).toBeInTheDocument()
+				})
+
+				expect(frappeSWRMutate).toHaveBeenCalledTimes(4)
+				for (const call of frappeSWRMutate.mock.calls) {
+					expect(call).toHaveLength(3)
+					// `undefined` data with `populateCache` left at its default is what clears the entry.
+					expect(call[1]).toBeUndefined()
+					expect(call[2]).toEqual({ revalidate: true })
+				}
+			})
+
 			it('evicts BEFORE navigating, so the workbench never mounts on the stale entry', async () => {
 				completedImport()
 				// ONE held promise returned for every key. Four separate promises would leave the
@@ -864,7 +897,7 @@ describe('StatementDetails', () => {
 				})
 			})
 
-			it('navigates anyway when a refresh fails, since SWR will fetch on mount regardless', async () => {
+			it('navigates anyway when an eviction fails, rather than withholding the handover', async () => {
 				completedImport()
 				frappeSWRMutate.mockRejectedValue(new Error('network'))
 
@@ -893,10 +926,11 @@ describe('StatementDetails', () => {
 				expect(frappeSWRMutate).not.toHaveBeenCalled()
 			})
 
-			it('hands the reviewer over even when every cache refresh is refused', async () => {
-				// The refresh is an optimisation of the FIRST look at the list, not a precondition for it:
-				// the rows exist either way, and SWR fetches on mount as it normally would. Blocking the
-				// handover on it would trade a stale list for no list.
+			it('hands the reviewer over even when every eviction is refused', async () => {
+				// The eviction improves the FIRST look at the list; it is not a precondition for it. The
+				// rows exist on the server either way, and blocking the handover would trade a possibly
+				// stale list for no list at all — so the reviewer is moved, and the list they land on is
+				// whatever SWR is holding.
 				completedImport()
 				frappeSWRMutate.mockRejectedValue(new Error('offline'))
 
@@ -907,6 +941,132 @@ describe('StatementDetails', () => {
 					expect(screen.getByText(RECONCILIATION_SENTINEL)).toBeInTheDocument()
 				})
 				expect(toastSuccess).toHaveBeenCalledWith('Bank statement imported.')
+			})
+		})
+
+		/*
+		 * ══════════════════════════════════════════════════════════════════════════════════════════
+		 * THE REGRESSION, AGAINST A REAL SWR CACHE AND A REAL ROUTE TRANSITION  (CR-01, TC1)
+		 *
+		 * The assertions above observe the CALL the page makes. They cannot observe what SWR does with
+		 * it, and that is exactly where the defect lived: `mutate(key)` was called for every key, every
+		 * call resolved, and the reviewer still arrived at a list without the rows they had just
+		 * imported. A suite that only checks the calls is satisfied by the broken version.
+		 *
+		 * So these two cases use the REAL SWR primitives - obtained through `vi.importActual` on the
+		 * SDK, which re-exports them, so the test drives the same implementation the app does - and
+		 * reproduce the actual sequence: a workbench query configured exactly as
+		 * `useGetUnreconciledTransactions` is (`revalidateIfStale: false`, `revalidateOnFocus: false`),
+		 * mounted, resolved, UNMOUNTED as the reviewer navigates away, then invalidated, then REMOUNTED
+		 * as they return.
+		 *
+		 * The pair is deliberately symmetric: one shows the old call shape leaving the stale entry in
+		 * place with no refetch, the other shows the shape the page now uses clearing it and forcing
+		 * one. Without the first, the second proves nothing about the bug.
+		 *
+		 * Keys are unique per test because these share SWR's process-wide default cache; there is no
+		 * `SWRConfig` provider, and there does not need to be one.
+		 * ══════════════════════════════════════════════════════════════════════════════════════════ */
+		describe('a real SWR cache across the route transition', () => {
+
+			type SDK = typeof import('frappe-react-sdk')
+			let realUseSWR: SDK['useSWR']
+			let realUseSWRConfig: SDK['useSWRConfig']
+
+			beforeEach(async () => {
+				const actual = await vi.importActual<SDK>('frappe-react-sdk')
+				realUseSWR = actual.useSWR
+				realUseSWRConfig = actual.useSWRConfig
+			})
+
+			/** The keyed global `mutate`, reachable only from inside a component. */
+			const captureMutate = (): { current: ReturnType<SDK['useSWRConfig']>['mutate'] } => {
+				const captured = { current: undefined as unknown as ReturnType<SDK['useSWRConfig']>['mutate'] }
+				const Probe = () => {
+					captured.current = realUseSWRConfig().mutate
+					return null
+				}
+				render(<Probe />)
+				return captured
+			}
+
+			/**
+			 * Mounts one query with the workbench's own SWR options and reports what it is showing.
+			 *
+			 * The options are the load-bearing part: `revalidateIfStale: false` is what makes a cached
+			 * entry authoritative on mount, and it is precisely why an entry that was merely "revalidated"
+			 * while nothing was subscribed is served again unchanged.
+			 */
+			const mountQuery = (key: string, fetcher: () => Promise<string[]>) => {
+				const seen: (string[] | undefined)[] = []
+				const Workbench = () => {
+					const { data } = realUseSWR(key, fetcher, {
+						revalidateIfStale: false,
+						revalidateOnFocus: false
+					})
+					seen.push(data)
+					return <span data-testid="rows">{(data ?? []).join(',')}</span>
+				}
+				return { seen, ...render(<Workbench />) }
+			}
+
+			it('leaves the stale rows in place when only a bare revalidation is requested', async () => {
+				// THE DEFECT, reproduced. This is what `mutate(key)` did.
+				const key = `swr-regression-bare-${Date.now()}`
+				const fetcher = vi.fn<() => Promise<string[]>>()
+					.mockResolvedValueOnce(['before the import'])
+					.mockResolvedValue(['before the import', 'the imported row'])
+
+				const first = mountQuery(key, fetcher)
+				await waitFor(() => {
+					expect(screen.getByTestId('rows')).toHaveTextContent('before the import')
+				})
+				// The reviewer navigates to the importer: the query is no longer subscribed, so there is no
+				// revalidator registered for this key.
+				first.unmount()
+
+				const mutate = captureMutate()
+				await act(async () => {
+					await mutate.current(key)
+				})
+
+				// Back to the workbench.
+				mountQuery(key, fetcher)
+				await waitFor(() => {
+					expect(screen.getByTestId('rows')).toHaveTextContent('before the import')
+				})
+
+				// One fetch in total, and the imported row is nowhere: the import looked as though it had
+				// done nothing at all.
+				expect(fetcher).toHaveBeenCalledTimes(1)
+				expect(screen.getByTestId('rows')).not.toHaveTextContent('the imported row')
+			})
+
+			it('clears the entry and refetches on remount when the imported range is EVICTED', async () => {
+				// THE FIX. The exact arguments `refreshImportedRange` now passes.
+				const key = `swr-regression-evict-${Date.now()}`
+				const fetcher = vi.fn<() => Promise<string[]>>()
+					.mockResolvedValueOnce(['before the import'])
+					.mockResolvedValue(['before the import', 'the imported row'])
+
+				const first = mountQuery(key, fetcher)
+				await waitFor(() => {
+					expect(screen.getByTestId('rows')).toHaveTextContent('before the import')
+				})
+				first.unmount()
+
+				const mutate = captureMutate()
+				await act(async () => {
+					await mutate.current(key, undefined, { revalidate: true })
+				})
+
+				mountQuery(key, fetcher)
+
+				// A second fetch, and the row the import created is on screen.
+				await waitFor(() => {
+					expect(screen.getByTestId('rows')).toHaveTextContent('the imported row')
+				})
+				expect(fetcher).toHaveBeenCalledTimes(2)
 			})
 		})
 

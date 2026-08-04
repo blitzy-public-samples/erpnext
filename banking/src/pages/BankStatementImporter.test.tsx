@@ -105,7 +105,6 @@ vi.mock('sonner', () => ({ toast: { error: toastError, success: toastSuccess, wa
 vi.mock('frappe-react-sdk', () => createFrappeSDKMock())
 
 import BankStatementImporter from './BankStatementImporter'
-import { installRoleProfile } from '@/test/setup'
 import {
 	canCreateDocument,
 	canDeleteDocument,
@@ -115,10 +114,7 @@ import {
 import {
 	bankRecErrorDialogAtom,
 	bankRecImportFailuresAtom,
-	bankRecPreLogImportFailuresAtom,
-	preLogImportFailureKey,
-	selectedBankAccountAtom,
-	type PreLogImportFailure
+	selectedBankAccountAtom
 } from '@/components/features/BankReconciliation/bankRecAtoms'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import type { BankStatementImportLog } from '@/types/Accounts/BankStatementImportLog'
@@ -254,7 +250,6 @@ interface ImporterScenario {
 	 * Refusals observed BEFORE any import log existed, keyed by account-and-file identity exactly as
 	 * the atom is. These are what produce the synthetic rows (F-03).
 	 */
-	preLogFailures?: Map<string, PreLogImportFailure>
 	dialogError?: FrappeErrorFixture
 	uploadError?: FrappeErrorFixture
 	/**
@@ -376,7 +371,6 @@ const renderImporter = ({
 	logs,
 	listError,
 	markers,
-	preLogFailures,
 	dialogError,
 	uploadError,
 	projectQueriedFieldsOnly = false,
@@ -400,9 +394,6 @@ const renderImporter = ({
 	}
 	if (markers) {
 		store.set(bankRecImportFailuresAtom, markers)
-	}
-	if (preLogFailures) {
-		store.set(bankRecPreLogImportFailuresAtom, preLogFailures)
 	}
 	if (dialogError) {
 		store.set(bankRecErrorDialogAtom, dialogError)
@@ -1355,40 +1346,35 @@ describe('BankStatementImporter', () => {
 		})
 	})
 
-	/* ── F-03: refusals that happen before any import log exists ─────────────────────── */
+	/* ── Refusals that happen before any import log exists ──────────────────────────── */
 
 	/**
-	 * ⚠️ F-03. THE FAILURES WITH NO ROW TO ATTACH TO.
+	 * THE FAILURES WITH NO ROW TO ATTACH TO.
 	 *
 	 * The whole first half of the upload chain runs before a `Bank Statement Import Log` exists: the
-	 * passphrase save onto the `Bank Account`, the private `File` upload, and the log insert itself. Every
-	 * refusal available there is one the reviewer most needs explaining — no permission on the DocType
-	 * (it is System Manager only), a disabled or mis-configured bank account, a file storage would not
-	 * take, an empty or unreadable statement, a wrong PDF password.
+	 * passphrase save onto the `Bank Account`, the private `File` upload, and the log insert itself.
+	 * Every refusal available there is one the reviewer most needs explaining — no permission on the
+	 * DocType (it is System Manager only), a disabled or mis-configured bank account, a file storage
+	 * would not take, an empty or unreadable statement, a wrong PDF password.
 	 *
-	 * Before this, the chain had NO rejection handler at all. Each of those refusals produced nothing but
-	 * whichever generic inline banner happened to be rendered, which vanished on the next render, and left
-	 * no per-file record whatsoever — so a reviewer who uploaded three statements and had one refused had
-	 * no way to tell afterwards WHICH one. FM2 requires the import status view to indicate failure per
-	 * file; there was no file to indicate against, because the row that would carry it is exactly what
-	 * failed to come into being.
+	 * Before this, the chain had NO rejection handler at all, so each of those refusals produced nothing
+	 * but whichever generic inline banner happened to be rendered. The handler now raises the shared
+	 * dismissible dialog with the server's error UNMODIFIED.
+	 *
+	 * It writes NO per-file marker, and that is a contract rather than an omission: FM2's indicator is
+	 * specified per import log and keyed by log name, and these refusals are defined by not having one.
+	 * The list must therefore keep telling the truth — that no statement was added — instead of growing
+	 * a row for a document that does not exist.
 	 *
 	 * These cases drive REAL rejections through the chain, so they fail unless the handler exists.
 	 */
-	describe('a refusal before any log exists (F-03)', () => {
+	describe('a refusal before any log exists', () => {
 
 		const REFUSAL = 'Bank Account HDFC - Test Company is disabled. Please enable it.'
 
 		/**
 		 * Runs the chain to completion with the named step refusing, and returns the exact `File` it was
 		 * driven with.
-		 *
-		 * Returning the file matters: `new File(...)` stamps `lastModified` at construction, so two calls
-		 * to `csvStatementFile()` produce files that differ in identity. The record's key folds
-		 * `lastModified` in on purpose — it is part of what distinguishes a retry of the SAME statement
-		 * from a different one — so a test that re-derived the file would be asserting about a different
-		 * upload. Re-selecting one file from disk is what these cases mean, and reusing the instance is
-		 * what expresses it.
 		 */
 		const uploadRefusedAt = async (
 			step: 'passphrase' | 'upload' | 'create',
@@ -1425,33 +1411,27 @@ describe('BankStatementImporter', () => {
 			expect(within(dialog).getByRole('button', { name: 'Dismiss' })).toBeInTheDocument()
 		})
 
-		it('records a per-file failed row for the statement that has no log', async () => {
-			await uploadRefusedAt('upload')
+		it("reports a refusal of the passphrase save, which has no surface of its own", async () => {
+			await uploadRefusedAt('passphrase', { file: pdfStatementFile(), passphrase: true })
 
-			// The indicator FM2 requires, for a file the server never gave a document to.
-			const chip = await screen.findByText('Failed')
-			const row = chip.closest<HTMLElement>('[data-slot="table-row"]')
-
-			expect(row).not.toBeNull()
-			// Identified by the only identity the reviewer can see: the file they chose.
-			expect(within(row!).getByText('hdfc-statement-jan-2024.csv')).toBeInTheDocument()
-			expect(chip).toHaveAttribute('aria-label', `Failed: ${REFUSAL}`)
+			expect(within(await screen.findByRole('alertdialog')).getByText(REFUSAL)).toBeInTheDocument()
+			// The chain stopped at the refused step: nothing was uploaded and nothing was created.
+			expect(frappeFileUpload).not.toHaveBeenCalled()
+			expect(frappeCreateDoc).not.toHaveBeenCalled()
 		})
 
-		it('invents no document data on that row', async () => {
-			await uploadRefusedAt('upload')
+		it('reports a refusal to create the log, when the file is already stored', async () => {
+			await uploadRefusedAt('create')
 
-			const row = (await screen.findByText('Failed')).closest<HTMLElement>('[data-slot="table-row"]')!
-
-			// There is no document, so there is no import date, no range, no count and no balance.
-			// Four dashes, not a fabricated zero balance or an empty date that reads as a real one.
-			expect(within(row).getAllByText('-')).toHaveLength(4)
-			// And no link, which would offer a download of a file that was never stored.
-			expect(within(row).queryByRole('link')).not.toBeInTheDocument()
+			expect(within(await screen.findByRole('alertdialog')).getByText(REFUSAL)).toBeInTheDocument()
+			// The file did reach storage, and the reviewer is still not handed to a log that was never
+			// created.
+			expect(frappeFileUpload).toHaveBeenCalledTimes(1)
+			expect(screen.queryByText(new RegExp(DETAIL_SENTINEL))).not.toBeInTheDocument()
 		})
 
-		it('survives dismissing the dialog, which is the whole point of recording it', async () => {
-			await uploadRefusedAt('upload')
+		it('invents no import-log row for a statement the server never gave a document to', async () => {
+			const { store } = await uploadRefusedAt('upload')
 
 			await screen.findByRole('alertdialog')
 			await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
@@ -1460,120 +1440,23 @@ describe('BankStatementImporter', () => {
 				expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
 			})
 
-			// The dialog was raised at the moment of the attempt; the row is what remains afterwards.
-			expect(screen.getByText('Failed')).toBeInTheDocument()
-		})
-
-		it('records a refusal of the passphrase save, which has no surface of its own', async () => {
-			await uploadRefusedAt('passphrase', { file: pdfStatementFile(), passphrase: true })
-
-			expect(await screen.findByText('Failed')).toBeInTheDocument()
-			// The chain stopped at the refused step: nothing was uploaded and nothing was created.
-			expect(frappeFileUpload).not.toHaveBeenCalled()
-			expect(frappeCreateDoc).not.toHaveBeenCalled()
-		})
-
-		it('records a refusal to create the log, when the file is already stored', async () => {
-			await uploadRefusedAt('create')
-
-			expect(await screen.findByText('Failed')).toBeInTheDocument()
-			// The file did reach storage, and the reviewer is still not handed to a log that
-			// was never created.
-			expect(frappeFileUpload).toHaveBeenCalledTimes(1)
-			expect(screen.queryByText(new RegExp(DETAIL_SENTINEL))).not.toBeInTheDocument()
-		})
-
-		it('keys the record by account and file, and scopes the row to the account on screen', async () => {
-			const { store, file } = await uploadRefusedAt('upload')
-
-			await screen.findByText('Failed')
-
-			const recorded = [...store.get(bankRecPreLogImportFailuresAtom)]
-
-			expect(recorded).toHaveLength(1)
-			const [key, failure] = recorded[0]
-
-			// The key is derived from the account AND the chosen file, so a retry of the same file
-			// replaces this verdict while a different statement records its own.
-			expect(key).toBe(preLogImportFailureKey(SELECTED_BANK.name, file))
-			// Not merely account-scoped: a second statement on the same account keys differently.
-			expect(key).not.toBe(preLogImportFailureKey(SELECTED_BANK.name, csvStatementFile('feb.csv')))
-			expect(failure).toEqual({
-				bankAccount: SELECTED_BANK.name,
-				fileName: 'hdfc-statement-jan-2024.csv',
-				message: REFUSAL
-			})
-		})
-
-		it("does not show one account's pre-log failure on another account's screen", () => {
-			// Recorded against a DIFFERENT bank account. The list is per-account, and a refusal on one
-			// account says nothing about another — showing it here would be the same data-isolation
-			// break the list filter exists to prevent.
-			const otherAccountFailure: PreLogImportFailure = {
-				bankAccount: 'Second Bank - Test Company',
-				fileName: 'icici-statement-jan-2024.csv',
-				message: REFUSAL
-			}
-
-			renderImporter({
-				logs: [],
-				preLogFailures: new Map([['second-account-key', otherAccountFailure]])
-			})
-
-			expect(screen.queryByText('Failed')).not.toBeInTheDocument()
-			expect(screen.queryByText('icici-statement-jan-2024.csv')).not.toBeInTheDocument()
+			// FM2's per-file indicator is keyed by import-log name, and there is no log — so the list
+			// says what is true: nothing was imported. No fabricated row, no orphan `Failed` chip.
 			expect(screen.getByText('No bank statements imported yet')).toBeInTheDocument()
+			expect(screen.queryByText('Failed')).not.toBeInTheDocument()
+			// No table at all, so there is no row for the statement. Asserted on the table rather than on
+			// the file name, which legitimately remains on screen in the dropzone's own chosen-file chip.
+			expect(screen.queryByRole('table')).not.toBeInTheDocument()
+			expect(document.querySelectorAll('[data-slot="table-row"]')).toHaveLength(0)
+			// And no marker is written against any log, because none of them was the one that failed.
+			expect(store.get(bankRecImportFailuresAtom).size).toBe(0)
 		})
 
-		it('retires the record when the same file is retried', async () => {
-			const { container, store, file } = await uploadRefusedAt('upload')
+		it('creates nothing, because only the server creates Bank Transactions', async () => {
+			await uploadRefusedAt('upload')
 
-			await screen.findByText('Failed')
-			await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
-
-			// A fresh attempt at the same file must not leave a verdict standing while it is being
-			// re-tested — the marker records one observation, and that observation is now stale.
-			frappeFileUpload.mockResolvedValue(makeFileUploadResponse())
-			frappeCreateDoc.mockResolvedValue(makeBankStatementImportLog({ name: SERVER_NAMED_LOG }))
-
-			await chooseStatementFile(container, file)
-			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
-
-			expect(await screen.findByText(detailViewFor(SERVER_NAMED_LOG))).toBeInTheDocument()
-			expect(store.get(bankRecPreLogImportFailuresAtom).size).toBe(0)
-		})
-
-		it('replaces the record with the new reason when the retry is refused differently', async () => {
-			const { container, store, file } = await uploadRefusedAt('upload')
-
-			await screen.findByText('Failed')
-			await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
-
-			const secondRefusal = 'No tables found in the PDF file'
-			frappeFileUpload.mockRejectedValue(makeServerMessagesError(secondRefusal))
-
-			await chooseStatementFile(container, file)
-			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
-
-			await waitFor(() => {
-				expect([...store.get(bankRecPreLogImportFailuresAtom).values()])
-					.toEqual([expect.objectContaining({ message: secondRefusal })])
-			})
-			// One row, carrying the CURRENT reason — not two rows for one file.
-			expect(screen.getAllByText('Failed')).toHaveLength(1)
-			expect(await screen.findByText(secondRefusal)).toBeInTheDocument()
-		})
-
-		it('records nothing about transactions, because the client creates none', async () => {
-			const { store } = await uploadRefusedAt('upload')
-
-			await screen.findByText('Failed')
-
-			// FM2: only the server creates Bank Transactions, and this path is reached when it did not.
+			await screen.findByRole('alertdialog')
 			expect(frappeCreateDoc).not.toHaveBeenCalled()
-			// The record carries the reason and the file's name, and nothing that looks like data.
-			expect([...store.get(bankRecPreLogImportFailuresAtom).values()][0])
-				.not.toHaveProperty('number_of_transactions')
 		})
 
 		it('leaves the button usable again, so a refusal is retryable', async () => {
@@ -1597,7 +1480,23 @@ describe('BankStatementImporter', () => {
 				expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
 			})
 		})
+
+		it('retries cleanly after a refusal, and reaches the log the server then created', async () => {
+			const { container, file } = await uploadRefusedAt('upload')
+
+			await screen.findByRole('alertdialog')
+			await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+
+			frappeFileUpload.mockResolvedValue(makeFileUploadResponse())
+			frappeCreateDoc.mockResolvedValue(makeBankStatementImportLog({ name: SERVER_NAMED_LOG }))
+
+			await chooseStatementFile(container, file)
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+			expect(await screen.findByText(detailViewFor(SERVER_NAMED_LOG))).toBeInTheDocument()
+		})
 	})
+
 
 	/* ── The upload chain's call contract ────────────────────────────────────────────── */
 
@@ -1822,12 +1721,11 @@ describe('BankStatementImporter', () => {
 				expect(store.get(bankRecErrorDialogAtom)).toBe(refusal)
 			})
 
-			// The pre-log failure row records the ORIGINAL refusal, so the chip's tooltip and the dialog
-			// agree, and neither mentions the delete.
-			const failures = store.get(bankRecPreLogImportFailuresAtom)
-			expect(failures.size).toBe(1)
-			expect([...failures.values()][0].message).toContain('Invalid Bank Account')
-			expect([...failures.values()][0].message).not.toContain('delete')
+			// The dialog carries the ORIGINAL refusal and never mentions the delete: the insert failure is
+			// the actionable one, and no marker is written because no import log exists to key one by.
+			expect(store.get(bankRecErrorDialogAtom)?._server_messages).toContain('Invalid Bank Account')
+			expect(store.get(bankRecErrorDialogAtom)?._server_messages).not.toContain('delete')
+			expect(store.get(bankRecImportFailuresAtom).size).toBe(0)
 		})
 
 		it('does not delete the file when the log WAS created', async () => {
@@ -1912,9 +1810,97 @@ describe('BankStatementImporter', () => {
 			// reads that url. Marking the file Failed would assert a refusal that did not happen, and
 			// blocking the hand-off would strand a reviewer whose upload in fact succeeded.
 			expect(store.get(bankRecErrorDialogAtom)).toBeNull()
-			expect(store.get(bankRecPreLogImportFailuresAtom).size).toBe(0)
+			expect(store.get(bankRecImportFailuresAtom).size).toBe(0)
 			expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
 			expect(screen.queryByText('Failed')).not.toBeInTheDocument()
+		})
+
+		/*
+		 * ══════════════════════════════════════════════════════════════════════════════════════════
+		 * A CLIENT FAULT WITH THE IMPORT LOG ALREADY CREATED
+		 *
+		 * Everything after the insert - the relink warning and the navigation to the log - is client
+		 * work, and it can throw. The chain's rejection handler used to be attached AFTER that step as a
+		 * trailing `.then(undefined, handler)`, and a rejection handler sees everything that rejects
+		 * earlier in the chain than itself - so a fault HERE was reported as a refusal of the upload, for
+		 * a `Bank Statement Import Log` the server had already created. The two handlers are now paired
+		 * on the same `.then`, which makes the rejection handler structurally incapable of seeing them.
+		 *
+		 * The fault is forced through the warning render, which is the one post-create step a test can
+		 * make fail without reaching into the router: `toast.warning` throwing is exactly what a
+		 * rendering failure in the notification layer looks like.
+		 * ══════════════════════════════════════════════════════════════════════════════════════════ */
+		it('does NOT report a post-create client fault as a refusal of the upload', async () => {
+			frappeFileUpload.mockResolvedValue(makeFileUploadResponse())
+			frappeCreateDoc.mockResolvedValue(makeBankStatementImportLog({ name: SERVER_NAMED_LOG }))
+			// Refused relink, so the chain reaches the warning...
+			frappeUpdateDoc.mockRejectedValue(makeServerMessagesError('Not permitted to edit File'))
+			// ...and the FIRST warning throws, which is the post-create client fault under test.
+			toastWarning.mockImplementationOnce(() => {
+				throw new Error('the notification layer failed to render')
+			})
+
+			const { container, store } = renderImporter({ logs: [] })
+
+			await chooseStatementFile(container, csvStatementFile())
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+			await waitFor(() => {
+				expect(toastWarning).toHaveBeenCalledTimes(2)
+			})
+
+			// THE POINT: the log exists, so nothing here may claim the upload was refused.
+			expect(store.get(bankRecErrorDialogAtom)).toBeNull()
+			expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+			expect(store.get(bankRecImportFailuresAtom).size).toBe(0)
+			expect(screen.queryByText('Failed')).not.toBeInTheDocument()
+		})
+
+		it('reports the post-create fault as a warning that names the log the server created', async () => {
+			// The reviewer has to be able to reach the statement by hand, and the log's name is the only
+			// identity that gets them there once the automatic hand-off has failed.
+			frappeFileUpload.mockResolvedValue(makeFileUploadResponse())
+			frappeCreateDoc.mockResolvedValue(makeBankStatementImportLog({ name: SERVER_NAMED_LOG }))
+			frappeUpdateDoc.mockRejectedValue(makeServerMessagesError('Not permitted to edit File'))
+			toastWarning.mockImplementationOnce(() => {
+				throw new Error('the notification layer failed to render')
+			})
+
+			const { container } = renderImporter({ logs: [] })
+
+			await chooseStatementFile(container, csvStatementFile())
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+			await waitFor(() => {
+				expect(toastWarning).toHaveBeenCalledTimes(2)
+			})
+
+			const [message, options] = toastWarning.mock.calls[1]
+			expect(message).toBe('The statement was uploaded, but this page could not open it.')
+			expect((options as { description: string }).description).toContain(SERVER_NAMED_LOG)
+		})
+
+		it('still releases the single-flight guard after a post-create fault', async () => {
+			// The guard is released in `finally`, so a fault on either side of the split must leave the
+			// control usable. Without this, the two cases above could pass while stranding the reviewer.
+			frappeFileUpload.mockResolvedValue(makeFileUploadResponse())
+			frappeCreateDoc.mockResolvedValue(makeBankStatementImportLog({ name: SERVER_NAMED_LOG }))
+			frappeUpdateDoc.mockRejectedValue(makeServerMessagesError('Not permitted to edit File'))
+			toastWarning.mockImplementationOnce(() => {
+				throw new Error('the notification layer failed to render')
+			})
+
+			const { container } = renderImporter({ logs: [] })
+
+			await chooseStatementFile(container, csvStatementFile())
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+			await waitFor(() => {
+				expect(toastWarning).toHaveBeenCalledTimes(2)
+			})
+			await waitFor(() => {
+				expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
+			})
 		})
 
 		it('navigates to the name the SERVER returned, never to a client-minted one', async () => {
@@ -2249,9 +2235,10 @@ describe('BankStatementImporter', () => {
 	 * So what a frontend suite can prove here is precisely two things, and it must not be read as
 	 * proving more:
 	 *
-	 *   1. That the harness models the REAL DocPerm rows, so a narrowed profile is genuinely denied
-	 *      rather than uniformly granted. Without this, every other suite's privileged profile would be
-	 *      an unexamined assumption.
+	 *   1. That a narrowed profile really is denied by `src/lib/permissions.ts` rather than uniformly
+	 *      granted. Without this, every other suite's privileged profile would be an unexamined
+	 *      assumption. The narrowing is written directly onto `window.frappe.boot.user` here, which is
+	 *      the only thing those helpers read; the harness restores the profile after every test.
 	 *   2. That this page is FAIL-CLOSED when the server refuses under such a profile: the refusal is
 	 *      surfaced in the server's own words, the per-file record is written, and nothing is created,
 	 *      navigated to, or presented as having succeeded.
@@ -2262,11 +2249,31 @@ describe('BankStatementImporter', () => {
 	 * ════════════════════════════════════════════════════════════════════════════════════════════════ */
 	describe('negative authorisation', () => {
 
-		it('models the real DocPerm rows, so an Accounts User is genuinely denied the import log', () => {
+		/**
+		 * Narrows the authorisation profile the SPA reads.
+		 *
+		 * `src/lib/permissions.ts` asks nothing more than whether a DocType appears in one of the eight
+		 * `can_*` arrays on `boot.user`, so overwriting the arrays IS the narrowing - no permission
+		 * derivation has to be reproduced anywhere. Whatever is not named is left as the harness
+		 * installed it, and the harness rebuilds the whole profile after every test.
+		 */
+		const narrowProfileTo = (rights: Partial<Record<'can_read' | 'can_write' | 'can_create' | 'can_delete' | 'can_cancel', string[]>>) => {
+			Object.assign(window.frappe.boot.user, rights)
+		}
+
+		/** Everything an accounting-only profile holds here, with the System-Manager-only rows withheld. */
+		const ACCOUNTS_ONLY = {
+			can_read: ['Bank Transaction', 'Bank Account', 'Payment Entry', 'Journal Entry'],
+			can_write: ['Bank Transaction', 'Bank Account', 'Payment Entry', 'Journal Entry'],
+			can_create: ['Bank Transaction', 'Bank Account', 'Payment Entry', 'Journal Entry'],
+			can_delete: ['Bank Transaction', 'Bank Account', 'Payment Entry', 'Journal Entry']
+		}
+
+		it('denies the import log to an accounting-only profile that still holds its own rights', () => {
 			// The premise every other suite rests on. `Bank Statement Import Log` has permission rows for
 			// System Manager only, so an accounting-only profile must come back denied on all four rights
 			// while still holding the transaction rights its own role really does grant.
-			installRoleProfile(['Accounts User'])
+			narrowProfileTo(ACCOUNTS_ONLY)
 
 			expect(canReadDocument(IMPORT_LOG_DOCTYPE)).toBe(false)
 			expect(canWriteDocument(IMPORT_LOG_DOCTYPE)).toBe(false)
@@ -2278,16 +2285,16 @@ describe('BankStatementImporter', () => {
 		})
 
 		it('denies by default when no role is held at all', () => {
-			installRoleProfile([])
+			narrowProfileTo({ can_read: [], can_write: [], can_create: [], can_delete: [] })
 
 			expect(canReadDocument(IMPORT_LOG_DOCTYPE)).toBe(false)
 			expect(canReadDocument('Bank Transaction')).toBe(false)
 			expect(canReadDocument('Bank Account')).toBe(false)
 		})
 
-		it('grants the import log to System Manager, which is the only role that has it', () => {
-			// The positive control for the two above: if this failed, "denied" would prove nothing.
-			installRoleProfile(['System Manager'])
+		it('grants the import log under the harness profile, which is the positive control', () => {
+			// The positive control for the two above: if this failed, "denied" would prove nothing. No
+			// narrowing is applied, so this is the profile every other test in this file runs under.
 
 			expect(canReadDocument(IMPORT_LOG_DOCTYPE)).toBe(true)
 			expect(canCreateDocument(IMPORT_LOG_DOCTYPE)).toBe(true)
@@ -2297,10 +2304,10 @@ describe('BankStatementImporter', () => {
 			/*
 			 * The behaviour that matters. Under an Accounts-User profile the server refuses the
 			 * `Bank Statement Import Log` insert, and this page must report exactly that and nothing more:
-			 * the refusal in the server's own words, a per-file record so the list shows the failure, no
-			 * navigation to a log that does not exist, and no orphan private file left behind.
+			 * the refusal in the server's own words, no navigation to a log that does not exist, and no
+			 * orphan private file left behind.
 			 */
-			installRoleProfile(['Accounts User'])
+			narrowProfileTo(ACCOUNTS_ONLY)
 
 			const refusal = makeServerMessagesError('Insufficient Permission for Bank Statement Import Log')
 			frappeFileUpload.mockResolvedValue(makeFileUploadResponse())
@@ -2315,10 +2322,8 @@ describe('BankStatementImporter', () => {
 				expect(store.get(bankRecErrorDialogAtom)).toBe(refusal)
 			})
 
-			// The server's own wording, not a paraphrase.
-			const failures = store.get(bankRecPreLogImportFailuresAtom)
-			expect(failures.size).toBe(1)
-			expect([...failures.values()][0].message).toContain('Insufficient Permission')
+			// The server's own wording, not a paraphrase, and passed through by identity.
+			expect(store.get(bankRecErrorDialogAtom)?._server_messages).toContain('Insufficient Permission')
 
 			// Nothing was reached that a refusal should not reach.
 			expect(screen.queryByText(detailViewFor(SERVER_NAMED_LOG))).not.toBeInTheDocument()
@@ -2328,7 +2333,7 @@ describe('BankStatementImporter', () => {
 		it('is FAIL-CLOSED when the server refuses the log LIST under a narrowed profile', async () => {
 			// The read is refused before any row exists, so the page must show the server's refusal and no
 			// table at all - never an empty list, which would read as "this account has no imports".
-			installRoleProfile(['Accounts User'])
+			narrowProfileTo(ACCOUNTS_ONLY)
 
 			renderImporter({ logs: [], listError: makeServerMessagesError('Insufficient Permission for Bank Statement Import Log') })
 

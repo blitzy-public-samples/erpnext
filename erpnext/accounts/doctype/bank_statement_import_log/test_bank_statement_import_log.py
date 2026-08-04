@@ -1,6 +1,8 @@
 # Copyright (c) 2026, Frappe Technologies Pvt. Ltd. and Contributors
 # See license.txt
 
+from unittest.mock import patch
+
 import frappe
 from frappe import qb
 from frappe.utils import getdate
@@ -463,6 +465,117 @@ class TestBankStatementImportLog(ERPNextTestSuite, AccountsTestMixin):
 		self.assertEqual(doc.detected_header_index, 0)
 		restored = {c.maps_to: c.index for c in doc.column_mapping if c.maps_to != "Do not import"}
 		self.assertEqual(restored.get("Description"), 1)
+
+	# ------------------------------------------------------------------ #
+	# Importing: claiming the log, refusing an empty statement, and the
+	# ordering of rule evaluation against the commit
+	# ------------------------------------------------------------------ #
+
+	TWO_ROW_CSV = "Date,Narration,Amount\n01/04/2024,UPI PAYMENT,500.00\n03/04/2024,SALARY,20000.00\n"
+
+	def _submitted_transaction_count(self) -> int:
+		return frappe.db.count(
+			"Bank Transaction", filters={"bank_account": self.bank_account, "docstatus": 1}
+		)
+
+	def _drop_amount_column(self, doc: BankStatementImportLog) -> None:
+		"""Unmap the amount column so the statement parses to zero transactions."""
+		update_column_mapping(
+			doc.name,
+			[
+				{"index": c.index, "maps_to": "Do not import" if c.maps_to == "Amount" else c.maps_to}
+				for c in doc.column_mapping
+			],
+		)
+		doc.reload()
+
+	def test_import_refuses_a_statement_with_no_transactions(self):
+		"""
+		CR-04. An empty final transaction set is refused before ANY side effect.
+
+		A file that parses to nothing used to fall straight through the insert loop, publish a 100%
+		progress event and save the log as "Completed" - so a malformed or empty upload was
+		indistinguishable from a successful import and the importer had no failure to report.
+		"""
+		doc = self._create_csv_import_log(self.TWO_ROW_CSV)
+		self._drop_amount_column(doc)
+		self.assertEqual(doc.number_of_transactions, 0)
+
+		before = self._submitted_transaction_count()
+
+		with patch("frappe.publish_realtime") as publish, patch("frappe.enqueue") as enqueue:
+			self.assertRaises(frappe.ValidationError, doc.insert_transactions)
+
+		# Refused BEFORE any side effect: no progress event, no evaluation queued...
+		publish.assert_not_called()
+		enqueue.assert_not_called()
+		# ...no transactions created...
+		self.assertEqual(self._submitted_transaction_count(), before)
+		# ...and the log is left exactly as it was, so the reviewer can fix the file and retry it.
+		self.assertEqual(frappe.db.get_value("Bank Statement Import Log", doc.name, "status"), "Not Started")
+
+	def test_import_claims_the_log_from_the_database_not_a_stale_snapshot(self):
+		"""
+		CR-06. The already-imported guard reads the log's row under a lock, not `self.status`.
+
+		`self.status` is a snapshot taken when the document was loaded. Two callers arriving together
+		- a double-click, a retried request, two reviewers on the same log - could both hold a
+		"Not Started" snapshot and both insert AND SUBMIT the same statement's transactions, and
+		nothing downstream rejects the duplicates. Committed cross-session concurrency cannot be
+		expressed in this suite without `frappe.db.commit()`, which `semgrep/test-correctness.yml`
+		bans at ERROR severity; a stale in-memory snapshot over a database row that already says
+		"Completed" reproduces exactly the state the second caller would hold, and is what the fix
+		has to survive.
+		"""
+		doc = self._create_csv_import_log(self.TWO_ROW_CSV)
+		doc.insert_transactions()
+		doc.reload()
+		self.assertEqual(doc.status, "Completed")
+		imported = self._submitted_transaction_count()
+		self.assertEqual(imported, 2)
+
+		# The stale snapshot: the row says "Completed", this object says otherwise.
+		doc.status = "Not Started"
+		self.assertEqual(frappe.db.get_value("Bank Statement Import Log", doc.name, "status"), "Completed")
+
+		doc.insert_transactions()
+
+		# Nothing was inserted a second time, and the row still says what it said.
+		self.assertEqual(self._submitted_transaction_count(), imported)
+		self.assertEqual(frappe.db.get_value("Bank Statement Import Log", doc.name, "status"), "Completed")
+
+	def test_import_queues_rule_evaluation_after_saving_and_after_commit(self):
+		"""
+		CR-03. Evaluation is queued once the rows exist and only takes effect after the commit.
+
+		The previous ordering queued the job BEFORE `status = "Completed"` was saved and without
+		`enqueue_after_commit`, so a worker could start against a still-open transaction, read none
+		of the imported rows and stamp nothing - leaving the first review with no suggested match
+		until the next scheduled pass.
+		"""
+		doc = self._create_csv_import_log(self.TWO_ROW_CSV)
+		observed = {}
+
+		def record(**kwargs):
+			observed.update(kwargs)
+			observed["status_when_queued"] = frappe.db.get_value(
+				"Bank Statement Import Log", doc.name, "status"
+			)
+			observed["rows_when_queued"] = self._submitted_transaction_count()
+
+		with patch("frappe.enqueue", side_effect=record) as enqueue:
+			doc.insert_transactions()
+
+		enqueue.assert_called_once()
+		self.assertTrue(observed["enqueue_after_commit"])
+		# Scope is derived from the log itself, never from a caller.
+		self.assertEqual(observed["bank_account"], self.bank_account)
+		# The import path must not deduplicate: a pass that has already STARTED cannot see rows
+		# committed after it began, so collapsing into one would discard this import's stamping.
+		self.assertFalse(observed["deduplicate"])
+		# The ordering the finding was about.
+		self.assertEqual(observed["status_when_queued"], "Completed")
+		self.assertEqual(observed["rows_when_queued"], 2)
 
 
 test_hdfc_sample_statement_data = [

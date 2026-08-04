@@ -83,45 +83,61 @@ const StatementDetails = ({ data }: Props) => {
     /*
      * TC2: RULE EVALUATION IS THE SERVER'S, AND THIS PAGE DELIBERATELY DOES NOT TRIGGER IT.
      *
-     * `insert_transactions` calls `run_rule_evaluation()` itself, so evaluation of the rows this import
-     * created is server-owned and needs nothing from here. A client-side call to that endpoint was
-     * added at one point and has been REMOVED, for two independent reasons that point the same way:
+     * `insert_transactions` queues evaluation itself, so evaluation of the rows this import created is
+     * server-owned and needs nothing from here. A client-side call to `run_rule_evaluation` was added at
+     * one point and has been REMOVED, for two reasons that point the same way:
      *
-     *   • AUTHORISATION. `run_rule_evaluation` authorises an UNSCOPED background write across every
-     *     company and every bank account on nothing more than `Bank Transaction` READ permission
-     *     (`bank_transaction_rule.py:237-241`). Invoking it from this page would let any reviewer who
-     *     can merely read transactions trigger a global re-stamp - a decision that is not this
-     *     surface's to make, and one the server does not currently gate. Leaving evaluation to the
-     *     import itself keeps the trigger tied to rows the server just created and owns.
+     *   • THE SERVER OWNS BOTH THE TRIGGER AND ITS SCOPE. `insert_transactions` queues the pass through
+     *     `enqueue_rule_evaluation(bank_account=self.bank_account)` AFTER it saves the log and, because
+     *     that helper sets `enqueue_after_commit`, only once the imported rows have committed - so the
+     *     worker is guaranteed to see them. The scope is derived from the log's own bank account rather
+     *     than from anything a client sends. Calling the endpoint from here would add a second,
+     *     unscoped pass that duplicates work the server has already arranged correctly.
      *   • SCOPE. The Agent Action Plan's change list for this file is the rejection callback and the
      *     dialog mount, and it says in terms: "Leave the document-method call shape, the success-path
      *     navigation and the realtime subscription untouched" (sections 0.6.1.4 and 0.8.2.2). An extra
      *     endpoint call is not in that list.
      *
-     * The residual behaviour is honestly stated rather than papered over: because the server enqueues
-     * evaluation BEFORE it sets `status = "Completed"` and saves, the job can start against a still-open
-     * transaction, see none of the new rows and stamp nothing - in which case the first review shows no
-     * suggested matches until the nightly scheduler runs. That ordering is inside a reference-only
-     * controller and is recorded in the README's residual-risk section; it is not something this client
-     * may fix by escalating its own privileges.
+     * For the record, `run_rule_evaluation` now requires `Bank Transaction` WRITE permission - it stamps
+     * `is_rule_evaluated` and `matched_transaction_rule` through permission-bypassing writes, so read
+     * authority was never the right gate - and it authorises any bank account named as its scope. That
+     * makes it a manager-level action rather than something a review surface should fire implicitly,
+     * which is a second reason this page leaves it alone.
      */
 
     /**
-     * Evicts every cache entry the workbench will read for the range the server reported, then waits
-     * for those reads to be re-issued.
+     * EVICTS every cache entry the workbench will read for the range the server reported, then waits
+     * for the eviction to settle.
+     *
+     * ⚠️ THE THIRD ARGUMENT IS THE WHOLE FIX, AND `mutate(key)` DOES NOT DO THIS JOB.
+     *
+     * SWR's global `mutate` has two different behaviours depending on how many arguments it is given.
+     * With one, `internalMutate` takes the `args.length < 3` branch and only calls the REVALIDATORS
+     * REGISTERED FOR THAT KEY - the callbacks a MOUNTED `useSWR` installs. Navigating here from the
+     * workbench unmounts those hooks, so at this moment the keys below have no revalidators at all: the
+     * call resolves having done nothing, the STALE DATA STAYS IN THE CACHE, and because
+     * `useGetUnreconciledTransactions` is configured `revalidateIfStale: false` the remounted hook
+     * serves that stale entry and issues no request. The reviewer arrived at a list that did not contain
+     * the rows they had just imported, and the import looked as though it had done nothing.
+     *
+     * Passing `undefined` as the data with `{ revalidate: true }` takes the other branch: SWR writes
+     * `data: undefined` into the cache entry (`populateCache` defaults to true) and then calls whatever
+     * revalidators exist. Clearing the entry is what makes the remount fetch, because `useSWR`'s
+     * initial-revalidation decision is `isUndefined(data) || revalidateIfStale` - an entry with no data
+     * is always re-fetched, whatever the stale setting says.
      *
      * The key strings are constructed exactly as `utils.ts` constructs them and must stay
      * character-identical to it; no new cache-key family is introduced. Rejections are swallowed
-     * individually: a refresh that fails leaves SWR to fetch on mount as it normally would, and must
+     * individually: an eviction that fails leaves SWR to fetch on mount as it normally would, and must
      * not stop the reviewer being taken to the workbench.
      */
     const refreshImportedRange = (bankAccount: string, fromDate: string, toDate: string) =>
         Promise.all([
-            revalidate(`bank-reconciliation-unreconciled-transactions-${bankAccount}-${fromDate}-${toDate}`),
-            revalidate(`bank-reconciliation-bank-transactions-${bankAccount}-${fromDate}-${toDate}`),
-            revalidate(`bank-reconciliation-account-closing-balance-${bankAccount}-${toDate}`),
-            revalidate(`bank-reconciliation-account-closing-balance-as-per-statement-${bankAccount}-${toDate}`)
-        ].map((refresh) => refresh.catch(() => undefined)))
+            `bank-reconciliation-unreconciled-transactions-${bankAccount}-${fromDate}-${toDate}`,
+            `bank-reconciliation-bank-transactions-${bankAccount}-${fromDate}-${toDate}`,
+            `bank-reconciliation-account-closing-balance-${bankAccount}-${toDate}`,
+            `bank-reconciliation-account-closing-balance-as-per-statement-${bankAccount}-${toDate}`
+        ].map((key) => revalidate(key, undefined, { revalidate: true }).catch(() => undefined)))
 
     const onImport = () => {
 
@@ -155,22 +171,21 @@ const StatementDetails = ({ data }: Props) => {
              * sent the reviewer to a list that would not contain it.
              *
              * An unconfirmed outcome is reported as an UNKNOWN, deliberately not as a failure: no
-             * refusal was observed, so nothing here may claim one. No per-file failure marker is
-             * written, and the reviewer is kept on this page - where the statement's own status badge
-             * is the server's answer - rather than being moved somewhere the answer is not visible.
+             * refusal was observed, so nothing here may claim one.
+             *
+             * It is reported as a plain WARNING TOAST and nothing more. The dismissible dialog is
+             * reserved for errors the SERVER raised, and it renders whatever `_server_messages` it is
+             * given - so a client-authored envelope would put words the server never said behind a
+             * surface whose whole purpose is to carry the server's own. No per-file failure marker is
+             * written either, for the same reason: nothing was refused. The reviewer is simply kept on
+             * this page, where the statement's own status badge IS the server's answer, rather than
+             * being moved somewhere the answer is not visible.
              */
             if (doc?.status !== 'Completed') {
-                toast.warning(_("The import could not be confirmed."))
-                setErrorDialog({
-                    httpStatus: 200,
-                    httpStatusText: 'OK',
-                    message: _("The import could not be confirmed."),
-                    exception: '',
-                    _server_messages: JSON.stringify([JSON.stringify({
-                        message: _("The server accepted the request but did not report this statement as imported. Reload this page to see its current status before trying again - transactions may or may not have been created."),
-                        title: _("Import not confirmed"),
-                        indicator: 'yellow'
-                    })])
+                toast.warning(_("The import could not be confirmed."), {
+                    duration: 8000,
+                    closeButton: true,
+                    description: _("The server accepted the request but did not report this statement as imported. Reload this page to see its current status before trying again - transactions may or may not have been created.")
                 })
                 return
             }

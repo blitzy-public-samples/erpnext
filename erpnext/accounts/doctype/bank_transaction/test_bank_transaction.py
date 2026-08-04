@@ -11,6 +11,10 @@ from erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool 
 	get_linked_payments,
 	reconcile_vouchers,
 )
+from erpnext.accounts.doctype.bank_transaction.bank_transaction import (
+	unreconcile_transaction,
+	unreconcile_transaction_entry,
+)
 from erpnext.accounts.doctype.mode_of_payment.test_mode_of_payment import (
 	set_default_account_for_mode_of_payment,
 )
@@ -241,6 +245,85 @@ class TestBankTransaction(ERPNextTestSuite):
 
 		linked_payments = get_linked_payments(bank_transaction.name, ["loan_repayment", "exact_match"])
 		self.assertEqual(linked_payments[0]["name"], repayment_entry.name)
+
+	# ------------------------------------------------------------------ #
+	# HTTP method restriction and reconcile-time currency validation
+	# ------------------------------------------------------------------ #
+
+	def test_unreconcile_transaction_is_not_reachable_by_get(self):
+		"""
+		`unreconcile_transaction` removes payment entries and CANCELS every voucher the
+		reconciliation created. Frappe does not apply CSRF protection to GET, so while the endpoint
+		accepted GET the whole operation was triggerable from a link or an image tag in any page an
+		authenticated user happened to open. It is asserted through the dispatcher's own guard, not
+		merely against the registry, so the test fails if either the declaration or the enforcement
+		changes.
+		"""
+		from frappe.handler import is_valid_http_method
+
+		self.assertEqual(
+			set(frappe.allowed_http_methods_for_whitelisted_func[unreconcile_transaction]), {"POST"}
+		)
+		# The strictly smaller sibling was already POST-only; the two must not diverge again.
+		self.assertEqual(
+			set(frappe.allowed_http_methods_for_whitelisted_func[unreconcile_transaction_entry]), {"POST"}
+		)
+
+		had_request = hasattr(frappe.local, "request")
+		original = frappe.local.request if had_request else None
+		try:
+			frappe.local.request = frappe._dict(method="GET")
+			self.assertRaises(frappe.PermissionError, is_valid_http_method, unreconcile_transaction)
+
+			frappe.local.request = frappe._dict(method="POST")
+			self.assertIsNone(is_valid_http_method(unreconcile_transaction))
+		finally:
+			if had_request:
+				frappe.local.request = original
+			else:
+				del frappe.local.request
+
+	def test_reconcile_refuses_a_currency_mismatch(self):
+		"""
+		`validate()` does not run for an update-after-submit, so the currency check it performs was
+		skipped on the one path that matters most - the reconciliation posting, which reaches the
+		database through `save()` on an already-submitted transaction. A transaction whose currency
+		disagrees with its Bank Account's account currency could therefore be allocated against
+		vouchers in a different currency.
+		"""
+		bank_transaction = frappe.get_doc(
+			"Bank Transaction",
+			dict(description="1512567 BG/000002918 OPSKATTUZWXXX AT776000000098709837 Herr G"),
+		)
+		payment = frappe.get_doc("Payment Entry", dict(party="Mr G", paid_amount=1200))
+
+		# Write the mismatch straight to the row. `frappe.db.set_value` bypasses validation, which is
+		# exactly the state the reconcile path used to accept without complaint.
+		frappe.db.set_value("Bank Transaction", bank_transaction.name, "currency", "USD")
+		gl_account = frappe.get_cached_value("Bank Account", bank_transaction.bank_account, "account")
+		self.assertNotEqual(frappe.get_cached_value("Account", gl_account, "account_currency"), "USD")
+
+		vouchers = json.dumps(
+			[
+				{
+					"payment_doctype": "Payment Entry",
+					"payment_name": payment.name,
+					"amount": bank_transaction.unallocated_amount,
+				}
+			]
+		)
+		self.assertRaises(frappe.ValidationError, reconcile_vouchers, bank_transaction.name, vouchers)
+
+		# The refusal happens before the status transition and before the allocation is persisted.
+		row = frappe.db.get_value(
+			"Bank Transaction",
+			bank_transaction.name,
+			["status", "unallocated_amount", "allocated_amount"],
+			as_dict=True,
+		)
+		self.assertEqual(row.status, "Unreconciled")
+		self.assertEqual(row.unallocated_amount, bank_transaction.unallocated_amount)
+		self.assertEqual(row.allocated_amount, 0)
 
 
 def create_bank_account(

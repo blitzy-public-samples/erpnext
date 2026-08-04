@@ -12,7 +12,10 @@ from frappe.query_builder.functions import Max, Sum
 from frappe.utils import cint, create_batch, flt
 
 from erpnext import get_default_cost_center
-from erpnext.accounts.doctype.bank_transaction.bank_transaction import get_total_allocated_amount
+from erpnext.accounts.doctype.bank_transaction.bank_transaction import (
+	get_doctypes_for_bank_reconciliation,
+	get_total_allocated_amount,
+)
 from erpnext.accounts.party import get_party_account
 from erpnext.accounts.report.bank_reconciliation_statement.bank_reconciliation_statement import (
 	get_amounts_not_reflected_in_system,
@@ -93,7 +96,16 @@ def get_bank_transactions(
 def get_account_balance(bank_account: str, till_date: str | date, company: str):
 	# returns account balance till the specified date
 	frappe.has_permission("Bank Account", "read", bank_account, throw=True)
-	account = frappe.db.get_value("Bank Account", bank_account, "account")
+
+	# MJ-10: bind BOTH the GL account and the company to the Bank Account that was authorised above,
+	# rather than trusting the `company` the caller sent. The permission check is scoped to the Bank
+	# Account only, so a caller could previously pair an account it may read with any company string;
+	# `get_entries` and `get_amounts_not_reflected_in_system` both filter on that company, so the
+	# number returned described a scope the caller had never been authorised for. The parameter is
+	# still accepted, unchanged, so the existing RPC signature keeps working - but the query now runs
+	# on the company the account actually belongs to.
+	account, company = frappe.db.get_value("Bank Account", bank_account, ["account", "company"])
+
 	filters = frappe._dict(
 		{
 			"account": account,
@@ -390,6 +402,16 @@ def get_older_unreconciled_transactions(bank_account: str, from_date: str):
 	"""
 	Get number of unreconciled transactions before a given date for a bank account
 	"""
+	# MJ-10: gate the count on the named Bank Account and on Bank Transaction read authority. Neither
+	# check existed, and `frappe.db.count` ignores permissions altogether, so any authenticated user
+	# could probe an arbitrary Bank Account name and learn from the returned count and oldest date
+	# whether that account exists and whether it carries unreconciled activity - an existence oracle
+	# over another company's banking data. Passing the account as `doc` also applies any User
+	# Permissions restricting which accounts this user may see, which is what makes the count below
+	# safe to run unfiltered.
+	frappe.has_permission("Bank Transaction", ptype="read", throw=True)
+	frappe.has_permission("Bank Account", ptype="read", doc=bank_account, throw=True)
+
 	count = frappe.db.count(
 		"Bank Transaction",
 		filters={
@@ -1057,11 +1079,115 @@ def get_auto_reconcile_message(partially_reconciled, reconciled):
 	return alert_message, indicator
 
 
+def get_allowed_voucher_doctypes() -> set[str]:
+	"""
+	The document types a Bank Transaction may legitimately be reconciled against.
+
+	`get_doctypes_for_bank_reconciliation` is hook-driven, so installed apps extend it and this stays
+	correct as they do. "Bank Transaction" is added separately: `allocate_payment_entries` handles a
+	transaction-against-transaction allocation - a refund correcting an earlier transaction - through
+	its own branch, without the hook ever listing it.
+	"""
+	return set(get_doctypes_for_bank_reconciliation()) | {"Bank Transaction"}
+
+
+def validate_vouchers_for_reconciliation(transaction, vouchers) -> None:
+	"""
+	CR-09: refuse everything about the requested vouchers that the posting code would otherwise trust.
+
+	`add_payment_entries` copies `payment_doctype` and `payment_name` straight into child rows, and
+	`clear_linked_payment_entry` then stamps a clearance date on the named document with
+	`frappe.db.set_value`, which performs no permission check of its own. Every guarantee about *which*
+	documents may be touched therefore has to be established here, before the first mutation.
+	"""
+	if not vouchers:
+		frappe.throw(_("Select at least one voucher to reconcile against this Bank Transaction"))
+
+	allowed_doctypes = get_allowed_voucher_doctypes()
+
+	for voucher in vouchers:
+		doctype = voucher.get("payment_doctype")
+		docname = voucher.get("payment_name")
+
+		if not doctype or not docname:
+			frappe.throw(_("Each voucher must name both a document type and a document"))
+
+		if doctype not in allowed_doctypes:
+			frappe.throw(
+				_("{0} cannot be reconciled against a Bank Transaction").format(frappe.bold(doctype)),
+				title=_("Invalid Voucher Type"),
+			)
+
+		if not frappe.db.exists(doctype, docname):
+			frappe.throw(_("{0} {1} not found").format(_(doctype), frappe.bold(docname)))
+
+		# Reconciling WRITES to the voucher - a clearance date, or a child row on another Bank
+		# Transaction - so read authority is not sufficient here.
+		frappe.has_permission(doctype, ptype="write", doc=docname, throw=True)
+
+		# Server-derived scope: a voucher from another company can never belong on this transaction.
+		# Guarded on the field existing because the allowed set is hook-extensible.
+		if not (transaction.company and frappe.get_meta(doctype).has_field("company")):
+			continue
+
+		voucher_company = frappe.db.get_value(doctype, docname, "company")
+		if voucher_company and voucher_company != transaction.company:
+			frappe.throw(
+				_("{0} {1} belongs to company {2}, not {3}").format(
+					_(doctype),
+					frappe.bold(docname),
+					frappe.bold(voucher_company),
+					frappe.bold(transaction.company),
+				),
+				title=_("Company Mismatch"),
+			)
+
+
 @frappe.whitelist(methods=["POST"])
 def reconcile_vouchers(bank_transaction_name: str | int, vouchers: str | list, is_new_voucher: bool = False):
 	# updated clear date of all the vouchers based on the bank transaction
 	vouchers = frappe.parse_json(vouchers)
-	transaction = frappe.get_doc("Bank Transaction", bank_transaction_name)
+
+	# CR-09: establish authority BEFORE reading or mutating anything. `transaction.save()` does enforce
+	# permissions, but it runs last - by then `add_payment_entries` has appended child rows and
+	# `allocate_payment_entries` has already written clearance dates through `frappe.db.set_value`,
+	# which checks nothing. A caller without write authority could therefore still leave clearance
+	# dates behind on other people's vouchers before the final save refused. The doctype-level check is
+	# the cheapest possible refusal and happens before the transaction row is even read.
+	frappe.has_permission("Bank Transaction", ptype="write", throw=True)
+
+	# CR-05: load the transaction under a row lock. The already-fully-reconciled guard at the top of
+	# `add_payment_entries` tests `self.unallocated_amount` from this snapshot, and the allocation that
+	# follows spends it. Without a lock, two concurrent posts both read the same non-zero unallocated
+	# amount, both pass the guard and both allocate against it - over-posting the transaction and
+	# leaving allocations that its amount does not support. `for_update=True` issues
+	# `SELECT ... FOR UPDATE`, so a second caller blocks here until the first request commits and then
+	# reads the already-reduced amount. The guard, the allocation, the clearance writes and the status
+	# transition become one atomic sequence for the remainder of this request.
+	transaction = frappe.get_doc("Bank Transaction", bank_transaction_name, for_update=True)
+
+	# CR-09: document-level authority - User Permissions, sharing, ownership - once the row is known.
+	transaction.check_permission("write")
+
+	# CR-09: and the vouchers themselves, still before the first mutation.
+	validate_vouchers_for_reconciliation(transaction, vouchers)
+
+	# MJ-09: the currency has to agree with the Bank Account's account currency before anything is
+	# allocated. `before_update_after_submit` also checks it - that covers every other
+	# update-after-submit path - but it runs inside `save()`, which is AFTER `set_status()` has
+	# already written the new status with `db_set`. Checking here means a mismatch is refused with
+	# nothing written at all, rather than relying on the request rollback to undo it.
+	transaction.validate_currency()
+
+	# `is_new_voucher` stays caller-supplied. It records whether the voucher was created by the
+	# reconciliation flow ("Voucher Created") or merely matched to an existing one ("Matched"), and
+	# `unreconcile_transaction` cancels the former. It cannot be derived server-side without removing
+	# the parameter's effect from the whitelisted RPC surface, which callers that create a voucher and
+	# then reconcile it depend on - the internal creation endpoints in this module do exactly that - and
+	# the AAP freezes that surface (§0.2.4 Immutable Contracts, reinforced by resolution rule (a) in
+	# §0.2.1: the existing backend contract wins for method signatures). What the validation above does
+	# guarantee is that a mislabelled voucher is still one that exists, is of a reconcilable type,
+	# belongs to this transaction's company, and is one this caller is entitled to write.
 	transaction.add_payment_entries(vouchers, is_new_voucher)
 	transaction.validate_duplicate_references()
 	transaction.allocate_payment_entries()
@@ -1072,7 +1198,50 @@ def reconcile_vouchers(bank_transaction_name: str | int, vouchers: str | list, i
 	return transaction
 
 
-@frappe.whitelist()
+# MJ-08: an upper bound on the candidate list this endpoint will return. `check_matching` sorts by rank
+# descending, so truncating keeps the best matches and only discards the long tail a reviewer would
+# never scroll to - while making it impossible to use the endpoint to page an entire ledger out of the
+# site in one unbounded response.
+MAX_LINKED_PAYMENTS = 500
+
+
+def normalize_document_types(document_types: str | list[str] | None) -> list[str]:
+	"""
+	MJ-08: reduce `document_types` to a plain list of strings.
+
+	The matching layer only ever asks `"payment_entry" in document_types`, so a bare string arriving
+	from a caller turns every one of those membership tests into a SUBSTRING test - a caller could send
+	"payment_entry journal_entry exact_match" and silently enable all three, or send a string that
+	happens to contain "exact_match" and change the matching mode by accident. Normalising here means
+	those tests are always list membership.
+
+	The token set itself is not restricted to a fixed list: `get_matching_queries` is a hook, so
+	installed apps contribute their own tokens (ERPNext alone understands payment_entry, journal_entry,
+	sales_invoice, purchase_invoice, bank_transaction and the exact_match modifier). Unrecognised
+	tokens are inert - they match no branch and produce no query - and the authoritative allow-list for
+	anything that WRITES lives in `validate_vouchers_for_reconciliation`.
+	"""
+	if not document_types:
+		return []
+
+	if isinstance(document_types, str):
+		try:
+			# An HTTP caller sends the list as a JSON array; `frappe.parse_json` raises on anything else.
+			document_types = frappe.parse_json(document_types)
+		except ValueError:
+			document_types = [document_types]
+
+		if isinstance(document_types, str):
+			document_types = [document_types]
+
+	if not isinstance(document_types, list | tuple | set):
+		# A number, a mapping, or a JSON `null`: nothing that names a matching branch.
+		return []
+
+	return [token for token in document_types if isinstance(token, str)]
+
+
+@frappe.whitelist(methods=["GET"])
 def get_linked_payments(
 	bank_transaction_name: str,
 	document_types: str | list[str] | None = None,
@@ -1083,7 +1252,19 @@ def get_linked_payments(
 	to_reference_date: str | None = None,
 ):
 	# get all matching payments for a bank transaction
+	#
+	# MJ-08: this endpoint reads across Payment Entries, Journal Entries, Invoices and other Bank
+	# Transactions and returns their names, amounts, parties and reference numbers. It is declared GET
+	# only because it is a read - it also means a caller cannot reach it with a method that Frappe
+	# treats as state-changing - and it now proves the caller's authority over the specific transaction
+	# and bank account being asked about, rather than relying on the individual matching queries to be
+	# scoped correctly.
 	transaction = frappe.get_doc("Bank Transaction", bank_transaction_name)
+	transaction.check_permission("read")
+	frappe.has_permission("Bank Account", ptype="read", doc=transaction.bank_account, throw=True)
+
+	document_types = normalize_document_types(document_types)
+
 	bank_account = frappe.db.get_values(
 		"Bank Account", transaction.bank_account, ["account", "company"], as_dict=True
 	)[0]
@@ -1099,7 +1280,7 @@ def get_linked_payments(
 		from_reference_date,
 		to_reference_date,
 	)
-	return subtract_allocations(gl_account, matching)
+	return subtract_allocations(gl_account, matching[:MAX_LINKED_PAYMENTS])
 
 
 def subtract_allocations(gl_account, vouchers):

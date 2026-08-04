@@ -94,10 +94,11 @@ import {
 	bankRecAmountFilter,
 	bankRecDateAtom,
 	bankRecErrorDialogAtom,
-	bankRecReconcileInFlightAtom,
 	bankRecSelectedTransactionAtom,
 	selectedBankAccountAtom
 } from './bankRecAtoms'
+// The shared single-flight guard lives with the hook that owns it, not in the feature's atom store.
+import { bankRecReconcileInFlightAtom } from './utils'
 import type { LinkedPayment, UnreconciledTransaction, useGetRuleForTransaction } from './utils'
 
 type QueryResponse = ReturnType<typeof frappeSDKMock.useFrappeGetCall>

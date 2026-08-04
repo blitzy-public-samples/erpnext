@@ -1556,7 +1556,7 @@ export const makeReconcileSuccessResponse = (
  * The success payload of the statement import, shaped exactly as its hook declares it:
  * `useFrappePostCall<{ docs: BankStatementImportLog[] }>('run_doc_method')`.
  *
- * `run_doc_method` always appends the document it ran the method on (`frappe/handler.py:340`), and
+ * `run_doc_method` always appends the document it ran the method on (`frappe/handler.py:342`), and
  * `insert_transactions` sets `status = "Completed"` and saves as its last act, so a returned
  * document reports the terminal status. The import step reads `docs[0].start_date` / `.end_date` to
  * move the reconciliation date range; it guards on both being present, so a suite can model a
