@@ -11,11 +11,12 @@ import { Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, Tabl
 import { Separator } from '@/components/ui/separator'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { FrappeError, useFrappeEventListener, useFrappePostCall } from 'frappe-react-sdk'
+import { useFrappeEventListener, useFrappePostCall } from 'frappe-react-sdk'
+import type { FrappeError } from 'frappe-react-sdk'
 import { toast } from 'sonner'
 import ErrorBanner from '@/components/ui/error-banner'
 import { Link, useNavigate } from 'react-router'
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { Progress } from '@/components/ui/progress'
 import { useSetAtom } from 'jotai'
 import { useDirection } from '@/components/ui/direction'
@@ -66,12 +67,28 @@ const StatementDetails = ({ data }: Props) => {
 
     const direction = useDirection()
 
+    /*
+     * Which import attempt, if any, is still in flight. A ref rather than state because the realtime
+     * listener below must read the CURRENT value: the payload carries no import-log identity, so
+     * "an attempt this screen started has not settled yet" is the only honest gate available against a
+     * delayed event from a superseded attempt.
+     */
+    const attemptRef = useRef(0)
+    const activeAttemptRef = useRef<number | null>(null)
+
     const onImport = () => {
+
+        // Reset before dispatching, so a retry never starts from the bar the previous attempt left
+        // behind, and so the bar is visible at zero rather than appearing part-way through.
+        const attempt = ++attemptRef.current
+        activeAttemptRef.current = attempt
+        setProgress({ percent: 0 })
 
         call({
             docs: data.doc,
             method: 'insert_transactions'
         }).then((response) => {
+            activeAttemptRef.current = null
             const doc = response.docs ? response.docs[0] : undefined
             if (doc && doc.start_date && doc.end_date) {
                 setDates({
@@ -79,9 +96,21 @@ const StatementDetails = ({ data }: Props) => {
                     toDate: doc.end_date,
                 })
             }
+            /* A confirmed success retires any failure this log carries from an earlier attempt, so a
+             * stale marker cannot keep labelling a log that has since imported cleanly. */
+            setImportFailures((failures) => {
+                if (!(data.doc.name in failures)) return failures
+                return Object.fromEntries(
+                    Object.entries(failures).filter(([name]) => name !== data.doc.name)
+                )
+            })
             toast.success(_("Bank statement imported."))
             navigate(`/`)
         }).catch((error: FrappeError) => {
+            activeAttemptRef.current = null
+            // The import rolled back, so any progress already reported describes work that no longer
+            // exists. Clearing it is what stops a failed screen showing a part-filled bar.
+            setProgress(null)
             toast.error(_("There was an error while importing the bank statement."))
             /* Preserve the raw import error for the shared dialog and record it for this log in memory;
              * the persisted import-log schema has no error field. */
@@ -91,10 +120,20 @@ const StatementDetails = ({ data }: Props) => {
 
     }
 
-    const [progress, setProgress] = useState(0)
+    /*
+     * `insert_transactions` publishes `{ progress: <PERCENT> }` after every row - `round(done / total *
+     * 100)`, not a row count - and then one terminal `{ progress: 100, total: <rows> }`. Modelled as
+     * such so the copy can say what each number means, and `null` for "no import is being reported".
+     */
+    const [progress, setProgress] = useState<{ percent: number, total?: number } | null>(null)
 
-    useFrappeEventListener("bank-rec-statement-import-progress", (event) => {
-        setProgress(event.progress)
+    useFrappeEventListener("bank-rec-statement-import-progress", (event: { progress?: number, total?: number }) => {
+        // Ignore anything arriving outside an attempt this screen started and has not yet settled.
+        if (activeAttemptRef.current === null) return
+        // Clamped here rather than trusted: the server derives the figure with `round(done / total *
+        // 100)`, and the bar has to stay a bar for any figure that arrives.
+        const percent = Math.min(100, Math.max(0, event.progress ?? 0))
+        setProgress({ percent, total: event.total })
     })
 
     const file_name = data.doc.file.split("/").pop() ?? ""
@@ -136,8 +175,13 @@ const StatementDetails = ({ data }: Props) => {
                     </div>
                 </div>
 
-                {progress > 0 && <div className='flex flex-col gap-2'><Progress value={progress} max={100} size="lg" />
-                    <span className='text-sm'>{_("Importing {0} transactions", [progress.toString()])}
+                {/* The server's figure is a PERCENTAGE, so it is labelled as one. Only the terminal
+                    event carries `total`, which is the row count actually written - the one point at
+                    which a transaction count can honestly be shown. */}
+                {progress !== null && <div className='flex flex-col gap-2'><Progress value={progress.percent} max={100} size="lg" />
+                    <span className='text-sm'>{progress.total !== undefined
+                        ? _("Imported {0} transactions.", [progress.total.toString()])
+                        : _("Importing... {0}% complete", [progress.percent.toString()])}
                     </span>
                 </div>}
 
@@ -183,15 +227,15 @@ const StatementDetails = ({ data }: Props) => {
                         </TableRow>
                         <TableRow>
                             <TableHead>{_("Total Debits")}</TableHead>
-                            <TableCell><span className='font-numeric'>{formatCurrency(flt(data.doc.total_debits, 2), data.currency)}</span> <span className='text-ink-gray-5 font-sans'>({data.doc.total_debit_transactions} {data.doc.total_debit_transactions === 1 ? _("transaction") : _("transactions")})</span></TableCell>
+                            <TableCell><span className='font-numeric'>{formatCurrency(flt(data.doc.total_debits, 2), data.doc.currency)}</span> <span className='text-ink-gray-5 font-sans'>({data.doc.total_debit_transactions} {data.doc.total_debit_transactions === 1 ? _("transaction") : _("transactions")})</span></TableCell>
                         </TableRow>
                         <TableRow>
                             <TableHead>{_("Total Credits")}</TableHead>
-                            <TableCell><span className='font-numeric'>{formatCurrency(flt(data.doc.total_credits, 2), data.currency)}</span> <span className='text-ink-gray-5 font-sans'>({data.doc.total_credit_transactions} {data.doc.total_credit_transactions === 1 ? _("transaction") : _("transactions")})</span></TableCell>
+                            <TableCell><span className='font-numeric'>{formatCurrency(flt(data.doc.total_credits, 2), data.doc.currency)}</span> <span className='text-ink-gray-5 font-sans'>({data.doc.total_credit_transactions} {data.doc.total_credit_transactions === 1 ? _("transaction") : _("transactions")})</span></TableCell>
                         </TableRow>
                         <TableRow>
                             <TableHead>{_("Closing Balance as of {}", [formatDate(data.doc.end_date, "Do MMMM YYYY")])}</TableHead>
-                            <TableCell className='font-numeric'>{formatCurrency(flt(data.doc.closing_balance, 2), data.currency)}</TableCell>
+                            <TableCell className='font-numeric'>{formatCurrency(flt(data.doc.closing_balance, 2), data.doc.currency)}</TableCell>
                         </TableRow>
                         <TableRow>
                             <TableHead>
@@ -262,8 +306,8 @@ const StatementDetails = ({ data }: Props) => {
                                         <TableCell>{formatDate(transaction.date)}</TableCell>
                                         <TableCell className='max-w-[200px] w-fit overflow-hidden text-ellipsis'>{transaction.description}</TableCell>
                                         <TableCell className='max-w-[100px] w-fit overflow-hidden text-ellipsis'>{transaction.reference}</TableCell>
-                                        <TableCell className='text-end font-numeric'>{formatCurrency(transaction.withdrawal, data.currency)}</TableCell>
-                                        <TableCell className='text-end font-numeric'>{formatCurrency(transaction.deposit, data.currency)}</TableCell>
+                                        <TableCell className='text-end font-numeric'>{formatCurrency(transaction.withdrawal, data.doc.currency)}</TableCell>
+                                        <TableCell className='text-end font-numeric'>{formatCurrency(transaction.deposit, data.doc.currency)}</TableCell>
                                     </TableRow>
                                 ))}
                             </TableBody>

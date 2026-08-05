@@ -137,6 +137,10 @@ class BankTransaction(Document):
 
 	def before_update_after_submit(self):
 		self.validate_duplicate_references()
+		# `validate()` never runs for a submitted document, so without this call the currency rule
+		# would be enforced on insert only - and the reconcile path (`reconcile_vouchers` ->
+		# `save()` on a docstatus=1 document) would post a mismatched transaction unchecked.
+		self.validate_currency()
 		self.update_allocated_amount()
 		self.delink_old_payment_entries()
 		self.allocate_payment_entries()

@@ -562,12 +562,16 @@ class BankStatementImportLog(Document):
 				self.bank_account, frappe.utils.getdate(self.end_date), self.closing_balance
 			)
 
-		from erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule import run_rule_evaluation
-
-		run_rule_evaluation()
-
 		self.status = "Completed"
 		self.save()
+
+		from erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule import run_rule_evaluation
+
+		# Queued last, and after commit (see `run_rule_evaluation`): the evaluator runs in a worker on
+		# its own database connection, so a job started before this request commits would find neither
+		# the Bank Transactions inserted above nor this log's "Completed" status, and would silently
+		# leave the imported rows unstamped.
+		run_rule_evaluation()
 
 
 HEADER_KEYWORDS = [

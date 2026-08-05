@@ -20,19 +20,10 @@ export default defineConfig({
 		coverage: {
 			provider: 'v8',
 			reporter: ['text', 'json-summary', 'lcov'],
-			// Keep the measured module list aligned with the aggregate threshold; adding files
-			// here expands the 80% gate.
-			include: [
-				'src/components/features/BankReconciliation/utils.ts',
-				'src/components/features/BankReconciliation/bankRecAtoms.ts',
-				'src/components/features/BankReconciliation/BankRecErrorDialog.tsx',
-				'src/components/features/BankReconciliation/MatchAndReconcile.tsx',
-				'src/components/features/BankStatementImporter/CSV/StatementDetails.tsx',
-				'src/pages/BankStatementImporter.tsx',
-				'src/lib/frappe.ts',
-				'src/lib/company.ts',
-				'src/lib/currency.ts'
-			],
+			// The WHOLE source tree is measured, so the 80% floor below is a genuine statement about
+			// the application rather than about a hand-picked subset of it. Narrowing this list would
+			// silently drop unlisted code out of both the measurement and the gate.
+			include: ['src/**/*.{ts,tsx}'],
 			exclude: [
 				'src/types/**',
 				'src/test/**',

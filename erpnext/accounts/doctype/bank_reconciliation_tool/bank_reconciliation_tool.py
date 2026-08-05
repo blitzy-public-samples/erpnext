@@ -390,32 +390,30 @@ def get_older_unreconciled_transactions(bank_account: str, from_date: str):
 	"""
 	Get number of unreconciled transactions before a given date for a bank account
 	"""
-	count = frappe.db.count(
+	filters = {
+		"bank_account": bank_account,
+		"date": ["<", from_date],
+		"docstatus": 1,
+		"unallocated_amount": [">", 0.0],
+	}
+
+	# One permission-aware query answers both halves. `frappe.db.count` applies no permission
+	# conditions, so counting through it would report rows the caller cannot see - which both leaks
+	# the existence of another tenant's backlog and, when the count is non-zero but the permitted
+	# list is empty, indexes an empty result. `frappe.get_list` applies the permission query,
+	# `frappe.get_all` deliberately does not.
+	older_transactions = frappe.get_list(
 		"Bank Transaction",
-		filters={
-			"bank_account": bank_account,
-			"date": ["<", from_date],
-			"docstatus": 1,
-			"unallocated_amount": [">", 0.0],
-		},
+		filters=filters,
+		fields=["date"],
+		order_by="date asc",
+		limit_page_length=0,
 	)
 
-	if count > 0:
-		oldest_transaction = frappe.db.get_list(
-			"Bank Transaction",
-			filters={
-				"bank_account": bank_account,
-				"date": ["<", from_date],
-				"docstatus": 1,
-				"unallocated_amount": [">", 0.0],
-			},
-			fields=["date"],
-			order_by="date",
-			limit=1,
-		)
+	if not older_transactions:
+		return {"count": 0, "oldest_date": None}
 
-		return {"count": count, "oldest_date": oldest_transaction[0].date}
-	return {"count": 0, "oldest_date": None}
+	return {"count": len(older_transactions), "oldest_date": older_transactions[0].date}
 
 
 @frappe.whitelist()
@@ -1072,6 +1070,50 @@ def reconcile_vouchers(bank_transaction_name: str | int, vouchers: str | list, i
 	return transaction
 
 
+def filter_permitted_vouchers(vouchers: list[dict]) -> list[dict]:
+	"""
+	Keep only the candidates the session user is permitted to read.
+
+	`check_matching` assembles its candidates with `frappe.qb`, which talks to the database directly
+	and so applies neither DocType permissions nor User Permissions. Re-asserting every candidate
+	through `frappe.get_list` restores both, because `get_list` runs the permission query - unlike
+	`frappe.get_all`, which sets `ignore_permissions`.
+
+	The re-assertion costs one permission-aware query per candidate DocType rather than one per row,
+	which is what lets the matching queries themselves stay untouched.
+	"""
+	if not vouchers:
+		return vouchers
+
+	names_by_doctype: dict[str, set[str]] = {}
+	for voucher in vouchers:
+		doctype, name = voucher.get("doctype"), voucher.get("name")
+		if doctype and name:
+			names_by_doctype.setdefault(doctype, set()).add(name)
+
+	permitted_by_doctype: dict[str, set[str]] = {}
+	for doctype, names in names_by_doctype.items():
+		if not frappe.has_permission(doctype, ptype="read"):
+			permitted_by_doctype[doctype] = set()
+			continue
+
+		permitted_by_doctype[doctype] = set(
+			frappe.get_list(
+				doctype,
+				filters={"name": ("in", sorted(names))},
+				pluck="name",
+				limit_page_length=0,
+				order_by=None,
+			)
+		)
+
+	return [
+		voucher
+		for voucher in vouchers
+		if voucher.get("name") in permitted_by_doctype.get(voucher.get("doctype"), set())
+	]
+
+
 @frappe.whitelist()
 def get_linked_payments(
 	bank_transaction_name: str,
@@ -1084,9 +1126,26 @@ def get_linked_payments(
 ):
 	# get all matching payments for a bank transaction
 	transaction = frappe.get_doc("Bank Transaction", bank_transaction_name)
-	bank_account = frappe.db.get_values(
+
+	# The transaction name arrives straight from the client, so it is authorised rather than trusted.
+	# Passing `doc=` makes the check honour User Permissions (company, bank account) and not only the
+	# DocType role rows, which is what keeps one tenant's transaction out of another tenant's reach.
+	frappe.has_permission("Bank Transaction", ptype="read", doc=transaction, throw=True)
+
+	bank_account_values = frappe.db.get_values(
 		"Bank Account", transaction.bank_account, ["account", "company"], as_dict=True
-	)[0]
+	)
+	if not bank_account_values:
+		frappe.throw(
+			_("Bank Transaction {0} is not linked to a Bank Account").format(transaction.name),
+			title=_("Invalid Bank Account"),
+		)
+
+	# The bank account supplies the GL account and company every candidate query is built from, so it
+	# is authorised in its own right before those two values are used.
+	frappe.has_permission("Bank Account", ptype="read", doc=transaction.bank_account, throw=True)
+
+	bank_account = bank_account_values[0]
 	(gl_account, company) = (bank_account.account, bank_account.company)
 	matching = check_matching(
 		gl_account,
@@ -1099,7 +1158,7 @@ def get_linked_payments(
 		from_reference_date,
 		to_reference_date,
 	)
-	return subtract_allocations(gl_account, matching)
+	return subtract_allocations(gl_account, filter_permitted_vouchers(matching))
 
 
 def subtract_allocations(gl_account, vouchers):

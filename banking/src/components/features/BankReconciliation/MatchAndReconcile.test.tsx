@@ -12,9 +12,10 @@
  *     builds its own store and seeds `selectedBankAccountAtom` (the component early-returns without
  *     it) and `bankRecDateAtom` (interpolated into the cache keys).
  *
- *  3. Radix's `Slot` spreads a `TooltipTrigger asChild`'s props AFTER its child's, so the advisory
- *     chip loses `data-slot="badge"` and keeps `data-variant`/`data-size`/`data-theme`.
- *     {@link currencyAdvisoryChip} therefore selects on that surviving triple.
+ *  3. Radix's `Slot` spreads a `TooltipTrigger asChild`'s props AFTER its child's, so whatever the
+ *     trigger wraps is stamped `data-slot="tooltip-trigger"`. The advisory's trigger is the focusable
+ *     span AROUND its badge, so the badge keeps its own slot and the span is addressable by its
+ *     accessible name.
  */
 
 import { act, render, screen, waitFor, within } from '@testing-library/react'
@@ -210,8 +211,19 @@ interface WorkbenchOptions {
 	 * `Bank Account` field - the endpoint derives it per row from the linked `Account.account_currency`
 	 * - so pass `null` to model an account whose currency it could not derive, `null` rather than
 	 * `undefined` so an omitted option stays distinguishable from one deliberately unresolved.
+	 *
+	 * This, and NOT {@link WorkbenchOptions.persistedAccountCurrency}, is what the advisory compares
+	 * against.
 	 */
 	accountCurrency?: string | null
+	/**
+	 * The account currency the `localStorage`-backed selection remembers, which defaults to whatever
+	 * the endpoint currently reports. Set it apart from {@link WorkbenchOptions.accountCurrency} to
+	 * model a snapshot that has gone stale - the endpoint answer must win.
+	 */
+	persistedAccountCurrency?: string | null
+	/** Leaves `bank_account.get_list` in flight, so no current account currency is known yet. */
+	bankAccountsState?: 'loading'
 	withoutBank?: boolean
 	transactionsState?: 'loading' | 'error'
 	vouchersState?: 'loading' | 'error'
@@ -235,6 +247,8 @@ const renderWorkbench = (options: WorkbenchOptions = {}) => {
 		vouchers = [],
 		selected = [],
 		accountCurrency = TEST_CURRENCY,
+		persistedAccountCurrency = accountCurrency,
+		bankAccountsState,
 		withoutBank = false,
 		transactionsState,
 		vouchersState,
@@ -249,7 +263,7 @@ const renderWorkbench = (options: WorkbenchOptions = {}) => {
 	const store = createStore()
 
 	if (!withoutBank) {
-		store.set(selectedBankAccountAtom, makeSelectedBank({ account_currency: accountCurrency ?? undefined }))
+		store.set(selectedBankAccountAtom, makeSelectedBank({ account_currency: persistedAccountCurrency }))
 	}
 	store.set(bankRecDateAtom, { fromDate: FROM_DATE, toDate: TO_DATE })
 	store.set(SELECTED_TRANSACTION_ATOM, selected)
@@ -275,11 +289,12 @@ const renderWorkbench = (options: WorkbenchOptions = {}) => {
 		}
 
 		// Answered with the ENDPOINT-row builder rather than by spreading `BANK`: that constant is the
-		// persisted selection, whose shape differs from this endpoint's projection in both directions. The
-		// advisory compares against the selected-bank atom's currency, not against this response.
+		// persisted selection, whose shape differs from this endpoint's projection in both directions.
+		// THIS is the response the currency advisory compares against.
 		if (method.endsWith('bank_account.bank_account.get_list')) {
+			if (bankAccountsState === 'loading') return fetching()
 			return answered({
-				message: [makeBankAccountListRow({ name: BANK.name, account_currency: accountCurrency ?? undefined })]
+				message: [makeBankAccountListRow({ name: BANK.name, account_currency: accountCurrency })]
 			})
 		}
 
@@ -322,12 +337,14 @@ const transactionRow = (transaction: UnreconciledTransaction): HTMLElement => {
 }
 
 /**
- * The currency-mismatch advisory chip inside one row, or `null` when the row shows none. Selected on
- * the variant triple that SURVIVES the `asChild` merge; scoping to a row and pinning
- * `data-size="sm"` is what stops it matching the voucher panel's own orange "Partial Match" badge.
+ * The currency-mismatch advisory chip inside one row, or `null` when the row shows none. Scoping to a
+ * row and pinning `data-size="sm"` is what stops it matching the voucher panel's own orange
+ * "Partial Match" badge, which is the default `md`.
  */
 const currencyAdvisoryChip = (row: HTMLElement): HTMLElement | null =>
-	row.querySelector<HTMLElement>('[data-theme="orange"][data-variant="subtle"][data-size="sm"]')
+	row.querySelector<HTMLElement>(
+		'[data-slot="badge"][data-theme="orange"][data-variant="subtle"][data-size="sm"]'
+	)
 
 const ruleBadge = (row: HTMLElement): HTMLElement | null =>
 	row.querySelector<HTMLElement>('[data-slot="badge"][data-theme="violet"]')
@@ -903,10 +920,43 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 				vouchers: candidatesAsReturned
 			})
 
-		it('returns the higher-ranked candidate first, as the endpoint sorts them', () => {
-			expect(suggested.rank).toBe(4)
-			expect(different.rank).toBe(1)
-			expect(candidatesAsReturned.map((voucher) => voucher.name)).toEqual([suggested.name, different.name])
+		/*
+		 * A second candidate matching the transaction on value exactly as the first one does, so the ONLY
+		 * thing separating the two is the slot the endpoint put them in. That is what makes the pair worth
+		 * rendering: `isSuggested` requires `index === 0` on top of the value match, so the marker has to
+		 * follow the position rather than anything about the voucher itself.
+		 */
+		const equallyPlausible = makeSuggestedLinkedPayment(DEPOSIT_ROW, {
+			name: 'ACC-PAY-2024-00002',
+			rank: suggested.rank - 1
+		})
+
+		it('marks only the first candidate the endpoint returned as the suggestion', async () => {
+			renderWorkbench({
+				transactions: [DEPOSIT_ROW],
+				selected: [DEPOSIT_ROW],
+				vouchers: sortLinkedPaymentsAsEndpoint([equallyPlausible, suggested])
+			})
+
+			await waitFor(() => {
+				expect(within(voucherCard(suggested)).getByText('Suggested')).toBeInTheDocument()
+			})
+			expect(within(voucherCard(equallyPlausible)).queryByText('Suggested')).not.toBeInTheDocument()
+		})
+
+		it('moves the suggestion with the position, not with the voucher', async () => {
+			// The same two rows handed over in the opposite order, as they would arrive had the endpoint
+			// ranked the other one higher.
+			renderWorkbench({
+				transactions: [DEPOSIT_ROW],
+				selected: [DEPOSIT_ROW],
+				vouchers: [equallyPlausible, suggested]
+			})
+
+			await waitFor(() => {
+				expect(within(voucherCard(equallyPlausible)).getByText('Suggested')).toBeInTheDocument()
+			})
+			expect(within(voucherCard(suggested)).queryByText('Suggested')).not.toBeInTheDocument()
 		})
 
 		it('sends the identity of the voucher the reviewer actually chose', async () => {
@@ -1089,10 +1139,18 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			expect(screen.queryByRole('button', { name: 'Reconcile' })).not.toBeInTheDocument()
 		})
 
-		it('reports the refusal and leaves the transaction unreconciled and unchanged', async () => {
+		it('reports the refusal and leaves the transaction unreconciled', async () => {
 			const user = userEvent.setup()
 			const refusal = makeAlreadyReconciledError(DEPOSIT_ROW.name)
 			frappePostCall.mockRejectedValue(refusal)
+			// The server's current answer for this account, which the refusal path re-reads: the row is
+			// still unreconciled, but its unallocated figure has moved on.
+			const serverCopy = makeUnreconciledTransaction({
+				...DEPOSIT_ROW,
+				unallocated_amount: TEST_TRANSACTION_AMOUNT / 2
+			})
+			frappeSWRMutate.mockImplementation((key) =>
+				Promise.resolve(key === UNRECONCILED_KEY ? { message: [serverCopy] } : undefined))
 
 			const { store } = renderWorkbench({
 				transactions: [DEPOSIT_ROW],
@@ -1108,7 +1166,11 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			await waitFor(() => {
 				expect(store.get(bankRecErrorDialogAtom)).toBe(refusal)
 			})
-			expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([DEPOSIT_ROW])
+			// Nothing was posted, so the row is still unreconciled - but the copy the client holds is now
+			// the server's, not the one it had before the attempt.
+			await waitFor(() => {
+				expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([serverCopy])
+			})
 			expect(store.get(SELECTED_TRANSACTION_ATOM)?.[0].status).toBe('Unreconciled')
 
 			expect(frappePostCall).toHaveBeenCalledTimes(1)
@@ -1116,15 +1178,33 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			await waitFor(() => {
 				expect(toastError).toHaveBeenCalledTimes(1)
 			})
+			// The server answered, so the client is entitled to name the outcome.
+			expect(toastError.mock.calls[0][0]).toBe('Reconciliation refused')
 		})
 
+		/*
+		 * "No retry" is asserted against the rejection path's own completion rather than against the
+		 * clock. The convergence read is the LAST thing that path awaits, so holding it open and then
+		 * releasing it by hand brackets the whole handler: the first count is taken while it is still
+		 * suspended, and the second only once the selection has converged, which cannot happen before
+		 * every continuation the handler could schedule has already run. A retry would have to appear
+		 * inside that bracket, so no wall-clock wait is needed to rule one out - and unlike a sleep,
+		 * this cannot pass merely because the machine was slow enough to finish after the assertion.
+		 */
 		it('does not retry a refused post, so a refusal cannot become a duplicate posting', async () => {
 			const user = userEvent.setup()
 			frappePostCall.mockRejectedValue(makeAlreadyReconciledError(DEPOSIT_ROW.name))
 
-			frappeSWRMutate.mockRejectedValue(new Error('revalidation unavailable'))
+			let releaseRefresh!: () => void
+			const heldRefresh = new Promise<{ message: UnreconciledTransaction[] }>((resolve) => {
+				// The row is absent from the re-read, which is what "already fully reconciled" looks like
+				// through `get_bank_transactions`: it filters on `unallocated_amount > 0`.
+				releaseRefresh = () => resolve({ message: [] })
+			})
+			frappeSWRMutate.mockImplementation((key) =>
+				key === UNRECONCILED_KEY ? heldRefresh : Promise.resolve(undefined))
 
-			renderWorkbench({
+			const { store } = renderWorkbench({
 				transactions: [DEPOSIT_ROW],
 				selected: [DEPOSIT_ROW],
 				vouchers: [suggested]
@@ -1135,11 +1215,21 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			})
 			await user.click(confirmControlFor(suggested))
 
+			// The refusal has been handled - the dialog holds it - while the re-read is still suspended.
 			await waitFor(() => {
-				expect(frappePostCall).toHaveBeenCalledTimes(1)
+				expect(store.get(bankRecErrorDialogAtom)).not.toBeNull()
+			})
+			expect(frappePostCall).toHaveBeenCalledTimes(1)
+
+			await act(async () => {
+				releaseRefresh()
+				await heldRefresh
 			})
 
-			await new Promise((resolve) => setTimeout(resolve, 50))
+			// Convergence has now run to completion, so nothing the handler scheduled is still pending.
+			await waitFor(() => {
+				expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([])
+			})
 			expect(frappePostCall).toHaveBeenCalledTimes(1)
 		})
 
@@ -1342,6 +1432,10 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			})
 
 			frappePostCall.mockRejectedValue(makeAlreadyReconciledError(stale.name))
+			// The stale row is absent from the re-read, which is what the server saying "already fully
+			// reconciled" looks like through `get_bank_transactions`: it filters on `unallocated_amount > 0`.
+			frappeSWRMutate.mockImplementation((key) =>
+				Promise.resolve(key === UNRECONCILED_KEY ? { message: [] } : undefined))
 
 			const { store } = renderWorkbench({
 				transactions: [stale],
@@ -1363,8 +1457,13 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			await waitFor(() => {
 				expect(store.get(bankRecErrorDialogAtom)).toBeNull()
 			})
-			expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([stale])
-			expect(store.get(SELECTED_TRANSACTION_ATOM)?.[0].status).toBe('Unreconciled')
+
+			// The stale client is corrected rather than merely warned: the selection the guard was computed
+			// from is dropped, so no Reconcile control is left offering the refused action again.
+			await waitFor(() => {
+				expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([])
+			})
+			expect(screen.queryByRole('button', { name: 'Reconcile' })).not.toBeInTheDocument()
 
 			expect(frappeSWRMutate).toHaveBeenCalledWith(UNRECONCILED_KEY)
 			expect(frappeSWRMutate).toHaveBeenCalledWith(BANK_TRANSACTIONS_KEY)
@@ -1373,7 +1472,7 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 
 			expect(toastError).toHaveBeenCalledTimes(1)
 			expect(toastError).toHaveBeenCalledWith(
-				'Error',
+				'Reconciliation refused',
 				expect.objectContaining({ description: formatAlreadyReconciledMessage(stale.name) })
 			)
 			expect(toastSuccess).not.toHaveBeenCalled()
@@ -1475,6 +1574,172 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 
 			expect(currencyAdvisoryChip(transactionRow(mismatched))).not.toBeNull()
 			expect(currencyAdvisoryChip(transactionRow(DEPOSIT_ROW))).toBeNull()
+		})
+
+		/*
+		 * The advisory has to agree with the rule the SERVER applies, and the persisted selection cannot
+		 * be trusted to: `selectedBankAccountAtom` is `localStorage`-backed and is only rewritten when
+		 * the selection changes, so re-selecting the same account replays a snapshot of unbounded age.
+		 * These two cases pin the source of truth from both directions.
+		 */
+		describe('reads the account currency from the server, not from the persisted selection', () => {
+			it('warns when the stale snapshot agrees with the row but the server does not', async () => {
+				renderWorkbench({
+					transactions: [mismatched],
+					// The snapshot claims the account is in the transaction's own currency, so a predicate
+					// reading it would conclude there is nothing to warn about.
+					persistedAccountCurrency: TEST_ALTERNATE_CURRENCY,
+					accountCurrency: TEST_CURRENCY
+				})
+
+				await waitFor(() => {
+					expect(transactionRow(mismatched)).toBeInTheDocument()
+				})
+
+				const chip = currencyAdvisoryChip(transactionRow(mismatched))
+				expect(chip).not.toBeNull()
+				expect(chip).toHaveTextContent(TEST_ALTERNATE_CURRENCY)
+			})
+
+			it('stays silent when the stale snapshot disagrees with the row but the server does not', async () => {
+				renderWorkbench({
+					transactions: [mismatched],
+					// The reverse error: a predicate reading the snapshot would warn about a mismatch the
+					// server no longer sees.
+					persistedAccountCurrency: TEST_CURRENCY,
+					accountCurrency: TEST_ALTERNATE_CURRENCY
+				})
+
+				await waitFor(() => {
+					expect(transactionRow(mismatched)).toBeInTheDocument()
+				})
+
+				expect(currencyAdvisoryChip(transactionRow(mismatched))).toBeNull()
+			})
+
+			it('stays silent while the account list is still in flight', async () => {
+				renderWorkbench({
+					transactions: [mismatched],
+					bankAccountsState: 'loading',
+					persistedAccountCurrency: TEST_CURRENCY
+				})
+
+				await waitFor(() => {
+					expect(transactionRow(mismatched)).toBeInTheDocument()
+				})
+
+				// No current answer is not the same as a different answer.
+				expect(currencyAdvisoryChip(transactionRow(mismatched))).toBeNull()
+			})
+		})
+
+		describe('is reachable by keyboard', () => {
+			const advisoryTrigger = (): HTMLElement =>
+				screen.getByLabelText(
+					`Currency mismatch: transaction in ${TEST_ALTERNATE_CURRENCY}, bank account in ${TEST_CURRENCY}`
+				)
+
+			it('names the advisory for assistive technology and takes focus', async () => {
+				renderWorkbench({ transactions: [mismatched], accountCurrency: TEST_CURRENCY })
+
+				await waitFor(() => {
+					expect(transactionRow(mismatched)).toBeInTheDocument()
+				})
+
+				const trigger = advisoryTrigger()
+				expect(trigger).toHaveAttribute('tabindex', '0')
+				expect(trigger.contains(currencyAdvisoryChip(transactionRow(mismatched)))).toBe(true)
+
+				act(() => {
+					trigger.focus()
+				})
+				expect(trigger).toHaveFocus()
+			})
+
+			it('reveals the full explanation on focus alone, with no pointer involved', async () => {
+				renderWorkbench({ transactions: [mismatched], accountCurrency: TEST_CURRENCY })
+
+				await waitFor(() => {
+					expect(transactionRow(mismatched)).toBeInTheDocument()
+				})
+
+				// Radix opens on focus with no hover delay to wait out.
+				act(() => {
+					advisoryTrigger().focus()
+				})
+
+				expect(await screen.findByRole('tooltip')).toHaveTextContent(
+					`Transaction currency ${TEST_ALTERNATE_CURRENCY} differs from the bank account currency ${TEST_CURRENCY}. This indicator does not block the action - the server validates the currency when the reconciliation is posted, and refuses a mismatch.`
+				)
+			})
+
+			it('points the trigger at the open explanation', async () => {
+				renderWorkbench({ transactions: [mismatched], accountCurrency: TEST_CURRENCY })
+
+				await waitFor(() => {
+					expect(transactionRow(mismatched)).toBeInTheDocument()
+				})
+
+				const trigger = advisoryTrigger()
+				act(() => {
+					trigger.focus()
+				})
+
+				const tooltip = await screen.findByRole('tooltip')
+				expect(trigger).toHaveAttribute('aria-describedby', tooltip.id)
+			})
+		})
+
+		/*
+		 * The advisory is last in a badge cluster that sits inside an `overflow-hidden` pane, and every
+		 * Badge is `shrink-0 whitespace-nowrap` by design. Without wrapping and a bound on the
+		 * variable-length badges ahead of it, a long rule name or reference pushed the warning clean out
+		 * of the visible area. jsdom computes no layout, so what is pinned here is that mechanism; the
+		 * rendered geometry is checked in a real browser.
+		 */
+		describe('survives a narrow pane and long neighbouring values', () => {
+			const crowded = makeCurrencyMismatchTransaction({
+				description: 'Cross-currency inbound wire with a long narrative',
+				reference_number: 'REF-'.repeat(20).concat('END'),
+				transaction_type: 'International Wire Transfer Credit Advice',
+				matched_transaction_rule: 'Rule for cross-currency inbound wires from the EU treasury desk'
+			})
+
+			it('still renders the advisory alongside them', async () => {
+				renderWorkbench({ transactions: [crowded], accountCurrency: TEST_CURRENCY })
+
+				await waitFor(() => {
+					expect(transactionRow(crowded)).toBeInTheDocument()
+				})
+
+				expect(currencyAdvisoryChip(transactionRow(crowded))).not.toBeNull()
+			})
+
+			it('lets the cluster wrap and bounds every badge ahead of the advisory', async () => {
+				renderWorkbench({ transactions: [crowded], accountCurrency: TEST_CURRENCY })
+
+				await waitFor(() => {
+					expect(transactionRow(crowded)).toBeInTheDocument()
+				})
+
+				const row = transactionRow(crowded)
+				const cluster = currencyAdvisoryChip(row)?.closest('div')
+				expect(cluster).not.toBeNull()
+				expect(cluster?.className).toContain('flex-wrap')
+
+				const rule = ruleBadge(row)
+				expect(rule?.className).toMatch(/max-w-/)
+				// A bound that ellipsises the name has to leave it discoverable somewhere.
+				expect(rule).toHaveAttribute(
+					'title',
+					`Matched by rule: ${crowded.matched_transaction_rule}`
+				)
+
+				row.querySelectorAll<HTMLElement>('[data-slot="badge"]').forEach((badge) => {
+					if (badge === currencyAdvisoryChip(row)) return
+					expect(badge.className).toMatch(/max-w-/)
+				})
+			})
 		})
 	})
 

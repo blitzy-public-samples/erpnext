@@ -609,16 +609,86 @@ describe('BankStatementImporter', () => {
 		})
 
 
-		it('only reads the failure map, never rewrites it', async () => {
+		it('leaves a still-applicable marker exactly as it found it', async () => {
 			const markers = makeImportFailures(FAILED_LOG, FAILED_LOG_MESSAGE)
 			const { store } = renderImporter({ logs: ALL_LOGS, markers })
 
 			expect(statusBadgeIn(rowFor(FAILED_LOG))).toHaveTextContent('Failed')
 
+			// The server still reports this log as `Not Started`, so nothing has overtaken the marker and
+			// the identical object survives - no needless re-render of every consumer.
 			await waitFor(() => {
 				expect(store.get(bankRecImportFailuresAtom)).toBe(markers)
 			})
 			expect(Object.keys(store.get(bankRecImportFailuresAtom))).toEqual([FAILED_LOG.name])
+		})
+
+		/*
+		 * A MARKER IS SUBORDINATE TO THE SERVER. It records what one request did; `status` records what
+		 * the server persisted. A log that failed once and then imported cleanly - directly, from another
+		 * tab, or from the Desk - comes back `Completed`, and the session marker must not go on
+		 * contradicting that for the rest of the session.
+		 */
+		describe('an authoritative Completed outranks a stale marker', () => {
+			const staleMarkerOnCompletedLog = makeImportFailures(COMPLETED_LOG, FAILED_LOG_MESSAGE)
+
+			it('renders Completed, not Failed', () => {
+				renderImporter({ logs: ALL_LOGS, markers: staleMarkerOnCompletedLog })
+
+				const badge = statusBadgeIn(rowFor(COMPLETED_LOG))
+
+				expect(badge).toHaveAttribute('data-theme', 'green')
+				expect(badge).toHaveTextContent('Completed')
+				expect(badge).not.toHaveTextContent('Failed')
+			})
+
+			it('retires the overtaken marker instead of keeping it for the session', async () => {
+				const { store } = renderImporter({ logs: ALL_LOGS, markers: staleMarkerOnCompletedLog })
+
+				await waitFor(() => {
+					expect(store.get(bankRecImportFailuresAtom)).toEqual({})
+				})
+			})
+
+			it('retires only the overtaken entry, leaving every still-valid marker in place', async () => {
+				const { store } = renderImporter({
+					logs: ALL_LOGS,
+					markers: { ...ATTEMPT_MARKERS, ...staleMarkerOnCompletedLog }
+				})
+
+				await waitFor(() => {
+					expect(Object.keys(store.get(bankRecImportFailuresAtom)).sort()).toEqual(
+						[FAILED_LOG.name, INDETERMINATE_LOG.name].sort()
+					)
+				})
+				expect(statusBadgeIn(rowFor(FAILED_LOG))).toHaveTextContent('Failed')
+				expect(statusBadgeIn(rowFor(INDETERMINATE_LOG))).toHaveTextContent('Failed')
+				expect(statusBadgeIn(rowFor(COMPLETED_LOG))).toHaveTextContent('Completed')
+			})
+
+			it('keeps a marker for a log outside this page of results, which is evidence of nothing', async () => {
+				const offListMarker = makeImportFailures(
+					makeBankStatementImportLog({ name: 'BSIL-2023-09999' }),
+					FAILED_LOG_MESSAGE
+				)
+				const { store } = renderImporter({ logs: [COMPLETED_LOG], markers: offListMarker })
+
+				await waitFor(() => {
+					expect(statusBadgeIn(rowFor(COMPLETED_LOG))).toHaveTextContent('Completed')
+				})
+				expect(Object.keys(store.get(bankRecImportFailuresAtom))).toEqual(['BSIL-2023-09999'])
+			})
+
+			it('prunes nothing while the list has not arrived', async () => {
+				const { store } = renderImporter({ logs: undefined, markers: staleMarkerOnCompletedLog })
+
+				// `data: undefined` is indistinguishable from an empty list in this component, so an
+				// unguarded prune would discard every marker before any evidence existed.
+				await waitFor(() => {
+					expect(screen.getByText('No bank statements imported yet')).toBeInTheDocument()
+				})
+				expect(store.get(bankRecImportFailuresAtom)).toEqual(staleMarkerOnCompletedLog)
+			})
 		})
 	})
 
@@ -800,6 +870,162 @@ describe('BankStatementImporter', () => {
 	})
 
 	/* ── Refusals that happen before any import log exists ──────────────────────────── */
+
+	/*
+	 * FM2's EMPTY / MALFORMED FILE PATH, END TO END, ON THE SURFACE WHERE IT ACTUALLY HAPPENS.
+	 *
+	 * `Bank Statement Import Log` parses the statement in `before_insert` - `get_data` for spreadsheets,
+	 * `prepare_pdf_tables` for PDFs - so an empty file, an unreadable one, a wrong file type, a
+	 * password-protected PDF without its password, or a PDF with no detectable tables is refused DURING
+	 * CREATION. No import log is written, so there is no detail screen to show the error on and no row
+	 * to hang a Failed badge from. The upload form is the only place the reviewer can be told.
+	 *
+	 * The tests above install the create hook's `error` MEMBER, which renders the inline banner. These
+	 * drive the actual promise REJECTION, which is a different path: before it was handled the rejection
+	 * was unhandled and the reviewer was left looking at an apparently idle form.
+	 */
+	describe('a statement the server cannot read is refused before any log exists (FM2)', () => {
+
+		const REFUSAL = 'No tables found in the PDF file'
+
+		const refuseCreation = async (
+			error: FrappeErrorFixture = makeServerMessagesError(REFUSAL),
+			file: File = csvStatementFile()
+		) => {
+			frappeFileUpload.mockResolvedValue(makeFileUploadResponse())
+			frappeCreateDoc.mockRejectedValue(error)
+			installCreateDocError(error)
+
+			const rendered = renderImporter({ logs: [] })
+			await chooseStatementFile(rendered.container, file)
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+			return { ...rendered, error }
+		}
+
+		it("reports the server's own words in the shared dismissible dialog", async () => {
+			await refuseCreation()
+
+			const dialog = await screen.findByRole('alertdialog')
+
+			expect(within(dialog).getByText(REFUSAL)).toBeInTheDocument()
+			expect(within(dialog).getByRole('button', { name: 'Dismiss' })).toBeInTheDocument()
+		})
+
+		it('hands the rejection to the dialog UNMODIFIED, so the shared parser sees Frappe\'s envelope', async () => {
+			const { store, error } = await refuseCreation()
+
+			await waitFor(() => {
+				expect(store.get(bankRecErrorDialogAtom)).toBe(error)
+			})
+		})
+
+		it('records NO failure marker, because no import log was created to key one against', async () => {
+			const { store } = await refuseCreation()
+
+			await screen.findByRole('alertdialog')
+			expect(store.get(bankRecImportFailuresAtom)).toEqual({})
+		})
+
+		it('claims no success: no detail view is opened, and the form is usable again once dismissed', async () => {
+			await refuseCreation()
+
+			await screen.findByRole('alertdialog')
+			expect(screen.queryByText(new RegExp(DETAIL_SENTINEL))).not.toBeInTheDocument()
+
+			// The dialog is modal, so Radix hides the form from the accessibility tree while it is open -
+			// the control is only assertable after dismissal, which is also when the reviewer can retry.
+			await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+
+			await waitFor(() => {
+				expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+			})
+			expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
+			expect(screen.queryByText(new RegExp(DETAIL_SENTINEL))).not.toBeInTheDocument()
+		})
+
+		it('raises the transient toast as well - the dialog is additive, not a replacement', async () => {
+			await refuseCreation()
+
+			await screen.findByRole('alertdialog')
+			expect(toastError).toHaveBeenCalledWith('The bank statement could not be uploaded.')
+			expect(toastSuccess).not.toHaveBeenCalled()
+		})
+
+		it('keeps the inline banner too, so the message survives dismissing the dialog', async () => {
+			await refuseCreation()
+
+			await userEvent.click(await screen.findByRole('button', { name: 'Dismiss' }))
+
+			await waitFor(() => {
+				expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+			})
+			expect(screen.getByRole('alert')).toHaveTextContent(REFUSAL)
+		})
+
+		it('creates nothing client-side: the refusal wrote no transactions and no log', async () => {
+			await refuseCreation()
+
+			await screen.findByRole('alertdialog')
+			expect(frappeCreateDoc).toHaveBeenCalledTimes(1)
+			expect(frappeCreateDoc).toHaveBeenCalledWith(IMPORT_LOG_DOCTYPE, expect.any(Object))
+			// The list is still the server's, unchanged: no optimistic row was invented for the attempt.
+			expect(screen.getByText('No bank statements imported yet')).toBeInTheDocument()
+			expect(screen.queryByRole('table')).not.toBeInTheDocument()
+		})
+
+		it('surfaces a refusal that arrives in _error_message rather than _server_messages', async () => {
+			const message = 'The uploaded file is empty.'
+			await refuseCreation(makeErrorMessageError(message))
+
+			expect(within(await screen.findByRole('alertdialog')).getByText(message)).toBeInTheDocument()
+		})
+
+		/*
+		 * The FIRST link can be the one to refuse it. The framework's own `File.before_insert` runs
+		 * `check_content` -> `pdf_contains_js`, so a file claiming to be a PDF that is not one is
+		 * rejected by `upload_file` itself and `createDoc` is never reached. Verified against the real
+		 * server, which answers that case with HTTP 500 from `pypdf`.
+		 */
+		it('reports a refusal from the UPLOAD leg, before creation is even attempted', async () => {
+			const message = 'Stream has ended unexpectedly'
+			const error = makeServerMessagesError(message)
+
+			frappeFileUpload.mockRejectedValue(error)
+			installFileUploadError(error)
+
+			const { container, store } = renderImporter({ logs: [] })
+			await chooseStatementFile(container, csvStatementFile())
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+			const dialog = await screen.findByRole('alertdialog')
+			expect(within(dialog).getByText(message)).toBeInTheDocument()
+
+			await waitFor(() => {
+				expect(store.get(bankRecErrorDialogAtom)).toBe(error)
+			})
+			// The chain stopped at the first link: nothing was created and nothing was navigated to.
+			expect(frappeCreateDoc).not.toHaveBeenCalled()
+			expect(screen.queryByText(new RegExp(DETAIL_SENTINEL))).not.toBeInTheDocument()
+			expect(store.get(bankRecImportFailuresAtom)).toEqual({})
+		})
+
+		it('handles the rejection, leaving no unhandled promise behind', async () => {
+			const unhandled = vi.fn<(event: PromiseRejectionEvent) => void>()
+			window.addEventListener('unhandledrejection', unhandled)
+
+			try {
+				await refuseCreation()
+				await screen.findByRole('alertdialog')
+				// One microtask turn past the point the chain settles.
+				await Promise.resolve()
+
+				expect(unhandled).not.toHaveBeenCalled()
+			} finally {
+				window.removeEventListener('unhandledrejection', unhandled)
+			}
+		})
+	})
 
 	describe('page shell', () => {
 

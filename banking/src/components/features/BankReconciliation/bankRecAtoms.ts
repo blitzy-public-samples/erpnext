@@ -7,14 +7,19 @@ import { UnreconciledTransaction } from "./utils";
 import { BankTransaction } from "@/types/Accounts/BankTransaction";
 import { PaymentEntry } from "@/types/Accounts/PaymentEntry";
 import { JournalEntry } from "@/types/Accounts/JournalEntry";
-import { FrappeError } from "frappe-react-sdk";
+import type { FrappeError } from "frappe-react-sdk";
 
 export interface SelectedBank extends Pick<BankAccount, 'name' | 'bank' | 'is_credit_card' | 'company' | 'account_name' | 'bank_account_no' | 'account' | 'account_type' | 'integration_id' | 'is_default' | 'last_integration_date'> {
     logo?: string,
     logoDark?: string,
     darkModeInvert?: boolean,
     logoClassName?: string,
-    account_currency?: string
+    /**
+     * Optional AND nullable, unlike the endpoint projection it is copied from: this is a persisted
+     * snapshot, so it may predate the key entirely (`undefined`) as well as carry the endpoint's own
+     * `null` for an account whose GL account has no currency.
+     */
+    account_currency?: string | null
 }
 export const selectedBankAccountAtom = atomWithStorage<SelectedBank | null>('bank-rec-selected-bank', null, undefined, {
     getOnInit: true
@@ -91,22 +96,12 @@ export const bankRecActionLog = atomWithStorage<ActionLog[]>('bank-rec-action-lo
  * would assert something nothing has re-checked.
  */
 
-/**
- * The rejection the shared dismissible `BankRecErrorDialog` is reporting, or `null` when the dialog
- * renders nothing - the falsy-means-closed convention `bankRecUnreconcileModalAtom` also uses.
- *
- * Held exactly as the SDK handed it over, never reshaped: `ErrorBanner` parses `_server_messages`
- * itself and picks its severity from the server's own `indicator`, so passing the object through by
- * identity is what makes the server's own wording reach the reviewer verbatim.
- */
+/** The rejection the shared dismissible `BankRecErrorDialog` is reporting; `null` closes it. */
 export const bankRecErrorDialogAtom = atom<FrappeError | null>(null)
 
 /**
- * Per-file import failures, keyed by `Bank Statement Import Log` name and holding the raw rejection so
- * the rendering layer parses it through that same shared path.
- *
- * The marker cannot come from the row itself: the DocType offers only `Not Started` and `Completed`
- * and carries no error field, and a failed import rolls back, so the log reads exactly as one nobody
- * has tried yet.
+ * Import failures observed this session, keyed by `Bank Statement Import Log` name. The DocType has no
+ * error field and only `Not Started`/`Completed`, and a failed import rolls back, so a failure is not
+ * recoverable from the row itself.
  */
 export const bankRecImportFailuresAtom = atom<Record<string, FrappeError>>({})

@@ -120,9 +120,20 @@ export interface GetStatementDetailsResponse {
     }>,
     date_format: string,
     raw_data: Array<Array<string>>,
-    currency: string,
+    /**
+     * PDF statements only. `get_statement_details` returns this key exclusively from its `is_pdf()`
+     * branch, so a CSV/XLSX response omits it entirely.
+     */
     pdf_tables?: PDFTable[],
 }
+
+/*
+ * DELIBERATELY NO TOP-LEVEL `currency`. `get_statement_details` returns `doc`, `date_format`,
+ * `conflicting_transactions`, `final_transactions`, `raw_data` and - for PDFs only - `pdf_tables`. The
+ * statement's own currency lives on `doc.currency`, and `conflicting_transactions` rows carry their
+ * own. Declaring one here made `data.currency` type-check while being `undefined` at runtime, which
+ * silently formatted every statement total with the browser default instead of the statement currency.
+ */
 
 export const useGetStatementDetails = (id: string) => {
     return useFrappeGetCall<{ message: GetStatementDetailsResponse }>("erpnext.accounts.doctype.bank_statement_import_log.bank_statement_import_log.get_statement_details", {

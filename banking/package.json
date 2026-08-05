@@ -73,6 +73,7 @@
     "vitest": "4.1.10"
   },
   "resolutions": {
-    "vitest/vite": "8.1.2"
+    "vitest/vite": "8.1.2",
+    "ws": "8.21.2"
   }
 }

@@ -166,23 +166,26 @@ const makeImportLog = (overrides: Partial<BankStatementImportLog> = {}): BankSta
 
 /**
  * The prop this step consumes, composed from the shared import-log builder plus the members the screen
- * reads. It is typed against `GetStatementDetailsResponse`, so the fixture supplies that interface's
- * declared members - including the top-level `currency` the screen formats its figures from - and a
- * member the interface does not declare cannot be invented here without a compile error. The optional
- * `pdf_tables` is omitted, because this component never reads it.
+ * reads. Typed against `GetStatementDetailsResponse`, so a member the endpoint does not return cannot
+ * be invented here without a compile error.
+ *
+ * THE STATEMENT CURRENCY IS ON `doc`, NOT AT THE TOP LEVEL. `get_statement_details` returns exactly
+ * `doc`, `date_format`, `conflicting_transactions`, `final_transactions`, `raw_data` and - for PDFs
+ * only - `pdf_tables`; `pdf_tables` is omitted because this component never reads it. An earlier
+ * revision of this fixture supplied a top-level `currency` that the endpoint never sends, which made
+ * the screen's `data.currency` reads look correct here while being `undefined` in production.
  */
 const RESPONSE_CURRENCY = TEST_CURRENCY
 
 const makeStatementDetails = (
 	overrides: Partial<GetStatementDetailsResponse> = {}
 ): GetStatementDetailsResponse => ({
-	doc: makeImportLog(),
+	doc: makeImportLog({ currency: RESPONSE_CURRENCY }),
 	conflicting_transactions: CONFLICTING_TRANSACTIONS,
 	final_transactions: FINAL_TRANSACTIONS,
 	date_format: DETECTED_DATE_FORMAT,
 	raw_data: RAW_DATA,
-	...overrides,
-	currency: overrides.currency ?? RESPONSE_CURRENCY
+	...overrides
 })
 
 const importCall = vi.fn<(params: Record<string, unknown>) => Promise<unknown>>()
@@ -559,10 +562,25 @@ describe('StatementDetails', () => {
 			expect(screen.queryByRole('button', { name: /^Import \d+ transactions$/ })).not.toBeInTheDocument()
 		})
 
-		it('withholds the control for a file the server recognised no transactions in', () => {
+		/*
+		 * A CLIENT-SIDE GUARD, NOT THE FM2 EMPTY-FILE PATH. Reaching this screen at all means the file
+		 * already parsed: `Bank Statement Import Log` runs `get_data` / `prepare_pdf_tables` in
+		 * `before_insert`, so a genuinely empty or malformed file is refused during creation, on the
+		 * upload surface, and no detail screen is ever rendered for it. That refusal is covered
+		 * end-to-end in `pages/BankStatementImporter.test.tsx`.
+		 *
+		 * What this covers is the narrower case of a file that parsed but yielded no rows - so there is
+		 * nothing to post, and the control is withheld rather than dispatched.
+		 */
+		it('withholds the control for a parsed file the server recognised no transactions in', async () => {
 			renderStatementDetails(makeStatementDetails({ final_transactions: [], conflicting_transactions: [] }))
 
 			expect(screen.getByRole('button', { name: 'Import 0 transactions' })).toBeDisabled()
+
+			// Disabled means DISPATCHES NOTHING, which is the property that actually matters.
+			await userEvent.click(screen.getByRole('button', { name: 'Import 0 transactions' }))
+			expect(importCall).not.toHaveBeenCalled()
+			expectNoClientSideWrites()
 		})
 	})
 
@@ -705,7 +723,42 @@ describe('StatementDetails', () => {
 	})
 
 
+	/*
+	 * THE SERVER'S `progress` IS A PERCENTAGE, NOT A ROW COUNT. `insert_transactions` publishes
+	 * `{ progress: round(done / total * 100) }` after each row and then ONE terminal
+	 * `{ progress: 100, total: <rows> }`. `total` is therefore the only figure in this channel that is
+	 * a transaction count, and it arrives exactly once, at the end.
+	 *
+	 * Events also carry no import-log identity, so this screen accepts them only while an attempt IT
+	 * started has not yet settled. Each test below therefore starts a real import first.
+	 */
 	describe('realtime import progress', () => {
+	/*
+	 * The bar's FILL, read off the indicator's inline transform, which is `translateX(-(100 - value)%)`.
+	 *
+	 * Asserted here rather than through `aria-valuenow`, because the shared `ui/progress` primitive
+	 * destructures `value` and never forwards it to the Radix root: the root therefore always reports
+	 * itself indeterminate with no `aria-valuenow` at all, whatever value it is given. That is a defect
+	 * in a design-system primitive this project treats as reference-only, so it is documented rather
+	 * than fixed, and the transform is what remains observable.
+	 */
+	const indicatorTransform = (): string | undefined =>
+		screen
+			.getByRole('progressbar')
+			.querySelector<HTMLElement>('[data-slot="progress-indicator"]')?.style.transform
+
+		/** Dispatches Import against a post that never settles, so the attempt stays in flight. */
+		const startAnImportThatStaysInFlight = async () => {
+			let settle: () => void = () => undefined
+			importCall.mockImplementation(() => new Promise<never>(() => {
+				settle = () => undefined
+			}))
+			void settle
+
+			renderStatementDetails(makeStatementDetails())
+			await userEvent.click(screen.getByRole('button', { name: 'Import 3 transactions' }))
+		}
+
 		it('subscribes to the import-progress channel', () => {
 			renderStatementDetails(makeStatementDetails())
 
@@ -716,43 +769,114 @@ describe('StatementDetails', () => {
 			expect(getFrappeEventListener(IMPORT_PROGRESS_CHANNEL)).toBeTypeOf('function')
 		})
 
-		it('renders the pushed figure alongside the bar, and follows each subsequent push', () => {
-			renderStatementDetails(makeStatementDetails())
+		it('shows the bar reset to zero the moment an import is dispatched', async () => {
+			await startAnImportThatStaysInFlight()
+
+			expect(screen.getByRole('progressbar')).toBeInTheDocument()
+			expect(indicatorTransform()).toBe('translateX(-100%)')
+			expect(screen.getByText('Importing... 0% complete')).toBeInTheDocument()
+		})
+
+		it('reports each pushed figure as a PERCENTAGE, not a transaction count', async () => {
+			await startAnImportThatStaysInFlight()
 
 			// `act` is the caller's responsibility: the captured handler sets React state.
 			act(() => {
 				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 33 })
 			})
-			expect(screen.getByText('Importing 33 transactions')).toBeInTheDocument()
-			expect(screen.getByRole('progressbar')).toBeInTheDocument()
+			expect(screen.getByText('Importing... 33% complete')).toBeInTheDocument()
+			expect(indicatorTransform()).toBe('translateX(-67%)')
+			// The old copy claimed 33 transactions had been written, which the payload never said.
+			expect(screen.queryByText('Importing 33 transactions')).not.toBeInTheDocument()
 
 			act(() => {
 				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 67 })
 			})
-			expect(screen.getByText('Importing 67 transactions')).toBeInTheDocument()
-			expect(screen.queryByText('Importing 33 transactions')).not.toBeInTheDocument()
+			expect(screen.getByText('Importing... 67% complete')).toBeInTheDocument()
+			expect(screen.queryByText('Importing... 33% complete')).not.toBeInTheDocument()
 		})
 
-		it('renders nothing until the server pushes a figure', () => {
+		it('states a transaction count only from the terminal event, which is the only one carrying it', async () => {
+			await startAnImportThatStaysInFlight()
+
+			act(() => {
+				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 50 })
+			})
+			expect(screen.getByText('Importing... 50% complete')).toBeInTheDocument()
+
+			act(() => {
+				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 100, total: 3 })
+			})
+			expect(screen.getByText('Imported 3 transactions.')).toBeInTheDocument()
+			expect(indicatorTransform()).toBe('translateX(-0%)')
+			expect(screen.queryByText(/% complete/)).not.toBeInTheDocument()
+		})
+
+		it('renders nothing before an import is dispatched', () => {
 			renderStatementDetails(makeStatementDetails())
 
 			expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
-			expect(screen.queryByText(/Importing transactions/)).not.toBeInTheDocument()
+			expect(screen.queryByText(/% complete/)).not.toBeInTheDocument()
 		})
 
-		it('caps the bar at the maximum it declares, whatever figure arrives', () => {
+		it('IGNORES a figure that arrives outside an attempt this screen started', () => {
 			renderStatementDetails(makeStatementDetails())
+
+			// A concurrent import of a DIFFERENT log, or a straggler from a settled attempt: the payload
+			// carries no log identity, so an ungated listener would paint this screen with it.
+			act(() => {
+				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 42 })
+			})
+
+			expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+			expect(screen.queryByText('Importing... 42% complete')).not.toBeInTheDocument()
+		})
+
+		it('clears the bar when the import is refused, because the rollback undid the progress', async () => {
+			importCall.mockRejectedValue(makeServerMessagesError('This bank account is disabled'))
+
+			renderStatementDetails(makeStatementDetails())
+			await userEvent.click(screen.getByRole('button', { name: 'Import 3 transactions' }))
+
+			await waitFor(() => {
+				expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+			})
+			expect(screen.queryByText(/% complete/)).not.toBeInTheDocument()
+		})
+
+		it('ignores a straggler that arrives after the attempt was refused', async () => {
+			importCall.mockRejectedValue(makeServerMessagesError('This bank account is disabled'))
+
+			renderStatementDetails(makeStatementDetails())
+			await userEvent.click(screen.getByRole('button', { name: 'Import 3 transactions' }))
+			await waitFor(() => {
+				expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+			})
+
+			act(() => {
+				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 90 })
+			})
+
+			// A superseded attempt cannot repopulate a failed screen.
+			expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+		})
+
+		it('clamps a figure outside 0-100 rather than rendering an impossible bar', async () => {
+			await startAnImportThatStaysInFlight()
 
 			act(() => {
 				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 120 })
 			})
 
-			// The bar's own contract is what bounds the visual: it declares `max={100}`, and Radix omits
-			// `aria-valuenow` altogether for a value outside that range rather than announcing an
-			// impossible one.
-			const bar = screen.getByRole('progressbar')
-			expect(bar).toHaveAttribute('aria-valuemax', '100')
-			expect(bar).not.toHaveAttribute('aria-valuenow')
+			expect(screen.getByText('Importing... 100% complete')).toBeInTheDocument()
+			expect(indicatorTransform()).toBe('translateX(-0%)')
+
+			act(() => {
+				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: -5 })
+			})
+
+			expect(screen.getByText('Importing... 0% complete')).toBeInTheDocument()
+			expect(indicatorTransform()).toBe('translateX(-100%)')
 		})
 	})
 

@@ -19,10 +19,13 @@ import _ from "@/lib/translate"
 import { cn } from "@/lib/utils"
 import { BankStatementImportLog } from "@/types/Accounts/BankStatementImportLog"
 import { useFrappeCreateDoc, useFrappeFileUpload, useFrappeGetDocList, useFrappeUpdateDoc } from "frappe-react-sdk"
-import { useAtom, useAtomValue } from "jotai"
+import type { FrappeError } from "frappe-react-sdk"
+import { useAtom, useAtomValue, useSetAtom } from "jotai"
 import { ListIcon, Loader2Icon } from "lucide-react"
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { useNavigate } from "react-router"
+import { toast } from "sonner"
+import { bankRecErrorDialogAtom } from "@/components/features/BankReconciliation/bankRecAtoms"
 
 
 const BankStatementImporter = () => {
@@ -39,6 +42,8 @@ const BankStatementImporter = () => {
     const navigate = useNavigate()
     const { createDoc, loading: createLoading, error: createError } = useFrappeCreateDoc<BankStatementImportLog>()
     const { updateDoc, error: updateError } = useFrappeUpdateDoc()
+
+    const setBankRecErrorDialog = useSetAtom(bankRecErrorDialogAtom)
 
     const isPdf = files[0]?.name?.toLowerCase().endsWith(".pdf") ?? false
 
@@ -63,7 +68,7 @@ const BankStatementImporter = () => {
             fieldname: 'file'
         })).then((file) => {
             return createDoc("Bank Statement Import Log",
-                // @ts-expect-error createDoc's generated type requires fields populated by the server.
+                // @ts-expect-error - not filling everything else
                 {
                     name: id,
                     file: file.file_url,
@@ -71,6 +76,28 @@ const BankStatementImporter = () => {
                 })
         }).then((doc) => {
             navigate(`/statement-importer/${doc.name}`)
+        }).catch((uploadError: FrappeError) => {
+            /*
+             * THIS is where a malformed or unreadable statement is refused, and the handler is attached
+             * to the WHOLE chain because either of the first two links can be the one to refuse it:
+             *
+             *   - `upload_file` rejects when the framework's own `File.before_insert` refuses the
+             *     content - `check_content` runs `pdf_contains_js`, so a file claiming to be a PDF that
+             *     is not one fails right here, before any import log is even attempted;
+             *   - `createDoc` rejects when `Bank Statement Import Log.before_insert` cannot parse a file
+             *     the framework accepted (`get_data` / `prepare_pdf_tables`), or when `validate`
+             *     refuses the bank account.
+             *
+             * Either way no import log is created, so there is no detail screen to report on and no row
+             * to hang a failure marker from - the upload form is the only place the reviewer can be
+             * told. Without this handler the rejection was unhandled and the form simply looked idle.
+             *
+             * The shared dismissible dialog reports the server's own words; the inline banners above
+             * keep them on the page after it is dismissed. The wording below stays neutral about WHICH
+             * link refused, because that is what the dialog is for.
+             */
+            setBankRecErrorDialog(uploadError)
+            toast.error(_("The bank statement could not be uploaded."))
         })
     }
 
@@ -242,8 +269,38 @@ const StatementImportLog = () => {
      * Log` name. They cannot come from the row itself: the DocType carries no error field and offers
      * only `Not Started` and `Completed`, and a failed import rolls back, so the row reads exactly as
      * one nobody has tried yet. The third badge state below renders from these markers.
+     *
+     * They are strictly SUBORDINATE to the server: a marker is an observation this session made about a
+     * request, while `status` is what the server persisted. Wherever the two disagree the server wins,
+     * both in the badge below and in the prune here.
      */
-    const importFailures = useAtomValue(bankRecImportFailuresAtom)
+    const [importFailures, setImportFailures] = useAtom(bankRecImportFailuresAtom)
+
+    /*
+     * Retire markers the fetched rows have overtaken - a log the server now reports as `Completed`, or
+     * one that has disappeared from this account's list. Without this a marker recorded once would
+     * outlive its cause for the whole session, since nothing else in the SPA ever removes one.
+     */
+    useEffect(() => {
+        if (!data) return
+
+        setImportFailures((failures) => {
+            const marked = Object.keys(failures)
+            if (marked.length === 0) return failures
+
+            const stale = new Set(marked)
+            const listed = new Map(data.map((row) => [row.name, row.status]))
+
+            for (const name of marked) {
+                // A log outside this account's page of results is not evidence of anything: keep it.
+                if (listed.has(name) && listed.get(name) !== "Completed") stale.delete(name)
+                else if (!listed.has(name)) stale.delete(name)
+            }
+
+            if (stale.size === 0) return failures
+            return Object.fromEntries(Object.entries(failures).filter(([name]) => !stale.has(name)))
+        })
+    }, [data, setImportFailures])
 
     const onViewDetails = (name: string) => {
         navigate(`/statement-importer/${name}`)
@@ -272,9 +329,16 @@ const StatementImportLog = () => {
                         {data?.map((item) => (
                             <TableRow key={item.name} onClick={() => onViewDetails(item.name)} className="cursor-pointer hover:bg-surface-gray-2">
                                 <TableCell>{formatDate(item.creation, 'Do MMM YYYY')}</TableCell>
-                                <TableCell>{importFailures[item.name]
-                                    ? <Badge theme="red">{_("Failed")}</Badge>
-                                    : <Badge theme={item.status === "Completed" ? "green" : "gray"}>{item.status}</Badge>}</TableCell>
+                                {/* The server's `Completed` is checked FIRST, so an authoritative
+                                    success always outranks a marker left by an earlier failed attempt.
+                                    `solid` red rather than the default `subtle`: subtle red on the dark
+                                    surface measures 4.407:1, under the 4.5:1 WCAG AA floor for this
+                                    text size, whereas solid puts `ink-red-1` on `surface-red-5`. */}
+                                <TableCell>{item.status === "Completed"
+                                    ? <Badge theme="green">{item.status}</Badge>
+                                    : importFailures[item.name]
+                                        ? <Badge variant="solid" theme="red">{_("Failed")}</Badge>
+                                        : <Badge theme="gray">{item.status}</Badge>}</TableCell>
                                 <TableCell>
                                     {item.start_date && item.end_date ? (
                                         <span>{formatDate(item.start_date, 'Do MMM YYYY')} to {formatDate(item.end_date, 'Do MMM YYYY')}</span>

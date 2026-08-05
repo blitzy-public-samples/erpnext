@@ -132,12 +132,13 @@ export const makeReconciledTransaction = (
 
 /**
  * A transaction denominated in {@link TEST_ALTERNATE_CURRENCY}, for the currency-mismatch advisory.
- * Pair it with a {@link makeSelectedBank} whose `account_currency` is {@link TEST_CURRENCY}.
+ * Pair it with a {@link makeBankAccountListRow} whose `account_currency` is {@link TEST_CURRENCY} -
+ * that endpoint response, not the persisted selection, is what the advisory compares against.
  *
- * It promises nothing about how the backend answers a post, so a suite mocks whichever response it
- * intends to exercise. A mismatch is not necessarily refused: `validate_currency` is reached only from
- * `validate()`, while the reconcile path saves an already-submitted document, which Frappe routes
- * through `update_after_submit`.
+ * The advisory itself never blocks, so a suite mocks whichever post response it intends to exercise.
+ * The server does refuse a mismatch: `Bank Transaction` runs `validate_currency` from
+ * `before_update_after_submit` as well as `validate`, and the reconcile path saves an already-submitted
+ * document, so the refusal arrives as an ordinary rejection on that path.
  */
 export const makeCurrencyMismatchTransaction = (
 	overrides: Partial<UnreconciledTransaction> = {}

@@ -347,6 +347,34 @@ class ResizeObserverStub {
 
 globalThis.ResizeObserver = ResizeObserverStub
 
+/**
+ * The Pointer Capture API, which jsdom does not implement at all.
+ *
+ * Radix's Select and Slider open by capturing the pointer, and its overlay primitives release it on
+ * dismiss. Without these three the trigger throws `hasPointerCapture is not a function` the moment a
+ * test tries to open a select, so the whole column-mapping surface of the statement importer would be
+ * undrivable. They are no-ops because there is no real pointer to capture: `hasPointerCapture` reports
+ * `false` so Radix follows its "capture not held" path, which is the correct branch under a synthetic
+ * pointer.
+ */
+HTMLElement.prototype.hasPointerCapture = HTMLElement.prototype.hasPointerCapture ??
+	function hasPointerCapture(): boolean {
+		return false
+	}
+
+HTMLElement.prototype.setPointerCapture = HTMLElement.prototype.setPointerCapture ??
+	function setPointerCapture(): void { }
+
+HTMLElement.prototype.releasePointerCapture = HTMLElement.prototype.releasePointerCapture ??
+	function releasePointerCapture(): void { }
+
+/**
+ * Radix scrolls the active option into view when a select opens. jsdom performs no layout and so ships
+ * no implementation, which would otherwise abort the open.
+ */
+Element.prototype.scrollIntoView = Element.prototype.scrollIntoView ??
+	function scrollIntoView(): void { }
+
 /* ── 9. Per-test teardown ────────────────────────────────────────────────────────── */
 
 afterEach(() => {

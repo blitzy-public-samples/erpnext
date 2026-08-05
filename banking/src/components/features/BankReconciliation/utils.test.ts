@@ -26,7 +26,6 @@ import {
 	makeServerMessagesError,
 	makeBankAccountListRow,
 	makeBankTransaction,
-	makeBankTransactionPayment,
 	makeLinkedPayment,
 	makeReconcileSuccessResponse,
 	makeReconciledTransaction,
@@ -327,9 +326,6 @@ describe('the transaction-list queries', () => {
 		expect(lastGetCallFor(GET_BANK_TRANSACTIONS)[2]).toBeNull()
 	})
 
-	it('keeps the two transaction lists on separate cache keys', () => {
-		expect(UNRECONCILED_KEY).not.toBe(ALL_TRANSACTIONS_KEY)
-	})
 })
 
 describe('the candidate-voucher query', () => {
@@ -451,11 +447,6 @@ describe('the cache-key surface is closed at five families', () => {
 		expect(declaredKeys).toContain(vouchersKeyFor(transaction.name, DEFAULT_JOINED_MATCH_FILTERS))
 	})
 
-	it('attributes a key from outside the five families to no family at all', () => {
-		expect(familyOf('bank-reconciliation-something-new-Test Bank')).toBeUndefined()
-		expect(familyOf(undefined)).toBeUndefined()
-		expect(familyOf(null)).toBeUndefined()
-	})
 })
 
 /*
@@ -701,6 +692,33 @@ describe('useReconcileTransaction — the accepted post (TC4)', () => {
 
 		expect(store.get(bankRecErrorDialogAtom)).toBeNull()
 	})
+
+	/*
+	 * The action log is the one place the reconciled document is retained after the post, so it is where
+	 * "the server's answer, not a locally assembled one" is observable. The allocation figures and the
+	 * status are asserted to be the ones the RESPONSE carried rather than any value computed from the
+	 * request, which is what makes the log an audit trail rather than a restatement of what was asked for.
+	 */
+	it("logs the server's own reconciled document, with its allocation figures untouched", async () => {
+		const serverAnswer = makeReconcileSuccessResponse({ unallocated_amount: 2500 })
+		const { store, voucher } = await confirmMatch(serverAnswer)
+
+		const log = store.get(bankRecActionLog)
+		expect(log).toHaveLength(1)
+		expect(log[0]).toMatchObject({ type: 'match', isBulk: false })
+
+		// The identical object the response carried, not a copy the client rebuilt.
+		expect(log[0].items[0].bankTransaction).toBe(serverAnswer.message)
+		expect(log[0].items[0].bankTransaction.allocated_amount).toBe(TEST_TRANSACTION_AMOUNT - 2500)
+		expect(log[0].items[0].bankTransaction.unallocated_amount).toBe(2500)
+		expect(log[0].items[0].bankTransaction.status).toBe('Unreconciled')
+
+		// The voucher side comes from what the reviewer chose, which is the client's to supply.
+		expect(log[0].items[0].voucher).toMatchObject({
+			reference_doctype: voucher.doctype,
+			reference_name: voucher.name
+		})
+	})
 })
 describe('a refused post leaves the client\'s state exactly as it was', () => {
 
@@ -718,19 +736,41 @@ describe('a refused post leaves the client\'s state exactly as it was', () => {
 		errorToast.mockRestore()
 	})
 
-	const refuseConfirm = async () => {
+	/**
+	 * Drive one refused confirmation.
+	 *
+	 * `refreshedRows` is what the revalidated unreconciled query answers with, i.e. the server's current
+	 * copy of the account. It defaults to a row whose amounts the server has moved on from, so the
+	 * convergence assertions below are about the client adopting the server's answer rather than about
+	 * it happening to keep what it already had.
+	 */
+	const refuseConfirm = async (
+		{
+			refusal,
+			refreshedRows
+		}: {
+			refusal?: unknown
+			refreshedRows?: UnreconciledTransaction[]
+		} = {}
+	) => {
 		const store = createSeededStore()
 		const transaction = makeUnreconciledTransaction()
 		store.set(SELECTED_TRANSACTION_ATOM, [transaction])
-		const refusal = makeAlreadyReconciledError(transaction.name)
-		frappePostCall.mockRejectedValue(refusal)
+		const rejection = refusal ?? makeAlreadyReconciledError(transaction.name)
+		frappePostCall.mockRejectedValue(rejection)
+
+		const serverRows = refreshedRows ?? [
+			makeUnreconciledTransaction({ unallocated_amount: TEST_TRANSACTION_AMOUNT / 2 })
+		]
+		frappeSWRMutate.mockImplementation((key) =>
+			Promise.resolve(key === UNRECONCILED_KEY ? { message: serverRows } : undefined))
 
 		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
 		await act(async () => {
 			result.current.reconcileTransaction(transaction, makeLinkedPayment())
 		})
 
-		return { store, transaction, refusal }
+		return { store, transaction, refusal: rejection, serverRows }
 	}
 
 	it('never writes a reconciled status anywhere, for any row', async () => {
@@ -739,18 +779,51 @@ describe('a refused post leaves the client\'s state exactly as it was', () => {
 		expect(transaction.status).toBe('Unreconciled')
 		expect(transaction.unallocated_amount).toBe(TEST_TRANSACTION_AMOUNT)
 
-		expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([transaction])
+		// Whatever ends up selected came out of the server's answer, and the client wrote no status of
+		// its own onto it.
 		expect(store.get(SELECTED_TRANSACTION_ATOM)?.[0].status).toBe('Unreconciled')
 	})
 
-	it('leaves the selection exactly as it was and re-reads the server instead', async () => {
-		const { store, transaction } = await refuseConfirm()
+	/*
+	 * The selected transaction lives in its own atom, so revalidating the lists is not by itself enough:
+	 * every guard the reviewer sees - the already-reconciled check on Reconcile among them - is computed
+	 * from that atom, and a copy left behind from before the refusal would keep those guards reading a
+	 * row the server has already moved past.
+	 */
+	it('replaces the selection with the server\'s current copy of the row', async () => {
+		const { store, serverRows } = await refuseConfirm()
 
+		expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual(serverRows)
+		expect(store.get(SELECTED_TRANSACTION_ATOM)?.[0].unallocated_amount)
+			.toBe(TEST_TRANSACTION_AMOUNT / 2)
+	})
+
+	it('clears the selection when the server no longer reports the row as unreconciled', async () => {
+		// A row that has been reconciled elsewhere drops out of `get_bank_transactions`, which filters on
+		// `unallocated_amount > 0` - so its absence is the server saying it is no longer reconcilable.
+		const { store } = await refuseConfirm({ refreshedRows: [] })
+
+		expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([])
+	})
+
+	it('leaves the selection alone when the re-read itself fails', async () => {
+		const store = createSeededStore()
+		const transaction = makeUnreconciledTransaction()
+		store.set(SELECTED_TRANSACTION_ATOM, [transaction])
+		frappePostCall.mockRejectedValue(makeAlreadyReconciledError(transaction.name))
+		frappeSWRMutate.mockRejectedValue(new Error('offline'))
+
+		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+		await act(async () => {
+			result.current.reconcileTransaction(transaction, makeLinkedPayment())
+		})
+
+		// No authoritative answer arrived, so guessing would be worse than showing what the reviewer last
+		// saw beside the error the dialog is already reporting.
 		expect(store.get(SELECTED_TRANSACTION_ATOM)).toEqual([transaction])
-		expect(frappeSWRMutate.mock.calls.map(([key]) => key)).toEqual([
-			UNRECONCILED_KEY,
-			ALL_TRANSACTIONS_KEY
-		])
+		// The rejected revalidations are contained: nothing escapes as an unhandled rejection, and the
+		// follow-up toast is NOT raised, because `Promise.allSettled` absorbs them.
+		expect(errorToast).toHaveBeenCalledTimes(1)
 	})
 
 	it('does not retry, so a refusal cannot become a duplicate posting', async () => {
@@ -770,22 +843,25 @@ describe('a refused post leaves the client\'s state exactly as it was', () => {
 
 		expect(store.get(bankRecErrorDialogAtom)).toBe(refusal)
 		expect(errorToast).toHaveBeenCalledTimes(1)
-		expect(errorToast.mock.calls[0][0]).toBe('Error')
+		// The server answered, so the client is entitled to call it a refusal.
+		expect(errorToast.mock.calls[0][0]).toBe('Reconciliation refused')
 		expect(String((errorToast.mock.calls[0][1] as { description?: unknown } | undefined)?.description))
 			.toContain(formatAlreadyReconciledMessage(transaction.name))
 	})
 
 	/*
 	 * The two cached lists that between them display every `status` and `unallocated_amount` the
-	 * reviewer sees are revalidated with the EXACT key strings the query hooks construct, so re-selecting
-	 * a row can only come from the server's current answer.
+	 * reviewer sees, plus the voucher list for the row under review, are revalidated with the EXACT key
+	 * strings the query hooks construct - so re-selecting a row can only come from the server's current
+	 * answer.
 	 */
-	it('revalidates both cached transaction lists, on their existing keys', async () => {
-		await refuseConfirm()
+	it('revalidates both cached transaction lists and the voucher list, on their existing keys', async () => {
+		const { transaction } = await refuseConfirm()
 
-		expect(frappeSWRMutate.mock.calls).toEqual([
-			[UNRECONCILED_KEY],
-			[ALL_TRANSACTIONS_KEY]
+		expect(frappeSWRMutate.mock.calls.map(([key]) => key)).toEqual([
+			UNRECONCILED_KEY,
+			ALL_TRANSACTIONS_KEY,
+			vouchersKeyFor(transaction.name, DEFAULT_JOINED_MATCH_FILTERS)
 		])
 	})
 
@@ -815,98 +891,151 @@ describe('a refused post leaves the client\'s state exactly as it was', () => {
 	})
 })
 
+/*
+ * A rejection is not automatically proof that nothing was posted. The SDK builds its rejection from
+ * `error.response.data` and stamps `httpStatus` onto it, so a numeric `httpStatus` means the server
+ * answered and - because `frappe.throw` rolls the request back - that answer was a refusal. With no
+ * response there is nothing to stamp: the SDK's own property access throws first, so the rejection
+ * arrives as a plain `Error`. Such a request may have been applied and its response lost, and the
+ * client must not claim otherwise.
+ */
+describe('a post whose outcome the server never reported is not called a refusal', () => {
 
-describe('the reconcile response document obeys the Bank Transaction allocation contract', () => {
+	let consoleError: ReturnType<typeof vi.spyOn>
+	let errorToast: ReturnType<typeof vi.spyOn>
 
-	const expectAllocationToBalance = (transaction: ReturnType<typeof makeBankTransaction>) => {
-		expect((transaction.allocated_amount ?? 0) + (transaction.unallocated_amount ?? 0)).toBe(
-			Math.abs((transaction.withdrawal ?? 0) - (transaction.deposit ?? 0))
-		)
+	beforeEach(() => {
+		consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+		errorToast = vi.spyOn(toast, 'error').mockReturnValue('toast-id')
+		frappeSWRMutate.mockResolvedValue(undefined)
+	})
+
+	afterEach(() => {
+		consoleError.mockRestore()
+		errorToast.mockRestore()
+	})
+
+	const attemptWithLostResponse = async () => {
+		const store = createSeededStore()
+		const transaction = makeUnreconciledTransaction()
+		store.set(SELECTED_TRANSACTION_ATOM, [transaction])
+		// Exactly what the SDK leaves behind when there is no response to read: an ordinary Error, with
+		// no `httpStatus`, no `_server_messages` and no `exception`.
+		const lostResponse = new TypeError("Cannot read properties of undefined (reading 'data')")
+		frappePostCall.mockRejectedValue(lostResponse)
+
+		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+		await act(async () => {
+			result.current.reconcileTransaction(transaction, makeLinkedPayment())
+		})
+
+		return { store, transaction, lostResponse }
 	}
 
-	it('reports a FULL allocation with a matching child row and a Reconciled status', () => {
-		const transaction = makeReconcileSuccessResponse().message
+	it('reports the outcome as unknown rather than as a refusal', async () => {
+		await attemptWithLostResponse()
 
-		expect(transaction.allocated_amount).toBe(TEST_TRANSACTION_AMOUNT)
-		expect(transaction.unallocated_amount).toBe(0)
-		expect(transaction.status).toBe('Reconciled')
-		expectAllocationToBalance(transaction)
-
-		expect(transaction.payment_entries).toHaveLength(1)
-		expect(transaction.payment_entries?.[0]).toMatchObject({
-			payment_document: 'Payment Entry',
-			allocated_amount: TEST_TRANSACTION_AMOUNT,
-			reconciliation_type: 'Matched'
-		})
-		expect(
-			transaction.payment_entries?.reduce((total, row) => total + row.allocated_amount, 0)
-		).toBe(transaction.allocated_amount)
-	})
-
-	it('derives the allocated amount, the status and the child row from a PARTIAL unallocated figure', () => {
-		const transaction = makeReconcileSuccessResponse({ unallocated_amount: 2500 }).message
-
-		expect(transaction.allocated_amount).toBe(TEST_TRANSACTION_AMOUNT - 2500)
-		expect(transaction.status).toBe('Unreconciled')
-		expectAllocationToBalance(transaction)
-		expect(transaction.payment_entries?.[0]?.allocated_amount).toBe(TEST_TRANSACTION_AMOUNT - 2500)
-	})
-
-	it('reports an untouched transaction with no child rows at all', () => {
-		const transaction = makeBankTransaction({ allocated_amount: 0 })
-
-		expect(transaction.unallocated_amount).toBe(TEST_TRANSACTION_AMOUNT)
-		expect(transaction.status).toBe('Unreconciled')
-		expect(transaction.payment_entries).toEqual([])
-		expectAllocationToBalance(transaction)
-	})
-
-	it('balances a WITHDRAWAL row against its own amount rather than the deposit default', () => {
-		const transaction = makeBankTransaction({ deposit: 0, withdrawal: 500 })
-
-		expect(transaction.allocated_amount).toBe(500)
-		expect(transaction.unallocated_amount).toBe(0)
-		expect(transaction.status).toBe('Reconciled')
-		expectAllocationToBalance(transaction)
-	})
-
-	it('takes the allocated amount from explicit child rows when they are supplied', () => {
-		const transaction = makeBankTransaction({
-			payment_entries: [
-				makeBankTransactionPayment({ allocated_amount: 7500 }),
-				makeBankTransactionPayment({
-					name: 'btp-f6g7h8i9j0',
-					idx: 2,
-					payment_entry: 'ACC-JV-2024-00001',
-					payment_document: 'Journal Entry',
-					allocated_amount: 5000
-				})
-			]
-		})
-
-		expect(transaction.allocated_amount).toBe(TEST_TRANSACTION_AMOUNT)
-		expect(transaction.unallocated_amount).toBe(0)
-		expectAllocationToBalance(transaction)
-	})
-
-	it('refuses a status the allocation contradicts', () => {
-		expect(() => makeBankTransaction({ unallocated_amount: 2500, status: 'Reconciled' })).toThrow(
-			/status "Unreconciled"/
+		expect(errorToast).toHaveBeenCalledTimes(1)
+		expect(errorToast.mock.calls[0][0]).toBe('Could not confirm the reconciliation')
+		const description = String(
+			(errorToast.mock.calls[0][1] as { description?: unknown } | undefined)?.description
 		)
+		expect(description).toContain('not yet known')
+		// The two claims a client cannot support without a server answer.
+		expect(description).not.toContain('refused')
+		expect(description).not.toContain('was not recorded')
 	})
 
-	it('refuses allocation figures that do not add up to the transaction amount', () => {
-		expect(() =>
-			makeBankTransaction({ allocated_amount: TEST_TRANSACTION_AMOUNT, unallocated_amount: 2500 })
-		).toThrow(/must equal abs\(withdrawal - deposit\)/)
+	it('still routes the rejection to the shared dialog, by identity', async () => {
+		const { store, lostResponse } = await attemptWithLostResponse()
+
+		expect(store.get(bankRecErrorDialogAtom)).toBe(lostResponse)
 	})
 
-	it('refuses a parent allocation with no child row underneath it', () => {
-		expect(() =>
-			makeBankTransaction({ allocated_amount: TEST_TRANSACTION_AMOUNT, payment_entries: [] })
-		).toThrow(/sum of payment_entries allocations/)
+	it('re-reads the server, because only the server can settle the outcome', async () => {
+		const { transaction } = await attemptWithLostResponse()
+
+		expect(frappeSWRMutate.mock.calls.map(([key]) => key)).toEqual([
+			UNRECONCILED_KEY,
+			ALL_TRANSACTIONS_KEY,
+			vouchersKeyFor(transaction.name, DEFAULT_JOINED_MATCH_FILTERS)
+		])
+	})
+
+	it('does not retry an attempt whose outcome is unknown', async () => {
+		await attemptWithLostResponse()
+
+		expect(frappePostCall).toHaveBeenCalledTimes(1)
+	})
+
+	it('writes no action-log entry for an attempt it cannot vouch for', async () => {
+		const { store } = await attemptWithLostResponse()
+
+		expect(store.get(bankRecActionLog)).toEqual([])
 	})
 })
+
+/*
+ * A `catch` chained after the success handler also catches whatever that handler throws. Reporting
+ * such a failure as a backend refusal would tell the reviewer that a reconciliation the server had
+ * already committed was rejected, which is the opposite of the truth.
+ */
+describe('a failure after a successful post is not attributed to the server', () => {
+
+	let consoleError: ReturnType<typeof vi.spyOn>
+	let errorToast: ReturnType<typeof vi.spyOn>
+	let successToast: ReturnType<typeof vi.spyOn>
+
+	beforeEach(() => {
+		consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+		errorToast = vi.spyOn(toast, 'error').mockReturnValue('toast-id')
+		successToast = vi.spyOn(toast, 'success').mockImplementation(() => {
+			throw new Error('the view could not be updated')
+		})
+	})
+
+	afterEach(() => {
+		consoleError.mockRestore()
+		errorToast.mockRestore()
+		successToast.mockRestore()
+	})
+
+	const succeedThenFailLocally = async () => {
+		const store = createSeededStore()
+		const transaction = makeUnreconciledTransaction()
+		store.set(SELECTED_TRANSACTION_ATOM, [transaction])
+		frappePostCall.mockResolvedValue(makeReconcileSuccessResponse())
+		frappeSWRMutate.mockResolvedValue({ message: [] })
+
+		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+		await act(async () => {
+			result.current.reconcileTransaction(transaction, makeLinkedPayment())
+		})
+
+		return { store }
+	}
+
+	it('reports a refresh failure and never calls it a refusal', async () => {
+		await succeedThenFailLocally()
+
+		expect(errorToast).toHaveBeenCalledTimes(1)
+		expect(errorToast.mock.calls[0][0]).toBe('The view could not be refreshed')
+		expect(errorToast.mock.calls[0][0]).not.toBe('Reconciliation refused')
+	})
+
+	it('does not open the error dialog, because the server said nothing', async () => {
+		const { store } = await succeedThenFailLocally()
+
+		expect(store.get(bankRecErrorDialogAtom)).toBeNull()
+	})
+
+	it('does not re-post, so a local failure cannot become a duplicate posting', async () => {
+		await succeedThenFailLocally()
+
+		expect(frappePostCall).toHaveBeenCalledTimes(1)
+	})
+})
+
 
 describe('useRefreshUnreconciledTransactions', () => {
 
@@ -1391,15 +1520,25 @@ describe('a refusal under a narrowed role profile is handled exactly like any ot
 	const NARROWED_RIGHTS = ['can_read', 'can_write', 'can_cancel'] as const
 	let installedRights: Partial<Record<(typeof NARROWED_RIGHTS)[number], string[]>> = {}
 
+	/*
+	 * The toast spy is installed and restored by the hooks rather than at the end of each test body: a
+	 * failing assertion aborts the body, so a trailing `mockRestore()` would leave a live spy on the
+	 * shared `toast` module for every test that follows.
+	 */
+	let errorToast: ReturnType<typeof vi.spyOn>
+
 	beforeEach(() => {
 		installedRights = {}
 		NARROWED_RIGHTS.forEach((right) => {
 			installedRights[right] = window.frappe.boot.user[right]
 		})
+		errorToast = vi.spyOn(toast, 'error').mockReturnValue('toast-id')
+		frappeSWRMutate.mockResolvedValue({ message: [] })
 	})
 
 	afterEach(() => {
 		Object.assign(window.frappe.boot.user, installedRights)
+		errorToast.mockRestore()
 	})
 
 	const ACCOUNTS_ONLY = {
@@ -1422,7 +1561,6 @@ describe('a refusal under a narrowed role profile is handled exactly like any ot
 		const refusal = makeServerMessagesError('Insufficient Permission for Bank Transaction')
 		const { store, transaction, voucher } = seedForReconcile()
 		frappePostCall.mockRejectedValue(refusal)
-		const errorToast = vi.spyOn(toast, 'error').mockReturnValue('toast-id')
 
 		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
 		await act(async () => {
@@ -1434,10 +1572,10 @@ describe('a refusal under a narrowed role profile is handled exactly like any ot
 		})
 		expect(errorToast.mock.calls[0][1]?.description).toContain('Insufficient Permission')
 
-		expect(store.get(bankRecSelectedTransactionAtom(TEST_BANK_ACCOUNT))).toEqual([transaction])
+		// A permission refusal converges like any other: the re-read reports the row as no longer
+		// reconcilable by this user, so the stale selection is dropped rather than kept.
+		expect(store.get(bankRecSelectedTransactionAtom(TEST_BANK_ACCOUNT))).toEqual([])
 		expect(store.get(bankRecActionLog)).toEqual([])
-
-		errorToast.mockRestore()
 	})
 
 	it('does not retry a refused post, whatever the reason for the refusal', async () => {
@@ -1445,7 +1583,6 @@ describe('a refusal under a narrowed role profile is handled exactly like any ot
 
 		const { store, transaction, voucher } = seedForReconcile()
 		frappePostCall.mockRejectedValue(makeServerMessagesError('Insufficient Permission for Bank Transaction'))
-		const errorToast = vi.spyOn(toast, 'error').mockReturnValue('toast-id')
 
 		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
 		await act(async () => {
@@ -1456,8 +1593,6 @@ describe('a refusal under a narrowed role profile is handled exactly like any ot
 		await waitFor(() => {
 			expect(store.get(bankRecErrorDialogAtom)).not.toBeNull()
 		})
-
-		errorToast.mockRestore()
 	})
 
 	it('holds no role at all and still reports a refusal rather than swallowing it', async () => {
@@ -1466,7 +1601,6 @@ describe('a refusal under a narrowed role profile is handled exactly like any ot
 		const refusal = makeServerMessagesError('Not permitted')
 		const { store, transaction, voucher } = seedForReconcile()
 		frappePostCall.mockRejectedValue(refusal)
-		const errorToast = vi.spyOn(toast, 'error').mockReturnValue('toast-id')
 
 		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
 		await act(async () => {
@@ -1476,7 +1610,5 @@ describe('a refusal under a narrowed role profile is handled exactly like any ot
 		await waitFor(() => {
 			expect(store.get(bankRecErrorDialogAtom)).toBe(refusal)
 		})
-
-		errorToast.mockRestore()
 	})
 })

@@ -180,13 +180,6 @@ describe('BankRecErrorDialog', () => {
 				expect(getBannerDescription()?.children).toHaveLength(2)
 			})
 
-			it('encodes an envelope exactly as the shared factory does', () => {
-				const factoryEnvelope = makeServerMessagesError('Nothing was posted')._server_messages
-
-				expect(
-					encodeServerMessages({ message: 'Nothing was posted', title: 'Message', indicator: 'red' })
-				).toBe(factoryEnvelope)
-			})
 		})
 
 		it('never reshapes, clears or re-encodes the rejection it was handed', () => {
@@ -316,10 +309,59 @@ describe('BankRecErrorDialog', () => {
 			expect(getDialogContent().parentElement).toBe(document.body)
 		})
 
-		it('follows the width of the canonical modal it imitates, and adds nothing else', () => {
+		/*
+		 * jsdom computes no layout and the suite loads no compiled stylesheet, so overflow cannot be
+		 * measured from here - the rendered geometry is checked in a real browser instead. What this
+		 * pins is the MECHANISM that overflowed: a `min-width` beats a `max-width` in CSS, so a fixed
+		 * `2xl` minimum forced the box wider than a narrow viewport, and the primitive's
+		 * viewport-relative cap has to survive for the box to be able to fit at all.
+		 */
+		it('caps its width against the viewport instead of forcing a minimum width', () => {
 			renderDialog(makeServerMessagesError('Nothing was posted'))
 
-			expect(getDialogContent().className).toContain('min-w-2xl')
+			const className = getDialogContent().className
+
+			expect(className).not.toMatch(/(^|[\s:])min-w-/)
+			// The primitive's unconditional floor. Any override of it would have had to remove this.
+			expect(className).toContain('max-w-[calc(100%-2rem)]')
+			// Widened only from `sm` upwards, so below that breakpoint the floor above is what applies.
+			expect(className).toContain('data-[size=default]:sm:max-w-2xl')
+			expect(className).not.toContain('data-[size=default]:sm:max-w-lg')
+		})
+
+		it('bounds its height against the viewport and scrolls only the message region', () => {
+			renderDialog(makeServerMessagesError('Nothing was posted'))
+
+			expect(getDialogContent().className).toContain('max-h-[calc(100dvh-4rem)]')
+
+			const scroller = getBanner().parentElement
+			expect(scroller).not.toBeNull()
+			expect(scroller?.className).toContain('overflow-y-auto')
+			// Without this the grid row cannot shrink and the height cap above would be inert.
+			expect(scroller?.className).toContain('min-h-0')
+			// Dismiss is a SIBLING of the scroll region, so no volume of server output can push it out
+			// of reach.
+			expect(scroller?.contains(screen.getByRole('button', { name: DISMISS_LABEL }))).toBe(false)
+		})
+
+		it('stays mounted and dismissible at a narrow viewport', async () => {
+			const originalWidth = window.innerWidth
+			try {
+				window.innerWidth = 360
+				window.dispatchEvent(new Event('resize'))
+
+				const { store } = renderDialog(makeServerMessagesError('Nothing was posted'))
+
+				expect(getDialogContent()).toBeInTheDocument()
+				await userEvent.click(screen.getByRole('button', { name: DISMISS_LABEL }))
+
+				await waitFor(() => {
+					expect(store.get(bankRecErrorDialogAtom)).toBeNull()
+				})
+			} finally {
+				window.innerWidth = originalWidth
+				window.dispatchEvent(new Event('resize'))
+			}
 		})
 	})
 

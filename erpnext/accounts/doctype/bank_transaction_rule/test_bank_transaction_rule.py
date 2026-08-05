@@ -1,11 +1,18 @@
 # Copyright (c) 2026, Frappe Technologies Pvt. Ltd. and Contributors
 # See license.txt
 
+from unittest.mock import patch
+
 import frappe
 from frappe import qb
 from frappe.exceptions import ValidationError
+from frappe.permissions import add_user_permission, remove_user_permission
 
-from erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule import _run_rule_evaluation
+from erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule import (
+	_run_rule_evaluation,
+	get_permitted_companies_for_rule_evaluation,
+	run_rule_evaluation,
+)
 from erpnext.accounts.test.accounts_mixin import AccountsTestMixin
 from erpnext.tests.utils import ERPNextTestSuite
 
@@ -46,6 +53,35 @@ class TestBankTransactionRule(ERPNextTestSuite, AccountsTestMixin):
 
 	def _unique_rule_name(self, prefix: str) -> str:
 		return f"{prefix}-{frappe.generate_hash(length=8)}"
+
+	def _make_user(self, roles: list[str], companies: list[str] | None = None) -> str:
+		"""
+		A throwaway enabled user with exactly the roles given, and optionally restricted to a set of
+		companies by User Permission.
+
+		The session is restored through `addCleanup` rather than at the end of the test body so an
+		assertion failure cannot leak an impersonated session into the next test.
+		"""
+		user = frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": f"bank-rule-{frappe.generate_hash(length=10)}@example.com",
+				"first_name": "Bank Rule",
+				"last_name": "Tester",
+				"send_welcome_email": 0,
+				"roles": [{"role": role} for role in roles],
+			}
+		).insert(ignore_permissions=True)
+
+		for company in companies or []:
+			add_user_permission("Company", company, user.name)
+			self.addCleanup(remove_user_permission, "Company", company, user.name)
+
+		return user.name
+
+	def _as_user(self, user: str) -> None:
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user(user)
 
 	def _make_transaction(self, company=None, withdrawal=0, deposit=0, description=None):
 		doc = frappe.new_doc("Bank Transaction")
@@ -374,3 +410,147 @@ class TestBankTransactionRule(ERPNextTestSuite, AccountsTestMixin):
 		self.assertEqual(evaluated.matched_transaction_rule, winner.name)
 		self.assertNotEqual(evaluated.matched_transaction_rule, runner_up.name)
 		self.assertEqual(evaluated.is_rule_evaluated, 1)
+
+	# --- run_rule_evaluation: the whitelisted endpoint ---
+
+	def test_run_rule_evaluation_defers_the_job_until_after_commit(self):
+		"""
+		The endpoint's own queueing contract, asserted at the endpoint rather than around it.
+
+		A statement import calls this while its own transaction is still open, and the worker runs on
+		a separate database connection. Enqueueing immediately would therefore start a pass that
+		cannot see the Bank Transactions the import just inserted, and those rows would be left
+		unstamped with no second attempt - the pass marks nothing, so nothing is retried.
+		"""
+		self._rule("enqueue_contract", [{"check": "Contains", "value": "irrelevant"}], priority=31).insert()
+
+		with patch.object(frappe, "enqueue") as enqueue:
+			run_rule_evaluation()
+
+		enqueue.assert_called_once()
+		kwargs = enqueue.call_args.kwargs
+		self.assertIs(kwargs["enqueue_after_commit"], True)
+		# The endpoint is reachable from the rules UI and from every statement import, so identical
+		# full-table rescans must collapse into one queued pass instead of fanning out.
+		self.assertIs(kwargs["deduplicate"], True)
+		self.assertTrue(kwargs["job_id"])
+		self.assertIs(kwargs["method"], _run_rule_evaluation)
+		self.assertIs(kwargs["force_evaluate"], False)
+		# Administrator carries no Company User Permission, so the pass stays site-wide.
+		self.assertIsNone(kwargs["companies"])
+
+	def test_run_rule_evaluation_job_ids_separate_the_two_modes(self):
+		# A forced rescan must not be deduplicated away by an ordinary pass already sitting in the
+		# queue: the two cover different row sets, so they need different identities.
+		self._rule("enqueue_modes", [{"check": "Contains", "value": "irrelevant"}], priority=32).insert()
+
+		with patch.object(frappe, "enqueue") as enqueue:
+			run_rule_evaluation()
+			run_rule_evaluation(force_evaluate=True)
+
+		self.assertEqual(enqueue.call_count, 2)
+		plain_job_id = enqueue.call_args_list[0].kwargs["job_id"]
+		forced_job_id = enqueue.call_args_list[1].kwargs["job_id"]
+		self.assertNotEqual(plain_job_id, forced_job_id)
+		self.assertIs(enqueue.call_args_list[1].kwargs["force_evaluate"], True)
+
+	def test_run_rule_evaluation_coerces_a_string_force_flag(self):
+		# `frappe.whitelist` hands query/form arguments over as strings, so a request asking for a
+		# forced rescan arrives as "true" and must not be read as the truthy string "false".
+		self._rule("enqueue_coerce", [{"check": "Contains", "value": "irrelevant"}], priority=33).insert()
+
+		with patch.object(frappe, "enqueue") as enqueue:
+			run_rule_evaluation(force_evaluate="false")
+			run_rule_evaluation(force_evaluate="true")
+
+		self.assertIs(enqueue.call_args_list[0].kwargs["force_evaluate"], False)
+		self.assertIs(enqueue.call_args_list[1].kwargs["force_evaluate"], True)
+
+	def test_run_rule_evaluation_requires_write_permission(self):
+		"""
+		The endpoint enqueues a job that WRITES `matched_transaction_rule` and `is_rule_evaluated`,
+		so a user who may only read Bank Transactions must not be able to trigger it.
+		"""
+		self._rule("enqueue_authz", [{"check": "Contains", "value": "irrelevant"}], priority=34).insert()
+		# Deliberately no accounting roles: every user carries the implicit "All" role, which grants
+		# no write on Bank Transaction, so this models the least-privileged authenticated caller.
+		self._as_user(self._make_user(roles=[]))
+
+		self.assertFalse(frappe.has_permission("Bank Transaction", ptype="write"))
+		with patch.object(frappe, "enqueue") as enqueue:
+			with self.assertRaises(frappe.PermissionError):
+				run_rule_evaluation()
+
+		# The refusal has to happen before anything is queued, not after.
+		enqueue.assert_not_called()
+
+	def test_run_rule_evaluation_is_allowed_for_a_writer(self):
+		self._rule("enqueue_allowed", [{"check": "Contains", "value": "irrelevant"}], priority=35).insert()
+		self._as_user(self._make_user(roles=["Accounts User", "Accounts Manager"]))
+
+		self.assertTrue(frappe.has_permission("Bank Transaction", ptype="write"))
+		with patch.object(frappe, "enqueue") as enqueue:
+			run_rule_evaluation()
+
+		enqueue.assert_called_once()
+
+	def test_run_rule_evaluation_scopes_the_pass_to_permitted_companies(self):
+		"""
+		The queued pass runs unscoped inside the worker, so the caller's company restriction has to be
+		resolved while the session is still the caller's and carried into the job explicitly.
+		"""
+		self._rule("enqueue_scope", [{"check": "Contains", "value": "irrelevant"}], priority=36).insert()
+		# An unrestricted caller is deliberately NOT narrowed to an explicit company list: naming every
+		# company would silently exclude any Bank Transaction whose company is unset.
+		self.assertIsNone(get_permitted_companies_for_rule_evaluation())
+
+		self._as_user(self._make_user(roles=["Accounts User", "Accounts Manager"], companies=[self.company]))
+
+		self.assertEqual(get_permitted_companies_for_rule_evaluation(), [self.company])
+		with patch.object(frappe, "enqueue") as enqueue:
+			run_rule_evaluation()
+
+		self.assertEqual(enqueue.call_args.kwargs["companies"], [self.company])
+
+	def test_run_rule_evaluation_leaves_other_companies_unstamped(self):
+		"""
+		The company scope is enforced by the evaluator and not merely reported by the endpoint: a
+		transaction outside the scope must come back unevaluated.
+		"""
+		token = f"btr-scope-{frappe.generate_hash(length=8)}"
+		self._rule("scope_rule", [{"check": "Contains", "value": token}], priority=37).insert()
+
+		transaction = frappe.get_doc(
+			{
+				"doctype": "Bank Transaction",
+				"date": "2026-01-15",
+				"description": f"NEFT CR REF {token} settled",
+				"deposit": 300,
+				"currency": frappe.get_cached_value("Account", self.bank, "account_currency"),
+				"bank_account": self.bank_account,
+			}
+		).insert()
+		transaction.submit()
+		self.assertEqual(transaction.company, self.company)
+
+		# A scope that excludes this transaction's company must leave it untouched...
+		_run_rule_evaluation(companies=["_Test Company 2"])
+		untouched = frappe.db.get_value(
+			"Bank Transaction",
+			transaction.name,
+			["matched_transaction_rule", "is_rule_evaluated"],
+			as_dict=True,
+		)
+		self.assertIsNone(untouched.matched_transaction_rule)
+		self.assertEqual(untouched.is_rule_evaluated, 0)
+
+		# ...while a scope that includes it stamps it, which is what makes the check above non-vacuous.
+		_run_rule_evaluation(companies=[self.company])
+		stamped = frappe.db.get_value(
+			"Bank Transaction",
+			transaction.name,
+			["matched_transaction_rule", "is_rule_evaluated"],
+			as_dict=True,
+		)
+		self.assertIsNotNone(stamped.matched_transaction_rule)
+		self.assertEqual(stamped.is_rule_evaluated, 1)

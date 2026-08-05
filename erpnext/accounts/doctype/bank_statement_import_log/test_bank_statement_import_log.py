@@ -1,6 +1,8 @@
 # Copyright (c) 2026, Frappe Technologies Pvt. Ltd. and Contributors
 # See license.txt
 
+from unittest.mock import patch
+
 import frappe
 from frappe import qb
 from frappe.utils import getdate
@@ -463,6 +465,72 @@ class TestBankStatementImportLog(ERPNextTestSuite, AccountsTestMixin):
 		self.assertEqual(doc.detected_header_index, 0)
 		restored = {c.maps_to: c.index for c in doc.column_mapping if c.maps_to != "Do not import"}
 		self.assertEqual(restored.get("Description"), 1)
+
+	def test_insert_transactions_queues_rule_evaluation_last(self):
+		"""
+		The import/evaluator ordering, asserted end to end on a real committed-shape import.
+
+		The rule evaluator runs in a worker on its own database connection, so it may only be queued
+		once the rows it has to stamp and this log's own `Completed` status are part of the
+		transaction being committed. Queueing it from the middle of the loop - as the code did
+		before - starts a pass that can see neither, and the imported rows are silently left with
+		`is_rule_evaluated = 0` and no matched rule.
+		"""
+		csv_text = "Date,Narration,Amount\n01/04/2024,UPI PAYMENT,-500.00\n03/04/2024,SALARY,20000.00\n"
+		doc = self._create_csv_import_log(csv_text)
+		self.assertEqual(doc.number_of_transactions, 2)
+		self.assertEqual(doc.status, "Not Started")
+
+		observed = {}
+
+		def record_state_at_queue_time(*args, **kwargs):
+			# Read straight from the database rather than from `doc`, so this observes what the
+			# about-to-be-committed transaction actually holds at the moment of queueing.
+			observed["status"] = frappe.db.get_value("Bank Statement Import Log", doc.name, "status")
+			observed["transactions"] = frappe.db.count(
+				"Bank Transaction", {"bank_account": self.bank_account, "docstatus": 1}
+			)
+
+		with patch(
+			"erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule.run_rule_evaluation",
+			side_effect=record_state_at_queue_time,
+		) as run_rule_evaluation:
+			doc.insert_transactions()
+
+		run_rule_evaluation.assert_called_once()
+		# Both halves of the ordering: the log had already reached "Completed"...
+		self.assertEqual(observed["status"], "Completed")
+		# ...and every imported transaction was already submitted and visible.
+		self.assertEqual(observed["transactions"], 2)
+
+		doc.reload()
+		self.assertEqual(doc.status, "Completed")
+
+	def test_insert_transactions_is_idempotent_once_completed(self):
+		# The client can retry an import whose response was lost, so a second call on a log that
+		# already reached "Completed" must create nothing further and must not re-queue the evaluator.
+		csv_text = "Date,Narration,Amount\n05/04/2024,ACH CREDIT,750.00\n"
+		doc = self._create_csv_import_log(csv_text)
+
+		with patch(
+			"erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule.run_rule_evaluation"
+		):
+			doc.insert_transactions()
+
+		doc.reload()
+		self.assertEqual(doc.status, "Completed")
+		created = frappe.db.count("Bank Transaction", {"bank_account": self.bank_account, "docstatus": 1})
+
+		with patch(
+			"erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule.run_rule_evaluation"
+		) as run_rule_evaluation:
+			doc.insert_transactions()
+
+		run_rule_evaluation.assert_not_called()
+		self.assertEqual(
+			frappe.db.count("Bank Transaction", {"bank_account": self.bank_account, "docstatus": 1}),
+			created,
+		)
 
 
 test_hdfc_sample_statement_data = [

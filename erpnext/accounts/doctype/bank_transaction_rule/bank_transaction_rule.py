@@ -6,6 +6,7 @@ import re
 import frappe
 from frappe import _
 from frappe.model.document import Document
+from frappe.utils import sbool
 
 from erpnext.accounts.doctype.bank_transaction.bank_transaction import BankTransaction
 
@@ -234,17 +235,71 @@ def scheduler_run_rule_evaluation():
 		_run_rule_evaluation(force_evaluate=False)
 
 
+def get_permitted_companies_for_rule_evaluation() -> list[str] | None:
+	"""
+	The companies the session user is restricted to, or `None` when the user is not restricted.
+
+	Only a Company User Permission narrows the scope, so `None` is returned for an unrestricted user
+	rather than "every company on the site": an explicit list would silently exclude any Bank
+	Transaction whose `company` is unset, which an unscoped pass has always covered.
+
+	`frappe.get_list` is what resolves the restricted case, because it applies the permission query -
+	unlike `frappe.get_all`, which sets `ignore_permissions`.
+	"""
+	from frappe.permissions import get_user_permissions
+
+	if not get_user_permissions(frappe.session.user).get("Company"):
+		return None
+
+	return frappe.get_list("Company", pluck="name", limit_page_length=0, order_by="name asc")
+
+
 @frappe.whitelist(methods=["POST"])
 def run_rule_evaluation(force_evaluate: bool = False):
-	frappe.has_permission("Bank Transaction", ptype="read", throw=True)
-	frappe.enqueue(method=_run_rule_evaluation, force_evaluate=force_evaluate)
+	# The job this enqueues WRITES `matched_transaction_rule` and `is_rule_evaluated` on Bank
+	# Transactions, so read permission is not the right gate - a read-only user must not be able to
+	# trigger a write, and `force_evaluate` re-stamps rows that were already evaluated.
+	frappe.has_permission("Bank Transaction", ptype="write", throw=True)
+
+	# The evaluator itself runs unscoped as the job's user, so the caller's company restriction is
+	# resolved here, while the session is still the caller's, and carried into the job explicitly.
+	companies = get_permitted_companies_for_rule_evaluation()
+	if companies is not None and not companies:
+		# Restricted, but to nothing readable: there is nothing for the pass to scan.
+		return
+
+	# `frappe.whitelist` hands query/form arguments over as strings, so a request asking for a forced
+	# rescan arrives as "true" - which is truthy either way, but so is "false". `sbool` maps both, and
+	# returns anything it cannot map unchanged rather than raising, so a malformed argument degrades to
+	# the ordinary pass instead of a server error.
+	force_evaluate = bool(sbool(force_evaluate)) if isinstance(force_evaluate, str) else bool(force_evaluate)
+
+	# Deduplicated because the endpoint is reachable from the UI and from every statement import: an
+	# unbounded fan-out of identical full-table rescans is a denial-of-service surface, and a single
+	# queued pass already covers every transaction a later request would have covered.
+	# `enqueue_after_commit` is what makes the pass see the rows that triggered it: a statement import
+	# calls this before its own transaction commits, so a job started immediately would query the
+	# database from another connection and find none of the freshly inserted Bank Transactions.
+	# `create_job_id` namespaces the id by site, so the id below only has to distinguish the two modes.
+	frappe.enqueue(
+		method=_run_rule_evaluation,
+		job_id=f"bank-transaction-rule-evaluation-force-{int(bool(force_evaluate))}",
+		deduplicate=True,
+		enqueue_after_commit=True,
+		force_evaluate=force_evaluate,
+		companies=companies,
+	)
 
 
-def _run_rule_evaluation(force_evaluate=False):
+def _run_rule_evaluation(force_evaluate=False, companies: list[str] | None = None):
 	"""
 	Run the rule evaluation for all bank transactions
 
 	If force evaluate is set to True, then transactions that were previously evaluated will be evaluated again.
+
+	`companies`, when given, restricts the pass to those companies. The whitelisted entry point
+	resolves it from the caller's permitted companies so a scoped user cannot trigger writes outside
+	their own scope; the scheduler passes nothing and evaluates site-wide, as it always has.
 	"""
 	rules = frappe.get_all("Bank Transaction Rule", fields=["name"], order_by="priority asc")
 
@@ -255,6 +310,9 @@ def _run_rule_evaluation(force_evaluate=False):
 
 	if not force_evaluate:
 		filters["is_rule_evaluated"] = 0
+
+	if companies:
+		filters["company"] = ("in", companies)
 
 	unreconciled_transactions = frappe.get_all(
 		"Bank Transaction",

@@ -187,6 +187,85 @@ class TestBankTransaction(ERPNextTestSuite):
 			vouchers=vouchers,
 		)
 
+	def test_reconcile_refuses_a_currency_mismatch(self):
+		"""
+		The currency rule has to hold on the reconcile path, not only on insert.
+
+		`validate()` - and with it `validate_currency()` - is never run for a submitted document, so
+		before this guard `reconcile_vouchers` could post a transaction whose currency differs from its
+		Bank Account's, which is exactly the mismatch the reconciliation UI raises an advisory about.
+		"""
+		bank_transaction = frappe.get_doc(
+			"Bank Transaction",
+			dict(description="1512567 BG/000003025 OPSKATTUZWXXX AT776000000098709849 Herr G"),
+		)
+		account_currency = frappe.get_cached_value(
+			"Account",
+			frappe.get_cached_value("Bank Account", bank_transaction.bank_account, "account"),
+			"account_currency",
+		)
+		self.assertEqual(bank_transaction.currency, account_currency)
+
+		# Planted with `db_set` on purpose: the mismatch has to exist on an ALREADY SUBMITTED document,
+		# which is the state the insert-time validator cannot reach and legacy rows can genuinely be in.
+		bank_transaction.db_set("currency", "USD", update_modified=False)
+		self.assertNotEqual(
+			frappe.db.get_value("Bank Transaction", bank_transaction.name, "currency"), account_currency
+		)
+
+		payment = frappe.get_doc("Payment Entry", dict(party="Mr G", paid_amount=1700))
+		vouchers = json.dumps(
+			[
+				{
+					"payment_doctype": "Payment Entry",
+					"payment_name": payment.name,
+					"amount": bank_transaction.unallocated_amount,
+				}
+			]
+		)
+		self.assertRaises(
+			frappe.ValidationError,
+			reconcile_vouchers,
+			bank_transaction_name=bank_transaction.name,
+			vouchers=vouchers,
+		)
+
+		# Nothing the refused `save()` would have written exists: no allocation row was persisted and
+		# the voucher was left unclaimed. (`status` is deliberately not asserted here - `set_status()`
+		# writes it through `db_set` BEFORE `save()` is reached, and that write is undone by the
+		# request-level rollback `frappe.throw` triggers, not by this call returning.)
+		bank_transaction.reload()
+		self.assertEqual(bank_transaction.payment_entries, [])
+		self.assertIsNone(
+			frappe.db.get_value(
+				"Bank Transaction Payments",
+				{"parent": bank_transaction.name, "payment_entry": payment.name},
+				"name",
+			)
+		)
+
+	def test_reconcile_allows_a_matching_currency(self):
+		# The refusal above is only meaningful if the matching-currency path still posts.
+		bank_transaction = frappe.get_doc(
+			"Bank Transaction",
+			dict(description="1512567 BG/000003025 OPSKATTUZWXXX AT776000000098709849 Herr G"),
+		)
+		payment = frappe.get_doc("Payment Entry", dict(party="Mr G", paid_amount=1700))
+		vouchers = json.dumps(
+			[
+				{
+					"payment_doctype": "Payment Entry",
+					"payment_name": payment.name,
+					"amount": bank_transaction.unallocated_amount,
+				}
+			]
+		)
+		reconcile_vouchers(bank_transaction.name, vouchers)
+
+		bank_transaction.reload()
+		self.assertEqual(bank_transaction.status, "Reconciled")
+		self.assertEqual(bank_transaction.unallocated_amount, 0)
+
 	# Raise an error if debitor transaction vs debitor payment
 	def test_clear_sales_invoice(self):
 		bank_transaction = frappe.get_doc(

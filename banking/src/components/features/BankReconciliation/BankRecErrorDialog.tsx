@@ -22,6 +22,12 @@ import _ from "@/lib/translate"
  * the server's own words reach the reviewer verbatim.
  *
  * Dismissing clears the atom and nothing else: the calling hook owns revalidation.
+ *
+ * Sizing widens the primitive's `sm:max-w-lg` cap to `2xl` from the same breakpoint, rather than
+ * setting a minimum width: a `min-width` beats a `max-width` in CSS, so a fixed `2xl` minimum forced
+ * the box wider than a viewport narrower than roughly 704px and overflowed it horizontally. Height is
+ * capped against the dynamic viewport and only the banner scrolls, so a long stack of server messages
+ * can never push the Dismiss control off screen.
  */
 const BankRecErrorDialog = () => {
 	const [error, setError] = useAtom(bankRecErrorDialogAtom)
@@ -41,7 +47,7 @@ const BankRecErrorDialog = () => {
 
 	return (
 		<AlertDialog open onOpenChange={onOpenChange}>
-			<AlertDialogContent className="min-w-2xl">
+			<AlertDialogContent className="data-[size=default]:sm:max-w-2xl max-h-[calc(100dvh-4rem)]">
 				<AlertDialogHeader>
 					{/* Outcome-neutral: a transport-level failure carries no server response, so the client
 					    cannot know whether the operation was applied and must not say. */}
@@ -50,7 +56,11 @@ const BankRecErrorDialog = () => {
 						{_("Review the details below, then dismiss this message to continue. The server remains the authority on what was recorded.")}
 					</AlertDialogDescription>
 				</AlertDialogHeader>
-				<ErrorBanner error={error} />
+				{/* `min-h-0` is what lets this grid row shrink below its content, so the height cap above
+				    scrolls the messages instead of growing the dialog past the viewport. */}
+				<div className="min-h-0 overflow-y-auto">
+					<ErrorBanner error={error} />
+				</div>
 				<AlertDialogFooter>
 					<AlertDialogAction onClick={() => setError(null)}>
 						{_("Dismiss")}

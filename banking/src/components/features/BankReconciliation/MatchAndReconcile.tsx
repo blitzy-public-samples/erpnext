@@ -6,7 +6,7 @@ import { getCompanyCurrency } from "@/lib/company"
 import ErrorBanner from "@/components/ui/error-banner"
 import { Separator } from "@/components/ui/separator"
 import Fuse from 'fuse.js'
-import { getSearchResults, LinkedPayment, UnreconciledTransaction, useGetRuleForTransaction, useGetUnreconciledTransactions, useGetVouchersForTransaction, useIsTransactionWithdrawal, useReconcileTransaction, useTransactionSearch } from "./utils"
+import { getSearchResults, LinkedPayment, UnreconciledTransaction, useGetRuleForTransaction, useGetUnreconciledTransactions, useGetVouchersForTransaction, useIsTransactionWithdrawal, useReconcileTransaction, useSelectedBankAccountCurrency, useTransactionSearch } from "./utils"
 import { Input } from "@/components/ui/input"
 import { AlertCircleIcon, ArrowDownRight, ArrowRightIcon, ArrowRightLeft, ArrowUpRight, BadgeCheck, ChevronDown, DollarSign, Landmark, LandmarkIcon, ListIcon, Loader2, Receipt, ReceiptIcon, Search, User, XCircle, ZapIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -207,6 +207,7 @@ const UnreconciledTransactions = ({ contentHeight }: { contentHeight: number }) 
                 </InputGroupAddon>
                 <Input
                     placeholder={_("Search")}
+                    // type='search'
                     variant='outline'
                     onChange={onSearchChange}
                     defaultValue={search}
@@ -228,8 +229,10 @@ const UnreconciledTransactions = ({ contentHeight }: { contentHeight: number }) 
                     decimalScale={2}
                     prefix={currencySymbol}
                     onValueChange={(v, _n, values) => {
-                        // Keep the raw string while the user is mid-decimal, so the decimals stay typeable;
-                        // it is formatted on blur anyway.
+                        // If the input ends with a decimal or a decimal with trailing zeroes, store the string since we need the user to be able to type the decimals.
+                        // When the user eventually types the decimals or blurs out, the value is formatted anyway.
+                        // Otherwise store the float value
+                        // Check if the value ends with a decimal or a decimal with trailing zeroes
                         const isDecimal = v?.endsWith(decimalSeparator) || v?.endsWith(decimalSeparator + '0')
                         const newValue = isDecimal ? v : values?.float ?? ''
                         const nextAmountFilter = {
@@ -334,7 +337,15 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
 
     const isSelected = selectedTransaction?.some((t) => t.name === transaction.name)
 
-    const currency = transaction.currency ?? selectedBank?.account_currency ?? getCompanyCurrency(selectedBank?.company ?? '')
+    /*
+     * The account currency as the server currently reports it, NOT as the `localStorage`-backed
+     * selection remembers it: that snapshot is only rewritten when the selection changes, so
+     * re-selecting the same account replays a value that can be arbitrarily old. The snapshot is still
+     * a reasonable last resort for FORMATTING while the list is in flight, but never for the advisory.
+     */
+    const accountCurrency = useSelectedBankAccountCurrency()
+
+    const currency = transaction.currency ?? accountCurrency ?? selectedBank?.account_currency ?? getCompanyCurrency(selectedBank?.company ?? '')
 
     /*
      * The advisory currency-mismatch predicate, derived from the server rather than designed:
@@ -342,12 +353,14 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
      * `Account.account_currency`, and `bank_account.get_list` attaches `account_currency` to each row
      * through that identical lookup, so the two sides cannot disagree.
      *
-     * Either side may legitimately be unknown, and unknown means "nothing to compare", never
-     * "mismatch".
+     * Either side may legitimately be unknown - a row without a currency, an account whose linked
+     * ledger carries none, or a list that has not arrived yet - and unknown means "nothing to compare",
+     * never "mismatch".
      */
-    const isCurrencyMismatch = Boolean(transaction.currency && selectedBank?.account_currency && transaction.currency !== selectedBank.account_currency)
+    const isCurrencyMismatch = Boolean(transaction.currency && accountCurrency && transaction.currency !== accountCurrency)
 
     const handleSelectTransaction = (event: React.MouseEvent<HTMLDivElement>) => {
+        // If the user is pressing the shift key, add/remove the transaction from the selected transactions
         if (event.shiftKey) {
             setSelectedTransaction(isSelected ? selectedTransaction.filter((t) => t.name !== transaction.name) : [...selectedTransaction, transaction])
         } else {
@@ -364,35 +377,61 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
             onClick={handleSelectTransaction}>
             <div className="flex justify-between items-start w-full">
                 <div className="space-y-1 overflow-hidden whitespace-pre-wrap">
-                    <div className="flex items-center gap-1">
+                    {/* `flex-wrap`, plus a bound on every variable-length badge ahead of the advisory.
+                        This cluster sits inside an `overflow-hidden` pane and Badge is deliberately
+                        `shrink-0 whitespace-nowrap`, so without both an unbounded rule name or
+                        transaction type pushed the trailing currency advisory clean out of the visible
+                        area - silently hiding a warning. Wrapping lets the pane grow taller instead.
+
+                        Each bounded badge is made shrinkable and truncates through an INNER block span.
+                        `text-overflow` has no effect on the Badge itself: it is `inline-flex` and
+                        `justify-center`, so over-long text was cut symmetrically at both edges instead of
+                        ellipsised. `shrink` is what keeps a badge that is alone on a wrapped line from
+                        overflowing a pane narrower than its own maximum. */}
+                    <div className="flex flex-wrap items-center gap-1">
                         <span className="font-medium text-sm">{formatDate(transaction.date)}</span>
                         {transaction.transaction_type &&
-                            <Badge theme="blue">{transaction.transaction_type}</Badge>}
+                            <Badge theme="blue"
+                                title={transaction.transaction_type}
+                                className="min-w-0 shrink max-w-40">
+                                <span className="truncate">{transaction.transaction_type}</span></Badge>}
                         {transaction.reference_number && <Badge
                             title={transaction.reference_number}
-                            className="max-w-[300px] text-ellipsis"
+                            className="min-w-0 shrink max-w-[300px]"
                         >
-                            {_("Ref")}: {transaction.reference_number}</Badge>}
+                            <span className="truncate">{_("Ref")}: {transaction.reference_number}</span></Badge>}
 
+                        {/* Titled with the rule name as well as the label, because the bound above may
+                            ellipsise the name itself. */}
                         {transaction.matched_transaction_rule && <Badge
                             theme="violet"
-                            title={_("Matched by rule")}>
-                            <ZapIcon className="w-4 h-4" /> {transaction.matched_transaction_rule}</Badge>}
+                            title={`${_("Matched by rule")}: ${transaction.matched_transaction_rule}`}
+                            className="min-w-0 shrink max-w-56">
+                            <ZapIcon className="w-4 h-4 shrink-0" />
+                            <span className="truncate">{transaction.matched_transaction_rule}</span></Badge>}
 
                         {/* Advisory only: Reconcile stays enabled, because the server and not this badge
                             decides whether a post is allowed. `theme="orange"` resolves to the amber ink
-                            and surface tokens, since Badge declares no `amber` theme. `TooltipTrigger
-                            asChild` keeps the indicator non-interactive - the row is itself a focusable
-                            role="button", and a bare trigger would add a second tab stop. */}
+                            and surface tokens, since Badge declares no `amber` theme.
+
+                            The trigger is a focusable span rather than the Badge itself. Badge renders a
+                            plain span, which takes no focus, so a keyboard user reaching this row had no
+                            way to reveal the explanation - focusing the row shows nothing. The span
+                            carries the accessible name and Radix points `aria-describedby` at the tooltip
+                            while it is open, so focus alone announces the warning and its reason. */}
                         {isCurrencyMismatch && <TooltipProvider>
                             <Tooltip>
                                 <TooltipTrigger asChild>
-                                    <Badge variant="subtle" theme="orange" size="sm"
-                                        title={_("Currency mismatch")}>
-                                        <AlertCircleIcon /> {transaction.currency}</Badge>
+                                    <span
+                                        tabIndex={0}
+                                        aria-label={_("Currency mismatch: transaction in {0}, bank account in {1}", [transaction.currency ?? '', accountCurrency ?? ''])}
+                                        className="inline-flex rounded-full outline-none focus-visible:shadow-focus-gray">
+                                        <Badge variant="subtle" theme="orange" size="sm">
+                                            <AlertCircleIcon /> {transaction.currency}</Badge>
+                                    </span>
                                 </TooltipTrigger>
                                 <TooltipContent side="top" className="max-w-sm text-balance wrap-break-word">
-                                    {_("Transaction currency {0} differs from the bank account currency {1}. This indicator does not block the reconciliation - the server applies its own currency rule and may refuse to post it.", [transaction.currency ?? '', selectedBank?.account_currency ?? ''])}
+                                    {_("Transaction currency {0} differs from the bank account currency {1}. This indicator does not block the action - the server validates the currency when the reconciliation is posted, and refuses a mismatch.", [transaction.currency ?? '', accountCurrency ?? ''])}
                                 </TooltipContent>
                             </Tooltip>
                         </TooltipProvider>}
@@ -442,6 +481,7 @@ const useKeyboardShortcuts = () => {
     const setRecordJournalEntryModalOpen = useSetAtom(bankRecRecordJournalEntryModalAtom)
 
     useHotkeys('meta+p', () => {
+        // 
         setRecordPaymentModalOpen(true)
     }, {
         enabled: true,
@@ -450,6 +490,7 @@ const useKeyboardShortcuts = () => {
     })
 
     useHotkeys('meta+b', () => {
+        // 
         setRecordJournalEntryModalOpen(true)
     }, {
         enabled: true,
@@ -458,6 +499,7 @@ const useKeyboardShortcuts = () => {
     })
 
     useHotkeys('meta+i', () => {
+        // 
         setTransferModalOpen(true)
     }, {
         enabled: true,
@@ -862,6 +904,12 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
 
         const transaction = selectedTransaction?.[0]
 
+        // We need to check if the following details match:
+        // Amount
+        // Date
+        // Reference/Description: Full or partial
+        // Whether this is suggested or not - depends on the above scores
+
         const amountMatches = voucher.paid_amount === transaction?.unallocated_amount
         const postingDateMatches = voucher.posting_date === transaction?.date
         const referenceDateMatches = voucher.reference_date === transaction?.date
@@ -1007,6 +1055,7 @@ const MatchBadge = ({ matchType, label }: { matchType: 'full' | 'partial' | 'non
 
 const OlderUnreconciledTransactionsBanner = () => {
 
+    // A banner to show when there are unreconciled transactions for the given bank account before the current selected date
     const [dates, setDates] = useAtom(bankRecDateAtom)
     const selectedBank = useAtomValue(selectedBankAccountAtom)
 
