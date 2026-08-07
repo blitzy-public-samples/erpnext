@@ -393,6 +393,66 @@ class TestBankStatementImportLog(ERPNextTestSuite, AccountsTestMixin):
 		self.assertEqual(mapped.get("Date"), 0)
 		self.assertEqual(mapped.get("Description"), 1)
 
+	def test_pdf_table_edits_refuse_coordinates_that_match_no_table(self):
+		"""
+		Both PDF table editors located their target with a `for ... if ... break` loop and did nothing at
+		all when nothing matched - answering HTTP 200 to a caller whose page or table index was stale, so
+		it believed an edit had been saved. `reextract_pdf_table` was worse: it re-extracted the page
+		BEFORE looking, so an out-of-range page failed inside the extractor as an IndexError HTTP 500.
+		"""
+		html = """
+		<html><body>
+		<table border="1"><tr><th>Date</th><th>Narration</th><th>Amount</th></tr>
+		<tr><td>01/04/2024</td><td>UPI PAYMENT</td><td>500.00</td></tr></table>
+		</body></html>
+		"""
+		doc = self._create_pdf_import_log(html)
+		table = doc.get_pdf_tables()[0]
+		before = doc.get_pdf_tables()
+
+		self.assertRaises(
+			frappe.ValidationError,
+			set_pdf_table_header,
+			statement_import_id=doc.name,
+			page=table["page"],
+			table_index=table["table_index"] + 99,
+			header_index=0,
+		)
+		self.assertRaises(
+			frappe.ValidationError,
+			reextract_pdf_table,
+			statement_import_id=doc.name,
+			page=table["page"] + 99,
+			table_index=table["table_index"],
+			bbox=table["bbox"],
+		)
+
+		doc.reload()
+		self.assertEqual(doc.get_pdf_tables(), before)
+
+	def test_pdf_reextract_refuses_a_region_that_is_not_four_numbers(self):
+		# The four numbers went straight to the extractor: a short list raised an IndexError and a
+		# non-numeric entry a ValueError, both as HTTP 500 rather than as a rejected request.
+		html = """
+		<html><body>
+		<table border="1"><tr><th>Date</th><th>Narration</th><th>Amount</th></tr>
+		<tr><td>01/04/2024</td><td>UPI PAYMENT</td><td>500.00</td></tr></table>
+		</body></html>
+		"""
+		doc = self._create_pdf_import_log(html)
+		table = doc.get_pdf_tables()[0]
+
+		for bbox in ([0, 0], [0, 0, 10, 10, 10], "not a box", ["a", "b", "c", "d"], [None, 0, 10, 10]):
+			with self.subTest(bbox=bbox):
+				self.assertRaises(
+					frappe.ValidationError,
+					reextract_pdf_table,
+					statement_import_id=doc.name,
+					page=table["page"],
+					table_index=table["table_index"],
+					bbox=bbox,
+				)
+
 	# ------------------------------------------------------------------ #
 	# CSV/XLSX column mapping + header overrides
 	# ------------------------------------------------------------------ #
@@ -531,6 +591,112 @@ class TestBankStatementImportLog(ERPNextTestSuite, AccountsTestMixin):
 			frappe.db.count("Bank Transaction", {"bank_account": self.bank_account, "docstatus": 1}),
 			created,
 		)
+
+	# ------------------------------------------------------------------ #
+	# Empty / malformed statements must fail, not "complete"
+	# ------------------------------------------------------------------ #
+
+	def test_insert_transactions_refuses_a_statement_with_no_transactions(self):
+		"""
+		A header-only or malformed statement parses to zero transaction rows, so the insert loop simply
+		did not run: the request answered HTTP 200 and stamped the log "Completed" having created no Bank
+		Transaction at all, telling the reviewer an import had succeeded when nothing had been imported.
+
+		Every assertion below is one half of that: the refusal itself, and the state it must leave behind
+		so the log is still importable once the file or the mapping is corrected.
+		"""
+		cases = {
+			"header only": "Date,Narration,Amount\n",
+			"malformed": "this,is,not,a,statement\nfoo,bar,baz\n",
+			"blank rows": "\n\n\n",
+		}
+
+		for label, csv_text in cases.items():
+			with self.subTest(statement=label):
+				before = frappe.db.count(
+					"Bank Transaction", {"bank_account": self.bank_account, "docstatus": 1}
+				)
+				doc = self._create_csv_import_log(csv_text)
+				self.assertEqual(doc.number_of_transactions, 0)
+
+				with patch(
+					"erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule.run_rule_evaluation"
+				) as run_rule_evaluation:
+					with self.assertRaises(frappe.ValidationError) as refusal:
+						doc.insert_transactions()
+
+				self.assertIn("No transactions could be read", str(refusal.exception))
+				# The evaluator is queued only by a successful import.
+				run_rule_evaluation.assert_not_called()
+
+				# Not "Completed" - otherwise the importer list would badge this log green, and a retry
+				# after fixing the mapping would be refused as already imported.
+				doc.reload()
+				self.assertEqual(doc.status, "Not Started")
+				# And no transaction was created, which is what "no client-side transaction creation"
+				# ultimately has to mean on the server too.
+				self.assertEqual(
+					frappe.db.count("Bank Transaction", {"bank_account": self.bank_account, "docstatus": 1}),
+					before,
+				)
+
+	def test_a_statement_with_no_dated_rows_gets_no_date_range(self):
+		# `getdate(None)` returns TODAY, so a statement in which no row carried a readable date was
+		# stamped with the upload day as both its start and its end - a range the file never contained,
+		# which the preview and the importer list then both displayed as fact.
+		doc = self._create_csv_import_log("Date,Narration,Amount\n")
+
+		self.assertEqual(doc.number_of_transactions, 0)
+		self.assertIsNone(doc.start_date)
+		self.assertIsNone(doc.end_date)
+
+		# A statement that DOES carry dates still gets its real range - the guard must not suppress that.
+		dated = self._create_csv_import_log(
+			"Date,Narration,Amount\n01/04/2024,UPI PAYMENT,-500.00\n03/04/2024,SALARY,20000.00\n"
+		)
+		self.assertEqual(dated.start_date, getdate("2024-04-01"))
+		self.assertEqual(dated.end_date, getdate("2024-04-03"))
+
+	def test_get_data_refuses_a_file_that_parses_to_no_rows(self):
+		"""
+		A file that yields no rows at all has nothing to detect a header or a mapping from, and
+		`detect_header_row` answers index 0 for an empty list - so `set_file_properties` indexed past the
+		end of it and raised a bare IndexError HTTP 500.
+
+		An empty XLSX workbook is used because it is the reachable form: the framework's own File
+		validation refuses a genuinely zero-byte upload before any of this code runs.
+		"""
+		import io
+
+		from frappe.utils.xlsxutils import read_xlsx_file_from_attached_file
+		from openpyxl import Workbook
+
+		buffer = io.BytesIO()
+		Workbook().save(buffer)
+		workbook = buffer.getvalue()
+
+		# The premise of the test, asserted rather than assumed.
+		self.assertEqual(read_xlsx_file_from_attached_file(fcontent=workbook), [])
+
+		file_doc = frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": f"test-empty-{frappe.generate_hash(length=8)}.xlsx",
+				"is_private": 1,
+				"content": workbook,
+			}
+		).insert(ignore_permissions=True)
+
+		with self.assertRaises(frappe.ValidationError) as refusal:
+			frappe.get_doc(
+				{
+					"doctype": "Bank Statement Import Log",
+					"bank_account": self.bank_account,
+					"file": file_doc.file_url,
+				}
+			).insert()
+
+		self.assertIn("No rows could be read", str(refusal.exception))
 
 
 test_hdfc_sample_statement_data = [

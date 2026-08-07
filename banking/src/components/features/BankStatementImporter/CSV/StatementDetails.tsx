@@ -16,7 +16,7 @@ import type { FrappeError } from 'frappe-react-sdk'
 import { toast } from 'sonner'
 import ErrorBanner from '@/components/ui/error-banner'
 import { Link, useNavigate } from 'react-router'
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Progress } from '@/components/ui/progress'
 import { useSetAtom } from 'jotai'
 import { useDirection } from '@/components/ui/direction'
@@ -76,6 +76,24 @@ const StatementDetails = ({ data }: Props) => {
     const attemptRef = useRef(0)
     const activeAttemptRef = useRef<number | null>(null)
 
+    /*
+     * Whether this screen is still on the reviewer's page. An import is a single server-side operation
+     * that keeps running whether or not anyone is watching, so its promise can settle long after the
+     * reviewer has clicked Back - and when it did, the continuation reached straight past the screen it
+     * belonged to: it rewrote the workbench's persisted date range, raised a success toast over whatever
+     * route the reviewer had moved to, and pushed a navigation to `/` that buried the history entry they
+     * had deliberately gone back to.
+     *
+     * `true` is re-asserted in the effect body rather than only initialised, because StrictMode mounts,
+     * tears down and re-mounts in development - a ref set false by the first cleanup would otherwise
+     * stay false for the life of the real mount.
+     */
+    const isMountedRef = useRef(true)
+    useEffect(() => {
+        isMountedRef.current = true
+        return () => { isMountedRef.current = false }
+    }, [])
+
     const onImport = () => {
 
         // Reset before dispatching, so a retry never starts from the bar the previous attempt left
@@ -84,11 +102,41 @@ const StatementDetails = ({ data }: Props) => {
         activeAttemptRef.current = attempt
         setProgress({ percent: 0 })
 
+        /*
+         * Deliberately NOT abortable. The suggested remedy for the stale-continuation defect was an
+         * AbortController, but aborting this XHR would abandon only the client's half: the server would
+         * carry on writing the transactions and committing, and the reviewer would be left with an import
+         * that had really happened and no record of it either way. The server is the authority on what
+         * was recorded, so the request is always allowed to finish - what is guarded is which of its
+         * consequences are permitted to touch a screen the reviewer has left.
+         */
         call({
             docs: data.doc,
             method: 'insert_transactions'
         }).then((response) => {
+            // A newer attempt owns the screen; this one's outcome is history and must not overwrite it.
+            if (activeAttemptRef.current !== attempt) return
             activeAttemptRef.current = null
+
+            /*
+             * A fact about the FILE, so it is recorded whatever became of this screen: a confirmed
+             * success retires any failure marker an earlier attempt left, so a stale marker cannot keep
+             * labelling a log that has since imported cleanly. This writes to a store, not to a mounted
+             * component, and the importer list reads it wherever the reviewer happens to be.
+             */
+            setImportFailures((failures) => {
+                if (!(data.doc.name in failures)) return failures
+                return Object.fromEntries(
+                    Object.entries(failures).filter(([name]) => name !== data.doc.name)
+                )
+            })
+
+            /*
+             * Everything below changes what the reviewer is LOOKING AT - their persisted date range, a
+             * toast, and a navigation - so none of it may happen once they have left this screen.
+             */
+            if (!isMountedRef.current) return
+
             const doc = response.docs ? response.docs[0] : undefined
             if (doc && doc.start_date && doc.end_date) {
                 setDates({
@@ -96,26 +144,28 @@ const StatementDetails = ({ data }: Props) => {
                     toDate: doc.end_date,
                 })
             }
-            /* A confirmed success retires any failure this log carries from an earlier attempt, so a
-             * stale marker cannot keep labelling a log that has since imported cleanly. */
-            setImportFailures((failures) => {
-                if (!(data.doc.name in failures)) return failures
-                return Object.fromEntries(
-                    Object.entries(failures).filter(([name]) => name !== data.doc.name)
-                )
-            })
             toast.success(_("Bank statement imported."))
             navigate(`/`)
         }).catch((error: FrappeError) => {
+            if (activeAttemptRef.current !== attempt) return
             activeAttemptRef.current = null
+
+            /*
+             * Also a fact about the file, and the ONLY record of it - the import rolled back and the
+             * import-log schema has no error field - so it is recorded even if the reviewer has moved on.
+             * They then meet the refusal as a red marker against that file in the importer list, which is
+             * where they would look for it, rather than as a modal ambushing an unrelated screen.
+             */
+            setImportFailures((failures) => ({ ...failures, [data.doc.name]: error }))
+
+            if (!isMountedRef.current) return
+
             // The import rolled back, so any progress already reported describes work that no longer
             // exists. Clearing it is what stops a failed screen showing a part-filled bar.
             setProgress(null)
             toast.error(_("There was an error while importing the bank statement."))
-            /* Preserve the raw import error for the shared dialog and record it for this log in memory;
-             * the persisted import-log schema has no error field. */
+            /* Preserve the raw import error for the shared dialog. */
             setBankRecErrorDialog(error)
-            setImportFailures((failures) => ({ ...failures, [data.doc.name]: error }))
         })
 
     }
@@ -149,7 +199,10 @@ const StatementDetails = ({ data }: Props) => {
     return (
         <div className='flex flex-col gap-4'>
             <div className='flex flex-col gap-4'>
-                <div className='flex justify-between items-center'>
+                {/* Wraps rather than compressing: Back and the Import control both carry text, and on a
+                    narrow screen a single non-wrapping row squeezed the Import label until it was clipped
+                    by the pane edge. */}
+                <div className='flex flex-wrap gap-2 justify-between items-center'>
                     <Button size='sm' variant='outline' asChild>
                         <Link to="/statement-importer">
                             {direction === 'ltr' ? <ChevronLeftIcon /> : <ChevronRightIcon />}
@@ -178,16 +231,37 @@ const StatementDetails = ({ data }: Props) => {
                 {/* The server's figure is a PERCENTAGE, so it is labelled as one. Only the terminal
                     event carries `total`, which is the row count actually written - the one point at
                     which a transaction count can honestly be shown. */}
-                {progress !== null && <div className='flex flex-col gap-2'><Progress value={progress.percent} max={100} size="lg" />
-                    <span className='text-sm'>{progress.total !== undefined
+                {progress !== null && (() => {
+                    /* The wording shown beside the bar is also the bar's spoken value, so a screen reader
+                       hears the same thing a sighted reviewer reads rather than a bare percentage. */
+                    const progressText = progress.total !== undefined
                         ? _("Imported {0} transactions.", [progress.total.toString()])
-                        : _("Importing... {0}% complete", [progress.percent.toString()])}
-                    </span>
-                </div>}
+                        : _("Importing... {0}% complete", [progress.percent.toString()])
+
+                    return <div className='flex flex-col gap-2'>
+                        <Progress
+                            value={progress.percent}
+                            max={100}
+                            size="lg"
+                            aria-label={_("Statement import progress")}
+                            hintText={progressText}
+                        />
+                        <span className='text-sm'>{progressText}</span>
+                    </div>
+                })()}
 
                 {error && <ErrorBanner error={error} />}
 
-                <Table>
+                {/*
+                  * Every cell in this summary is allowed to wrap. The table primitive defaults each cell to
+                  * `whitespace-nowrap`, which is right for a list of many short rows and wrong for this:
+                  * the labels here are whole phrases ("Closing Balance as of 5th August 2026") and the
+                  * values carry currency and counts, so nowrap forced a horizontal scroll INSIDE the pane
+                  * and the reviewed figures ended up off the edge of it. Wrapping keeps every one of them
+                  * on screen at any pane width. Applied once here rather than as a class on each of the ten
+                  * rows.
+                  */}
+                <Table className='[&_th]:whitespace-normal [&_td]:whitespace-normal'>
                     <TableBody>
                         <TableRow>
                             <TableHead>{_("Bank Account")}</TableHead>
@@ -209,7 +283,10 @@ const StatementDetails = ({ data }: Props) => {
                             <TableCell>
                                 <div className='flex items-center gap-2'>
                                     <FileTypeIcon fileType={getFileExtension(file_name)} size='md' showBackground={false} />
-                                    {file_name}
+                                    {/* `break-all` as well as wrapping: an exported filename is often one
+                                        unbroken token, which `whitespace-normal` alone cannot wrap, so it
+                                        would still run past the pane edge. `title` carries it whole. */}
+                                    <span className='break-all' title={file_name}>{file_name}</span>
                                 </div>
                             </TableCell>
                         </TableRow>

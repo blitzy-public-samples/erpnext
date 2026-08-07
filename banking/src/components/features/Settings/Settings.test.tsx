@@ -29,7 +29,7 @@
  * the list, the editor and the creator.
  */
 
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { describe, expect, it, vi, beforeAll, beforeEach } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Provider, createStore } from 'jotai'
@@ -181,9 +181,13 @@ const openSettings = async (scenario: SettingsScenario = {}) => {
 
 	// The generous timeout covers the FIRST open in the file, where the panels chunk is genuinely
 	// being resolved and transformed for the first time; later opens hit the resolved module and
-	// settle in a few milliseconds. This waits on the import completing, not on a fixed delay.
+	// settle in a few milliseconds. This waits on the import completing, not on a fixed delay - and
+	// the ceiling is high because resolving and transforming a module is host-speed work: on a
+	// contended runner it can take tens of seconds, and expiring here would report a missing element
+	// for a chunk that simply had not arrived yet. It stays below the suite's own test timeout so a
+	// genuinely absent panel still fails as a missing element rather than as a timed-out test.
 	await screen.findByText('Configure settings for the banking module', undefined, {
-		timeout: 10_000
+		timeout: 20_000
 	})
 
 	return user
@@ -199,9 +203,38 @@ const openMatchingRules = async (scenario: SettingsScenario = {}) => {
 	return user
 }
 
-describe('Settings', () => {
+/*
+ * TIMEOUT: this file declares a per-suite budget above Vitest's 5 s default, for the same reason the
+ * reconciliation-workbench suite does, and because without it {@link openSettings}'s own 10 s
+ * allowance for the panels chunk could never be reached — the enclosing test would be killed at 5 s
+ * first.
+ *
+ * The allowance is not theoretical. Whichever case opens the dialog first would otherwise pay the
+ * whole `lazy()` transform-and-evaluate cost inside its own budget, and coverage instrumentation
+ * multiplies it: under `yarn test:coverage` the first open measured 4.19 s against the 5 s default —
+ * an 810 ms margin, which a loaded machine erases. It then fails on timing alone, and WHICH case
+ * fails moves with test order. The `beforeAll` below removes that cost from every test budget; this
+ * budget is the second guard, for a machine slow enough that even a warm open is not instant.
+ */
+describe('Settings', { timeout: 20000 }, () => {
 
 	stubViewportMeasurement()
+
+	/**
+	 * Resolves the lazily imported panels chunk ONCE, before any test runs, exactly as the
+	 * reconciliation-workbench suite warms its three modal bodies.
+	 *
+	 * `SettingsDialogContent` renders `SettingsPanelsContent` behind a `lazy()` boundary, and it is the
+	 * largest chunk this surface pulls in, so without this the first case to open the dialog pays the
+	 * transform and evaluation of that whole chunk inside its own timeout - measured at ~4.4 s against the
+	 * 5 s default, which is close enough to fail under load rather than because of anything the test
+	 * asserts - and the charge moves between cases with `--sequence.shuffle`. Warming it here makes the
+	 * cost a fixed once-per-file charge outside every test budget, and makes module-cache state identical
+	 * for every case regardless of order. Nothing is rendered or asserted.
+	 */
+	beforeAll(async () => {
+		await import('./SettingsPanelsContent')
+	}, 60_000)
 
 	beforeEach(() => {
 		configureSDK()
@@ -383,6 +416,37 @@ describe('Settings', () => {
 				'false'
 			)
 		})
+
+		it('names the three theme cards as one group', async () => {
+			await openSettings()
+
+			// "Theme" heads THREE toggle buttons, so there is no single control a <label> could point
+			// `htmlFor` at. Rendered as a label it therefore named nothing at all. Wiring it to the
+			// card container instead names all three buttons collectively, which is what was intended.
+			const group = screen.getByRole('group', { name: 'Theme' })
+
+			expect(group).toContainElement(screen.getByRole('button', { name: /Light/ }))
+			expect(group).toContainElement(screen.getByRole('button', { name: /Dark/ }))
+			expect(group).toContainElement(screen.getByRole('button', { name: /System/ }))
+		})
+
+		it('leaves no label on the panel governing nothing', async () => {
+			await openSettings()
+
+			// Each remaining label here governs exactly one control, so every one must either carry a
+			// `htmlFor` that resolves to a real element or wrap its control directly. A label that
+			// does neither is inert: it is skipped by assistive technology and reported by the
+			// browser's own accessibility audit as "No label associated with a form field". Radix
+			// renders both the switches and the select trigger as `button`, which is why buttons count
+			// as governable controls here.
+			const orphans = Array.from(document.querySelectorAll('label')).filter((label) => {
+				const target = label.getAttribute('for')
+				if (target !== null) return document.getElementById(target) === null
+				return label.querySelector('input, select, textarea, button') === null
+			})
+
+			expect(orphans.map((label) => label.textContent)).toEqual([])
+		})
 	})
 
 	describe('the Matching Rules panel', () => {
@@ -405,6 +469,52 @@ describe('Settings', () => {
 
 			expect(screen.getByTitle('Applies to withdrawals')).toBeInTheDocument()
 			expect(screen.getByTitle('Applies to deposits')).toBeInTheDocument()
+		})
+
+		it('bounds a long rule name and description instead of letting the row grow', async () => {
+			const LONG_NAME = `W002 RULE-NAME-PADDING-${'X'.repeat(77)}`
+			const LONG_DESCRIPTION = 'A'.repeat(200)
+
+			await openMatchingRules({
+				rules: [makeRule({ rule_name: LONG_NAME, rule_description: LONG_DESCRIPTION })]
+			})
+
+			// A rule name and description are free text with no server-side length cap. Left
+			// unconstrained they grew the row wider than the dialog and displaced the panel header's
+			// actions off its right edge. Truncation has to land on an INNER span because `Button`
+			// sets `whitespace-nowrap` on itself, and the button has to be cleared to `min-w-0`
+			// because a flex item cannot otherwise shrink below its own content.
+			const name = screen.getByText(LONG_NAME)
+			expect(name).toHaveClass('truncate')
+			expect(name.closest('button')).toHaveClass('min-w-0')
+
+			expect(screen.getByText(LONG_DESCRIPTION)).toHaveClass('truncate')
+
+			// Truncating must not lose the text: both stay readable on hover and to assistive tech.
+			expect(screen.getByTitle(LONG_NAME)).toBeInTheDocument()
+			expect(screen.getByTitle(LONG_DESCRIPTION)).toBeInTheDocument()
+		})
+
+		it('keeps both panel actions present alongside a rule that overflows its row', async () => {
+			await openMatchingRules({
+				rules: [makeRule({ rule_name: `Overflowing ${'Y'.repeat(120)}` })]
+			})
+
+			// The consequence that mattered: with the row unbounded these two buttons rendered OUTSIDE
+			// the dialog's clipping box and could not be hit-tested. jsdom performs no layout, so this
+			// pins the structural guarantee while the geometric proof is a runtime measurement.
+			//
+			// BOTH clamps are asserted because clamping only the panel was measured to be INSUFFICIENT.
+			// `DialogContent` is a grid, so the tabs root is a grid item whose default `min-width:auto`
+			// resolves to its content-based minimum: the widest descendant anywhere inside sized the
+			// whole row, and the overflow spilled outside the dialog. A `min-width` of 0 on the panel is
+			// a floor that permits shrinking, not a cap that compels it, so it could not prevent that on
+			// its own - the grid item is the clamp that binds.
+			expect(document.querySelector('[data-slot="settings-dialog"]')).toHaveClass('min-w-0')
+			expect(document.querySelector('[data-slot="settings-panels"]')).toHaveClass('min-w-0')
+
+			expect(screen.getByRole('button', { name: 'Add Rule' })).toBeInTheDocument()
+			expect(screen.getByRole('button', { name: /Run Rules/ })).toBeInTheDocument()
 		})
 
 		it('invites setting rules up when there are none', async () => {

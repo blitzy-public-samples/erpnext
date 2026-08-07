@@ -12,6 +12,7 @@ import {
 } from "react-hook-form"
 
 import { cn } from "@/lib/utils"
+import _ from "@/lib/translate"
 import { Label } from "@/components/ui/label"
 
 const Form = FormProvider
@@ -102,10 +103,23 @@ function FormLabel({
     )
 }
 
+/**
+ * The "this field is required" mark shown after a field's label.
+ *
+ * The asterisk on its own was decorative: it is a punctuation character, so a screen reader either
+ * skipped it or read "star", and nothing in the accessible tree said the field was required. The glyph is
+ * therefore hidden from assistive technology and the requirement is stated in words alongside it, which
+ * become part of the label's accessible name. The controls themselves carry `aria-required`, so the
+ * constraint is also readable programmatically rather than only being announced.
+ */
 function FormRequiredIndicator({ className, ...props }: React.ComponentProps<"span">) {
     return (
         <span className={cn("text-ink-red-2", className)} {...props}>
-            *
+            <span aria-hidden="true">*</span>
+            {/* The leading space is deliberate and load-bearing. This indicator sits immediately after
+                the label text with no separator, so without it the computed accessible name came out as
+                "Reference(required)" and was announced as one run-together word. */}
+            <span className="sr-only">{" "}{_("(required)")}</span>
         </span>
     )
 }

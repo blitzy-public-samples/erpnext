@@ -61,9 +61,10 @@ import {
 	bankRecAmountFilter,
 	bankRecDateAtom,
 	bankRecErrorDialogAtom,
+	bankRecLastRefusalAtom,
 	bankRecMatchFilters,
 	bankRecSearchText,
-	bankRecSelectedTransactionAtom,
+	bankRecSelectedTransactionsAtom,
 	bankRecTransactionTypeFilter,
 	bankRecUnreconcileModalAtom,
 	selectedBankAccountAtom,
@@ -88,7 +89,7 @@ const TO_DATE = '2024-01-31'
 const UNRECONCILED_KEY = `bank-reconciliation-unreconciled-transactions-${TEST_BANK_ACCOUNT}-${FROM_DATE}-${TO_DATE}`
 const ALL_TRANSACTIONS_KEY = `bank-reconciliation-bank-transactions-${TEST_BANK_ACCOUNT}-${FROM_DATE}-${TO_DATE}`
 
-const SELECTED_TRANSACTION_ATOM = bankRecSelectedTransactionAtom(TEST_BANK_ACCOUNT)
+const SELECTED_TRANSACTION_ATOM = bankRecSelectedTransactionsAtom
 
 /**
  * A store seeded with the state the reconcile seam reads. Seeding the dates explicitly is what makes
@@ -227,6 +228,57 @@ describe('the balance queries', () => {
 			till_date: TO_DATE
 		})
 		expect(swrKey).toBe(CLOSING_BALANCE_KEY)
+	})
+
+	/*
+	 * A null SWR key is what SUPPRESSES the request, and for these two hooks that is load-bearing rather
+	 * than tidy: `get_account_balance` takes `company` as a REQUIRED positional argument, so a call made
+	 * without one is not an empty answer but an HTTP 500 `TypeError: ... missing 1 required positional
+	 * argument: 'company'`, complete with a traceback. A bank account without a company is a reachable
+	 * state - `selectedBankAccountAtom` reads storage on init, and for one render this atom did not.
+	 */
+	it.each([
+		['the opening balance', useGetAccountOpeningBalance],
+		['the closing balance', useGetAccountClosingBalance]
+	])('withholds %s entirely while no company is known', (_label, useBalance) => {
+		/*
+		 * BOTH company sources have to be empty, which is exactly the state the defect needed:
+		 * `useCurrentCompany` falls back to the signed-in user's default company, and the real account
+		 * this was observed on - Administrator - simply has no default company set. The harness stubs one,
+		 * so it is removed here and restored immediately afterwards.
+		 */
+		const defaults = (window.frappe.boot as { user: { defaults: Record<string, unknown> } }).user.defaults
+		const stubbedCompany = defaults.company
+		delete defaults.company
+
+		try {
+			const store = createStore()
+			store.set(selectedBankAccountAtom, makeSelectedBank())
+			store.set(bankRecDateAtom, { fromDate: FROM_DATE, toDate: TO_DATE })
+			store.set(selectedCompanyAtom, '')
+
+			renderHook(() => useBalance(), { wrapper: withStore(store) })
+
+			const [, params, swrKey] = lastGetCallFor(GET_ACCOUNT_BALANCE)
+			// The arguments still carry the bank account, so the request was genuinely assembled and only
+			// the key held it back - which is what makes this a suppression rather than an accident.
+			expect((params as { bank_account?: string }).bank_account).toBe(TEST_BANK_ACCOUNT)
+			expect(swrKey).toBeNull()
+		} finally {
+			defaults.company = stubbedCompany
+		}
+	})
+
+	it.each([
+		['the opening balance', useGetAccountOpeningBalance],
+		['the closing balance', useGetAccountClosingBalance]
+	])('withholds %s entirely while no bank account is selected', (_label, useBalance) => {
+		const store = createStoreWithoutBank()
+
+		renderHook(() => useBalance(), { wrapper: withStore(store) })
+
+		const [, , swrKey] = lastGetCallFor(GET_ACCOUNT_BALANCE)
+		expect(swrKey).toBeNull()
 	})
 
 	it('reads the statement closing balance from the bank account, under its own distinct key', () => {
@@ -729,6 +781,10 @@ describe('a refused post leaves the client\'s state exactly as it was', () => {
 		consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
 		errorToast = vi.spyOn(toast, 'error').mockReturnValue('toast-id')
 		frappeSWRMutate.mockResolvedValue(undefined)
+		// The convergence re-reads the all-transactions list imperatively (see the dedicated block
+		// below), so this seam is configured for every test here: the imperative default REJECTS when
+		// unconfigured, and the keyed `mutate` is a spy that never consumes the promise it is handed.
+		frappeContextValue.call.get.mockResolvedValue({ message: [] })
 	})
 
 	afterEach(() => {
@@ -850,23 +906,238 @@ describe('a refused post leaves the client\'s state exactly as it was', () => {
 	})
 
 	/*
+	 * WHAT LEAVES THE APPLICATION ABOUT A REFUSAL, AND TO WHOM.
+	 *
+	 * These are three different audiences with three different entitlements: the dialog is for the
+	 * reviewer and gets the server's words in full; the toast is a plain-text surface and gets the same
+	 * words with only the markup it cannot render removed; the console is read by anyone who opens
+	 * DevTools on a financial application and gets what identifies the failure and nothing that
+	 * describes the server.
+	 */
+	describe('what it publishes about a refusal', () => {
+
+		// Shortened but shaped exactly like the real thing: `frappe.throw` returns `exc` as a traceback
+		// naming absolute paths inside both apps.
+		const TRACEBACK = [
+			'Traceback (most recent call last):',
+			'  File "apps/frappe/frappe/app.py", line 114, in application',
+			'  File "apps/erpnext/erpnext/accounts/doctype/bank_transaction/bank_transaction.py", line 161',
+			'frappe.exceptions.ValidationError: Transaction currency mismatch'
+		].join('\n')
+
+		const CURRENCY_REFUSAL =
+			'Transaction currency: <strong>USD</strong> cannot be different from Bank Account(<strong>QA Checking - QA Bank</strong>) currency: <strong>INR</strong>'
+
+		const refuseWithTraceback = () => refuseConfirm({
+			refusal: makeServerMessagesError(CURRENCY_REFUSAL, {
+				exc: TRACEBACK,
+				exc_type: 'ValidationError'
+			})
+		})
+
+		it("keeps the server's traceback and filesystem paths out of the console", async () => {
+			await refuseWithTraceback()
+
+			expect(consoleError).toHaveBeenCalledTimes(1)
+			const logged = JSON.stringify(consoleError.mock.calls[0][0])
+
+			expect(logged).not.toContain('Traceback')
+			expect(logged).not.toContain('apps/frappe')
+			expect(logged).not.toContain('apps/erpnext')
+			expect(logged).not.toContain('bank_transaction.py')
+			expect(logged).not.toContain('frappe.exceptions')
+		})
+
+		it('still says enough to identify which call failed and why', async () => {
+			await refuseWithTraceback()
+			const logged = consoleError.mock.calls[0][0] as Record<string, unknown>
+
+			expect(String(logged.scope)).toContain('reconcile_vouchers')
+			expect(logged.httpStatus).toBe(417)
+			expect(logged.exc_type).toBe('ValidationError')
+			// The reviewer-facing messages, which the dialog is showing anyway.
+			expect(JSON.stringify(logged.messages)).toContain('cannot be different')
+			// The two fields that carried the disclosure are absent, not merely unused.
+			expect(logged).not.toHaveProperty('exc')
+			expect(logged).not.toHaveProperty('exception')
+		})
+
+		it('summarises a failure that never reached the server by name instead', async () => {
+			await refuseConfirm({ refusal: new TypeError('Network request failed') })
+
+			const logged = consoleError.mock.calls[0][0] as Record<string, unknown>
+
+			expect(logged.name).toBe('TypeError')
+			expect(logged.message).toBe('Network request failed')
+			// Nothing to report about a response that never arrived.
+			expect(logged).not.toHaveProperty('httpStatus')
+		})
+
+		/*
+		 * The server's own messages carry inline HTML - `validate_currency` wraps all three of its values
+		 * in `<strong>`. The dialog renders that as emphasis; a toast description is a plain string child,
+		 * so the identical text arrived there with its tags visible as characters.
+		 */
+		it('renders the toast description as text, because a toast cannot render markup', async () => {
+			await refuseWithTraceback()
+
+			const description = String(
+				(errorToast.mock.calls[0][1] as { description?: unknown } | undefined)?.description
+			)
+
+			expect(description).toContain(
+				'Transaction currency: USD cannot be different from Bank Account(QA Checking - QA Bank) currency: INR'
+			)
+			expect(description).not.toContain('<strong>')
+			expect(description).not.toContain('</strong>')
+			expect(description).not.toMatch(/[<>]/)
+		})
+
+		it('coalesces a repeat refusal onto one toast instead of stacking an identical second', async () => {
+			await refuseWithTraceback()
+			await refuseWithTraceback()
+
+			expect(errorToast).toHaveBeenCalledTimes(2)
+			const first = (errorToast.mock.calls[0][1] as { id?: unknown } | undefined)?.id
+			const second = (errorToast.mock.calls[1][1] as { id?: unknown } | undefined)?.id
+
+			expect(first).toBe('bank-rec-reconcile-rejected')
+			expect(second).toBe(first)
+		})
+	})
+
+	/*
 	 * The two cached lists that between them display every `status` and `unallocated_amount` the
 	 * reviewer sees, plus the voucher list for the row under review, are revalidated with the EXACT key
 	 * strings the query hooks construct - so re-selecting a row can only come from the server's current
 	 * answer.
 	 */
-	it('revalidates both cached transaction lists and the voucher list, on their existing keys', async () => {
+	it('revalidates every keyed read the workbench shows, on their existing keys', async () => {
 		const { transaction } = await refuseConfirm()
 
 		expect(frappeSWRMutate.mock.calls.map(([key]) => key)).toEqual([
 			UNRECONCILED_KEY,
 			ALL_TRANSACTIONS_KEY,
-			vouchersKeyFor(transaction.name, DEFAULT_JOINED_MATCH_FILTERS)
+			vouchersKeyFor(transaction.name, DEFAULT_JOINED_MATCH_FILTERS),
+			// The balance tiles too: a refreshed list beside figures computed before the server did
+			// whatever it did is two answers disagreeing on one screen.
+			CLOSING_BALANCE_KEY,
+			CLOSING_BALANCE_AS_PER_STATEMENT_KEY
 		])
 	})
 
-	it('makes no imperative read of its own, because it asserts nothing about the row', async () => {
+	/*
+	 * Two reads are deliberately NOT revalidated, and both follow anyway. The opening balance is the
+	 * balance BEFORE the range, which a reconciliation inside the range cannot move; and the reconciled
+	 * count is derived from the unreconciled list, which is revalidated above. Neither has a cache key of
+	 * its own, and inventing one would add a sixth key family that other modules do not spell.
+	 */
+	it('introduces no new cache-key family while converging', async () => {
 		await refuseConfirm()
+
+		frappeSWRMutate.mock.calls.forEach(([key]) => {
+			expect(KEY_FAMILY_PREFIXES.some((prefix) => String(key).startsWith(prefix))).toBe(true)
+		})
+	})
+
+	/*
+	 * The dialog is modal and momentary. Dismissing it took the only explanation with it - and in the
+	 * case this path exists for, convergence has just removed the row the reviewer was working on, so
+	 * they were left looking at an empty pane with nothing saying why.
+	 */
+	it('keeps the refusal where dismissing the dialog cannot reach it', async () => {
+		const { store, transaction, refusal } = await refuseConfirm()
+
+		const kept = store.get(bankRecLastRefusalAtom)
+		// The identical rejection object, so the banner can re-render the server's own words.
+		expect(kept?.error).toBe(refusal)
+		expect(kept?.transactionName).toBe(transaction.name)
+		// The server answered, so the client may state that nothing was posted.
+		expect(kept?.refused).toBe(true)
+
+		// Closing the dialog is exactly what must NOT take the explanation with it.
+		store.set(bankRecErrorDialogAtom, null)
+		expect(store.get(bankRecLastRefusalAtom)?.error).toBe(refusal)
+	})
+
+	it('marks an unanswered request as an unknown outcome rather than a refusal', async () => {
+		const { store } = await refuseConfirm({ refusal: new Error('Network request failed') })
+
+		expect(store.get(bankRecLastRefusalAtom)?.refused).toBe(false)
+	})
+
+	it('clears the previous explanation when another attempt begins', async () => {
+		const store = createSeededStore()
+		const transaction = makeUnreconciledTransaction()
+		store.set(SELECTED_TRANSACTION_ATOM, [transaction])
+		frappePostCall.mockRejectedValue(makeAlreadyReconciledError(transaction.name))
+
+		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+		await act(async () => {
+			result.current.reconcileTransaction(transaction, makeLinkedPayment())
+		})
+		expect(store.get(bankRecLastRefusalAtom)).not.toBeNull()
+
+		// An attempt that never resolves: the explanation must go at the START of the attempt, or an
+		// in-flight one sits beneath the reason the LAST attempt failed.
+		frappePostCall.mockReturnValue(new Promise(() => undefined))
+		await act(async () => {
+			result.current.reconcileTransaction(transaction, makeLinkedPayment())
+		})
+
+		expect(store.get(bankRecLastRefusalAtom)).toBeNull()
+	})
+
+	/*
+	 * The all-transactions list is the one cache that CANNOT be corrected by asking SWR to revalidate.
+	 * SWR revalidates a key through the revalidators its mounted subscribers registered, and that list
+	 * is rendered only by the "Bank Transactions" tab - unmounted whenever a reconciliation is being
+	 * confirmed - so a bare `mutate(key)` returns the stale entry and never reaches the network. It is
+	 * therefore re-read imperatively, through the SAME endpoint, arguments and cache key the query hook
+	 * uses, which is what makes the correction independent of which tab happens to be open.
+	 *
+	 * This supersedes an earlier expectation that the hook makes NO imperative read of its own. That
+	 * expectation described a deliberate design - the hook asserts nothing about the row and lets SWR
+	 * answer - but it was measured to leave the "Bank Transactions" tab showing a pre-attempt copy of a
+	 * row the server had already moved on from, which is the defect this read exists to close.
+	 */
+	it('re-reads the all-transactions list imperatively, because SWR alone would not', async () => {
+		await refuseConfirm()
+
+		expect(frappeContextValue.call.get).toHaveBeenCalledTimes(1)
+		expect(frappeContextValue.call.get).toHaveBeenCalledWith(GET_BANK_TRANSACTIONS, {
+			bank_account: TEST_BANK_ACCOUNT,
+			from_date: FROM_DATE,
+			to_date: TO_DATE,
+			all_transactions: true
+		})
+	})
+
+	it('writes that answer onto the all-transactions key itself, without revalidating it again', async () => {
+		const refreshed = { message: [makeReconciledTransaction()] }
+		frappeContextValue.call.get.mockResolvedValue(refreshed)
+
+		await refuseConfirm()
+
+		const write = frappeSWRMutate.mock.calls.find(([key]) => key === ALL_TRANSACTIONS_KEY)
+		expect(write).toBeDefined()
+		// The answer is handed to SWR as the new value for that key, so a tab mounting later reads the
+		// server's current copy rather than the pre-attempt one.
+		await expect(write?.[1]).resolves.toBe(refreshed)
+		// `revalidate: false`, so the imperative read is the ONLY request for this key - a mounted
+		// subscriber does not turn the correction into two round trips.
+		expect(write?.[2]).toEqual({ revalidate: false })
+	})
+
+	it('issues no imperative read when no bank account is selected, because that list is not keyed', async () => {
+		const store = createStoreWithoutBank()
+		const transaction = makeUnreconciledTransaction()
+		frappePostCall.mockRejectedValue(makeAlreadyReconciledError(transaction.name))
+
+		const { result } = renderHook(() => useReconcileTransaction(), { wrapper: withStore(store) })
+		await act(async () => {
+			result.current.reconcileTransaction(transaction, makeLinkedPayment())
+		})
 
 		expect(frappeContextValue.call.get).not.toHaveBeenCalled()
 	})
@@ -908,6 +1179,7 @@ describe('a post whose outcome the server never reported is not called a refusal
 		consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
 		errorToast = vi.spyOn(toast, 'error').mockReturnValue('toast-id')
 		frappeSWRMutate.mockResolvedValue(undefined)
+		frappeContextValue.call.get.mockResolvedValue({ message: [] })
 	})
 
 	afterEach(() => {
@@ -955,10 +1227,14 @@ describe('a post whose outcome the server never reported is not called a refusal
 	it('re-reads the server, because only the server can settle the outcome', async () => {
 		const { transaction } = await attemptWithLostResponse()
 
+		// The same convergence as a refusal, balance tiles included: the outcome is unknown, so
+		// everything this account displays has to come from a fresh read rather than from before.
 		expect(frappeSWRMutate.mock.calls.map(([key]) => key)).toEqual([
 			UNRECONCILED_KEY,
 			ALL_TRANSACTIONS_KEY,
-			vouchersKeyFor(transaction.name, DEFAULT_JOINED_MATCH_FILTERS)
+			vouchersKeyFor(transaction.name, DEFAULT_JOINED_MATCH_FILTERS),
+			CLOSING_BALANCE_KEY,
+			CLOSING_BALANCE_AS_PER_STATEMENT_KEY
 		])
 	})
 
@@ -1239,21 +1515,47 @@ describe('useIsTransactionWithdrawal', () => {
 		expect(result.current.amount).toBe(1250)
 	})
 
-	it('classifies a transaction with neither column as neither', () => {
+	it('classifies a transaction with neither column as neither, and its amount as zero', () => {
 		const { result } = renderHook(() =>
 			useIsTransactionWithdrawal(makeUnreconciledTransaction({ withdrawal: undefined, deposit: undefined })))
 
-		expect(result.current.isWithdrawal).toBeFalsy()
-		expect(result.current.isDeposit).toBeFalsy()
-		expect(result.current.amount).toBeUndefined()
+		expect(result.current.isWithdrawal).toBe(false)
+		expect(result.current.isDeposit).toBe(false)
+		expect(result.current.direction).toBe('none')
+		// Zero rather than undefined: the caller has to be able to SHOW this amount, and a row with no
+		// amount in either column has an amount of zero. Reported as absent, it rendered as nothing at
+		// all - or, guarded on, as a bare `0`.
+		expect(result.current.amount).toBe(0)
 	})
 
 	it('treats a zero as an empty column rather than as an amount', () => {
 		const { result } = renderHook(() =>
 			useIsTransactionWithdrawal(makeUnreconciledTransaction({ withdrawal: 0, deposit: 0 })))
 
-		expect(result.current.isWithdrawal).toBeFalsy()
-		expect(result.current.isDeposit).toBeFalsy()
+		expect(result.current.isWithdrawal).toBe(false)
+		expect(result.current.isDeposit).toBe(false)
+		expect(result.current.direction).toBe('none')
+		expect(result.current.amount).toBe(0)
+	})
+
+	it('names the direction of a debit and of a credit', () => {
+		const debit = renderHook(() =>
+			useIsTransactionWithdrawal(makeUnreconciledTransaction({ withdrawal: 750, deposit: 0 })))
+		expect(debit.result.current.direction).toBe('withdrawal')
+
+		const credit = renderHook(() =>
+			useIsTransactionWithdrawal(makeUnreconciledTransaction({ withdrawal: 0, deposit: 1250 })))
+		expect(credit.result.current.direction).toBe('deposit')
+	})
+
+	it('reports genuine booleans, not the numbers a truthiness test leaves behind', () => {
+		const { result } = renderHook(() =>
+			useIsTransactionWithdrawal(makeUnreconciledTransaction({ withdrawal: 0, deposit: 1250 })))
+
+		// `transaction.withdrawal && transaction.withdrawal > 0` evaluated to the NUMBER 0 here, which a
+		// caller rendering the flag put on screen as a bare `0`.
+		expect(typeof result.current.isWithdrawal).toBe('boolean')
+		expect(typeof result.current.isDeposit).toBe('boolean')
 	})
 })
 
@@ -1269,6 +1571,37 @@ describe('useGetRuleForTransaction', () => {
 		expect(swrKey).toBeUndefined()
 		expect(swrOptionsOf(options).revalidateOnFocus).toBe(false)
 		expect(swrOptionsOf(options).revalidateIfStale).toBe(false)
+	})
+
+	it('withholds the request entirely while no company is known', () => {
+		/*
+		 * `company` is a REQUIRED positional argument of `bank_account.get_list`, so asking without one
+		 * does not answer an empty list - it answers an unhandled HTTP 500 reading `get_list() missing 1
+		 * required positional argument: 'company'`, which every consumer of this hook renders as a raw
+		 * server traceback. A null key is how the request is withheld until there is a company to ask
+		 * about, and both of `useCurrentCompany`'s sources have to be emptied to reach that state: the
+		 * persisted selection, and the signed-in user's own default company.
+		 */
+		const store = createStore()
+		store.set(bankRecDateAtom, { fromDate: FROM_DATE, toDate: TO_DATE })
+		store.set(selectedCompanyAtom, '')
+
+		const bootDefaults = window.frappe!.boot!.user!.defaults as Record<string, unknown>
+		const previousDefaultCompany = bootDefaults.company
+		bootDefaults.company = ''
+
+		try {
+			const { result } = renderHook(() => useGetBankAccounts(), { wrapper: withStore(store) })
+
+			const [, , swrKey] = lastGetCallFor(BANK_ACCOUNT_GET_LIST)
+			expect(swrKey).toBeNull()
+
+			// And the caller is handed an ordinary empty result rather than an error to render.
+			expect(result.current.banks).toEqual([])
+			expect(result.current.error).toBeUndefined()
+		} finally {
+			bootDefaults.company = previousDefaultCompany
+		}
 	})
 
 	it('does not read anything for a transaction no rule matched', () => {
@@ -1503,7 +1836,7 @@ describe('a refusal under a narrowed role profile is handled exactly like any ot
 	const seedForReconcile = () => {
 		const store = createSeededStore()
 		const transaction = makeUnreconciledTransaction()
-		store.set(bankRecSelectedTransactionAtom(TEST_BANK_ACCOUNT), [transaction])
+		store.set(bankRecSelectedTransactionsAtom, [transaction])
 		return { store, transaction, voucher: makeSuggestedLinkedPayment(transaction) }
 	}
 
@@ -1534,6 +1867,7 @@ describe('a refusal under a narrowed role profile is handled exactly like any ot
 		})
 		errorToast = vi.spyOn(toast, 'error').mockReturnValue('toast-id')
 		frappeSWRMutate.mockResolvedValue({ message: [] })
+		frappeContextValue.call.get.mockResolvedValue({ message: [] })
 	})
 
 	afterEach(() => {
@@ -1574,7 +1908,7 @@ describe('a refusal under a narrowed role profile is handled exactly like any ot
 
 		// A permission refusal converges like any other: the re-read reports the row as no longer
 		// reconcilable by this user, so the stale selection is dropped rather than kept.
-		expect(store.get(bankRecSelectedTransactionAtom(TEST_BANK_ACCOUNT))).toEqual([])
+		expect(store.get(bankRecSelectedTransactionsAtom)).toEqual([])
 		expect(store.get(bankRecActionLog)).toEqual([])
 	})
 

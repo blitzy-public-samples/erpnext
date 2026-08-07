@@ -23,7 +23,7 @@
 // inside `src/` augments `expect` for the whole program, so no test file needs its own import.
 import '@testing-library/jest-dom/vitest'
 
-import { afterEach, vi } from 'vitest'
+import { afterAll, afterEach, vi } from 'vitest'
 
 import { resetFrappeSDKMock } from './factories'
 import { cleanup } from '@testing-library/react'
@@ -398,5 +398,43 @@ afterEach(() => {
 	// test's selection leaking into the next.
 	localStorage.clear()
 	sessionStorage.clear()
+})
+
+/* ── 10. Per-file teardown: let debounced work land before jsdom goes away ───────── */
+
+/**
+ * The longest debounce any surface in this application arms, in milliseconds: the reconciliation
+ * search (`BankReconciliation/utils.ts`) and the importer's mapping and table saves
+ * (`CSV/CSVRawDataPreview.tsx`, `PDF/PDFTableEditor.tsx`) all use 500 ms, ahead of the link-field
+ * search at 400 ms and the transaction-list search at 250 ms.
+ */
+const LONGEST_DEBOUNCE_MS = 500
+
+/**
+ * Waits out one debounce window after the last test in a file, so a timer armed by that test fires
+ * while this environment is still standing.
+ *
+ * This is not tidiness, it is what keeps the exit code meaningful. `usehooks-ts` powers every
+ * debounced input here through `useDebounceCallback`, whose unmount cleanup cancels a **different**
+ * `lodash.debounce` instance from the one it actually invokes — the effect-assigned ref, not the
+ * memoised instance holding the armed timer. A pending timer therefore survives `cleanup()`, and if
+ * the file finishes first it fires against a torn-down jsdom, where React's `resolveUpdatePriority`
+ * reads `window`:
+ *
+ *     Uncaught Exception: ReferenceError: window is not defined
+ *       ❯ resolveUpdatePriority react-dom-client.development.js
+ *       ❯ invokeFunc / trailingEdge lodash.debounce
+ *
+ * Vitest counts that as an unhandled error and **exits non-zero while reporting every test as
+ * passed**, which was observed intermittently across full parallel runs. Draining here is preferred
+ * over a per-test wait at each of the five typing sites across four suites — `LinkFieldCombobox`
+ * (twice), `MatchAndReconcile`, `BankTransactionList` and `BankRecDateFilter` — because it closes the
+ * whole class, including for suites added later, and it is charged once per file rather than once per
+ * test.
+ */
+afterAll(async () => {
+	await new Promise((resolve) => {
+		setTimeout(resolve, LONGEST_DEBOUNCE_MS + 50)
+	})
 })
 

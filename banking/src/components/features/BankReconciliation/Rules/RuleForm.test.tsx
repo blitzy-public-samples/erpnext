@@ -129,6 +129,26 @@ describe('RuleForm', () => {
 			expect(screen.getByText('Deposit')).toBeInTheDocument()
 		})
 
+		it('names the direction choice as a group without misusing a label', () => {
+			renderRuleForm()
+
+			// The three directions are one radiogroup, and a radiogroup is not a labelable control, so
+			// it cannot be named by a <label for>. Doing that left the group anonymous and raised an
+			// "Incorrect use of <label for=FORM_ELEMENT>" audit issue; `aria-labelledby` is the valid
+			// way to name a grouping role.
+			const group = screen.getByRole('radiogroup', { name: /Transaction Type/ })
+
+			const heading = document.getElementById(group.getAttribute('aria-labelledby') ?? '')
+			expect(heading).not.toBeNull()
+			expect(heading!.tagName).not.toBe('LABEL')
+
+			// No label anywhere in the form may point at the radiogroup, which is what made it invalid.
+			const labelsTargetingTheGroup = Array.from(document.querySelectorAll('label')).filter(
+				(label) => label.getAttribute('for') === group.id && group.id !== ''
+			)
+			expect(labelsTargetingTheGroup).toEqual([])
+		})
+
 		it('bounds the rule by amount', () => {
 			renderRuleForm()
 
@@ -258,9 +278,10 @@ describe('RuleForm', () => {
 				party_type: undefined
 			} as Partial<BankTransactionRule>)
 
-			// The accessible name carries the required indicator, and it must be anchored so that
-			// "Party Type*" in the same section is not matched instead.
-			expect(screen.getByLabelText(/^Party\*$/)).toBeDisabled()
+			// The accessible name carries the required indicator - an asterisk for the eye and the word
+			// for a screen reader - and it must be anchored so that "Party Type*" in the same section is
+			// not matched instead.
+			expect(screen.getByLabelText(/^Party\* \(required\)$/)).toBeDisabled()
 		})
 
 		it('opens the party field once a party type names the doctype to search', () => {
@@ -275,7 +296,7 @@ describe('RuleForm', () => {
 			// stops advertising itself as required, because the search itself enforces the choice -
 			// which is why the asterisk that the disabled variant carries is absent here.
 			expect(screen.getByLabelText(/^Party$/)).toBeEnabled()
-			expect(screen.queryByLabelText(/^Party\*$/)).not.toBeInTheDocument()
+			expect(screen.queryByLabelText(/^Party\* \(required\)$/)).not.toBeInTheDocument()
 		})
 	})
 

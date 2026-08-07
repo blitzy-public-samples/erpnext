@@ -23,7 +23,12 @@ const ActionLog = () => {
 			<Tooltip>
 				<TooltipTrigger asChild>
 					<DialogTrigger asChild>
-						<Button variant={'outline'} isIconButton size='md'>
+						{/*
+						 * Named explicitly. It is an icon-only control, and the tooltip beside it announces
+						 * nothing until it is open - so without this the way IN to the audit trail, and to the
+						 * only undo the SPA offers, is an unnamed button.
+						 */}
+						<Button variant={'outline'} isIconButton size='md' aria-label={_("Reconciliation History")}>
 							<HistoryIcon />
 						</Button>
 					</DialogTrigger>

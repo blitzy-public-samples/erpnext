@@ -1,14 +1,15 @@
 import { useAtom, useAtomValue, useSetAtom } from "jotai"
-import { bankRecAmountFilter, bankRecDateAtom, bankRecRecordJournalEntryModalAtom, bankRecRecordPaymentModalAtom, bankRecSelectedTransactionAtom, bankRecTransactionTypeFilter, bankRecTransferModalAtom, selectedBankAccountAtom } from "./bankRecAtoms"
+import { bankRecAmountFilter, bankRecDateAtom, bankRecLastRefusalAtom, bankRecRecordJournalEntryModalAtom, bankRecRecordPaymentModalAtom, bankRecSelectedTransactionsAtom, bankRecTransactionTypeFilter, bankRecTransferModalAtom, selectedBankAccountAtom, selectedTransactionScopeKey } from "./bankRecAtoms"
 import { H4 } from "@/components/ui/typography"
-import { useMemo, useRef } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
+import { useAvailableHeight } from "@/hooks/use-available-height"
 import { getCompanyCurrency } from "@/lib/company"
 import ErrorBanner from "@/components/ui/error-banner"
 import { Separator } from "@/components/ui/separator"
 import Fuse from 'fuse.js'
-import { getSearchResults, LinkedPayment, UnreconciledTransaction, useGetRuleForTransaction, useGetUnreconciledTransactions, useGetVouchersForTransaction, useIsTransactionWithdrawal, useReconcileTransaction, useSelectedBankAccountCurrency, useTransactionSearch } from "./utils"
+import { getSearchResults, LinkedPayment, TransactionDirection, UnreconciledTransaction, useGetRuleForTransaction, useGetUnreconciledTransactions, useGetVouchersForTransaction, useIsTransactionWithdrawal, useReconcileTransaction, useSelectedBankAccountCurrency, useTransactionSearch } from "./utils"
 import { Input } from "@/components/ui/input"
-import { AlertCircleIcon, ArrowDownRight, ArrowRightIcon, ArrowRightLeft, ArrowUpRight, BadgeCheck, ChevronDown, DollarSign, Landmark, LandmarkIcon, ListIcon, Loader2, Receipt, ReceiptIcon, Search, User, XCircle, ZapIcon } from "lucide-react"
+import { AlertCircleIcon, ArrowDownRight, ArrowRightIcon, ArrowRightLeft, ArrowUpRight, BadgeCheck, ChevronDown, DollarSign, Landmark, LandmarkIcon, ListIcon, Loader2, MinusIcon, Receipt, ReceiptIcon, Search, User, XCircle, ZapIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from "@/components/ui/dropdown-menu"
 import { Button } from "@/components/ui/button"
@@ -17,7 +18,7 @@ import { getCurrencySymbol } from "@/lib/currency"
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { formatDate } from "@/lib/date"
 import { Badge } from "@/components/ui/badge"
-import { formatCurrency, getCurrencyFormatInfo } from "@/lib/numbers"
+import { formatCurrency, getCurrencyFormatInfo, parseCurrencyInput } from "@/lib/numbers"
 import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from "@/components/ui/tooltip"
 import { Skeleton } from "@/components/ui/skeleton"
 import { slug } from "@/lib/frappe"
@@ -53,13 +54,21 @@ const MatchAndReconcile = ({ contentHeight }: { contentHeight: number }) => {
     }
 
     return <>
-        <div className={`flex items-start space-x-2`} >
-            <div className="flex-1">
+        {/* Two panes side by side is the comparison surface this screen exists to provide, but only while
+            each pane is wide enough to read. Below `xl` they stack instead of being squeezed: at 1024px a
+            side-by-side pane measured 483px and at 768px only ~355px, which wrapped every transaction row
+            onto three or four lines and left the amount column colliding with the description. `min-w-0`
+            on both is what actually lets them narrow - a flex item defaults to `min-width:auto`, so
+            without it the panes refuse to go below their content width and push their content out
+            instead. */}
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:gap-2" >
+            <div className="flex-1 min-w-0">
                 <H4 className="text-sm font-medium">{_("Unreconciled Transactions")}</H4>
-                <UnreconciledTransactions contentHeight={contentHeight} />
+                <UnreconciledTransactions />
             </div>
-            <Separator orientation="vertical" style={{ minHeight: `${contentHeight}px` }} />
-            <div className="flex-1 px-1">
+            <Separator orientation="vertical" className="hidden xl:block" style={{ minHeight: `${contentHeight}px` }} />
+            <Separator orientation="horizontal" className="xl:hidden" />
+            <div className="flex-1 min-w-0 xl:px-1">
                 <H4 className="text-sm font-medium">{_("Match or Create")}</H4>
                 <VouchersSection contentHeight={contentHeight} />
             </div>
@@ -127,8 +136,10 @@ function VirtualizedListBody<T>({
     )
 }
 
-const UnreconciledTransactions = ({ contentHeight }: { contentHeight: number }) => {
+const UnreconciledTransactions = () => {
     const bankAccount = useAtomValue(selectedBankAccountAtom)
+    const dates = useAtomValue(bankRecDateAtom)
+    const setSelectedTransaction = useSetAtom(bankRecSelectedTransactionsAtom)
 
     const currency = bankAccount?.account_currency ?? getCompanyCurrency(bankAccount?.company ?? '')
     const currencySymbol = getCurrencySymbol(currency)
@@ -144,6 +155,9 @@ const UnreconciledTransactions = ({ contentHeight }: { contentHeight: number }) 
     const [amountFilter, setAmountFilter] = useAtom(bankRecAmountFilter)
 
     const [search, setSearch] = useTransactionSearch()
+
+    /** Set when the amount field holds text that cannot be used, so the reason can be shown in place. */
+    const [amountFilterError, setAmountFilterError] = useState<string | null>(null)
 
     const searchIndex = useMemo(() => {
 
@@ -164,20 +178,53 @@ const UnreconciledTransactions = ({ contentHeight }: { contentHeight: number }) 
 
     }, [searchIndex, search, typeFilter, amountFilter.value, unreconciledTransactions?.message])
 
-    const setSelectedTransaction = useSetAtom(bankRecSelectedTransactionAtom(bankAccount?.name || ''))
+    /*
+     * Leaving a scope ENDS the review.
+     *
+     * The selection atom already refuses to read a selection made under a different account or date
+     * range, but refusing to read it is not the same as being rid of it: the row was still held, so
+     * returning to the account replayed it - which is the account-switch resurrection this closes. One
+     * write in the new scope is enough, because the atom keeps a single scope-stamped selection, so the
+     * previous one is overwritten rather than parked.
+     *
+     * Guarded on a CHANGE rather than run on mount, so a selection made before this list mounted - a
+     * reviewer returning from a modal, or from another tab - is left alone.
+     */
+    const scopeKey = selectedTransactionScopeKey(bankAccount?.name, dates)
+    const scopeRef = useRef(scopeKey)
 
-    const onFilterChange = () => {
+    useEffect(() => {
+        if (scopeRef.current === scopeKey) {
+            return
+        }
+
+        scopeRef.current = scopeKey
         setSelectedTransaction([])
-    }
+    }, [scopeKey, setSelectedTransaction])
+
+    /*
+     * Filters no longer discard the selection.
+     *
+     * Every filter change used to clear it outright, so narrowing the list threw away the row under
+     * review and its loaded candidates even when the filter still matched them - and a reviewer who
+     * typed a search term to find something adjacent lost their place for no reason. A filter changes
+     * what is LISTED, not what is under review, so the two are now independent.
+     *
+     * What does end a selection is a change of SCOPE - a different account, or a different date range -
+     * and that is handled by the selection atom itself, which is keyed by both. So a row selected in
+     * August cannot survive a move to July, where it is not in the result set at all.
+     *
+     * A row the SERVER has moved on from is handled where the server's answer arrives:
+     * `convergeWithServer` in the reconcile hook re-reads the list after a refusal and drops any selected
+     * row the re-read no longer returns.
+     */
 
     const onSearchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         setSearch(e.target.value)
-        onFilterChange()
     }
 
     const onTypeFilterChange = (type: string) => {
         setTypeFilter(type)
-        onFilterChange()
     }
 
     const onClearFilters = () => {
@@ -187,25 +234,52 @@ const UnreconciledTransactions = ({ contentHeight }: { contentHeight: number }) 
         }
         setTypeFilter('All')
         setAmountFilter({ value: 0, stringValue: '' })
-        onFilterChange()
+        setAmountFilterError(null)
     }
 
-    const hasFilters = search !== '' || typeFilter !== 'All' || amountFilter.value !== 0
-    const listHeight = contentHeight - 72
+    /*
+     * Whether there is anything to reset - which includes an amount the filter REFUSED.
+     *
+     * Keying this on the filtered number alone left a reviewer who typed a negative looking at a field
+     * holding red text and an error message with no reset control at all, because a refused amount filters
+     * on nothing and so read as "no filters active". What the reviewer sees in the box is what decides it.
+     */
+    const hasAmountText = String(amountFilter.stringValue ?? '') !== ''
+
+    const hasFilters = search !== '' || typeFilter !== 'All' || amountFilter.value !== 0 || hasAmountText
+
+    /** Identity of the current filter set - see the `key` on the list body below. */
+    const listResetKey = `${search}\u0000${typeFilter}\u0000${amountFilter.value}`
+
+    /*
+     * The list is sized from where it actually sits, rather than from an arithmetic guess. Everything
+     * above it - the filter row, and above all the older-transactions banner, which wraps to many more
+     * lines as the window narrows - changes height with the viewport, so no constant offset can be right
+     * at every width. See `useAvailableHeight`.
+     */
+    const [listRef, listHeight] = useAvailableHeight({ min: 240, gutter: 24 })
 
     if (isLoading) {
         return <UnreconciledTransactionsLoadingState />
     }
 
     return <div className="space-y-1">
-        <div className="flex py-2 w-full gap-2">
+        {/* `flex-wrap` plus a floor on the search field: the two filters to its right keep their width, so
+            an unwrapped row made the search input absorb every pixel of shrinkage and it collapsed to 24px
+            at 768px - too narrow to show its own placeholder. Wrapping moves them to a second line
+            instead. The floor is on the GROUP, which also carries the leading icon and the trailing result
+            counter, so it is set well above the width wanted for the text field alone. */}
+        <div className="flex flex-wrap py-2 w-full gap-2">
 
-            <InputGroup variant='outline'>
-                <label className="sr-only">{_("Search transactions")}</label>
+            <InputGroup variant='outline' className="min-w-72 flex-1">
+                <label className="sr-only" htmlFor="bank-rec-transaction-search">{_("Search transactions")}</label>
                 <InputGroupAddon>
                     <Search className="w-4 h-4 text-ink-gray-5" />
                 </InputGroupAddon>
                 <Input
+                    id="bank-rec-transaction-search"
+                    name="bank-rec-transaction-search"
+                    aria-label={_("Search transactions")}
                     placeholder={_("Search")}
                     // type='search'
                     variant='outline'
@@ -218,8 +292,11 @@ const UnreconciledTransactions = ({ contentHeight }: { contentHeight: number }) 
                 </InputGroupAddon>
             </InputGroup>
             <div>
-                <label className="sr-only">{_("Filter by amount")}</label>
+                <label className="sr-only" htmlFor="bank-rec-amount-filter">{_("Filter by amount")}</label>
                 <CurrencyInput
+                    id="bank-rec-amount-filter"
+                    name="bank-rec-amount-filter"
+                    aria-label={_("Filter by amount")}
                     groupSeparator={groupSeparator}
                     decimalSeparator={decimalSeparator}
                     placeholder={`${currencySymbol}0${decimalSeparator}00`}
@@ -227,31 +304,51 @@ const UnreconciledTransactions = ({ contentHeight }: { contentHeight: number }) 
                     value={amountFilter.stringValue}
                     maxLength={12}
                     decimalScale={2}
+                    /* The library's k/m/b shorthand is off: a bank amount is typed in full, and left on
+                       it a stray letter multiplies the figure. `12ab34` was read as `12b34` and filtered
+                       on 120,000,000,003 - a figure the reviewer never typed. Off, the letters are simply
+                       dropped and 1234 is filtered. */
+                    disableAbbreviations
                     prefix={currencySymbol}
+                    aria-invalid={amountFilterError !== null}
+                    aria-describedby={amountFilterError ? 'bank-rec-amount-filter-error' : undefined}
                     onValueChange={(v, _n, values) => {
-                        // If the input ends with a decimal or a decimal with trailing zeroes, store the string since we need the user to be able to type the decimals.
-                        // When the user eventually types the decimals or blurs out, the value is formatted anyway.
-                        // Otherwise store the float value
-                        // Check if the value ends with a decimal or a decimal with trailing zeroes
-                        const isDecimal = v?.endsWith(decimalSeparator) || v?.endsWith(decimalSeparator + '0')
-                        const newValue = isDecimal ? v : values?.float ?? ''
-                        const nextAmountFilter = {
-                            value: Number(newValue),
-                            stringValue: newValue
-                        }
-                        const hasAmountFilterChanged = amountFilter.value !== nextAmountFilter.value || amountFilter.stringValue !== nextAmountFilter.stringValue
+                        /*
+                         * The number comes from the library's own parse, never from re-reading the
+                         * displayed text. Storing "the string while a decimal is being typed, otherwise
+                         * the float" and then running `Number()` over that union is what previously
+                         * produced `NaN` on a grouped value, inflated 1.23 into 1,230,000,000, and
+                         * filtered on a silently truncated 12 for `12ab34`. See `parseCurrencyInput`.
+                         */
+                        const parsed = parseCurrencyInput({ text: v, float: values?.float, decimalSeparator })
 
-                        setAmountFilter(nextAmountFilter)
+                        // A negative can never match: the list compares against withdrawal and deposit,
+                        // both of which the server stores as positive magnitudes. So it is refused out
+                        // loud rather than accepted and quietly ignored.
+                        const isNegative = parsed.value !== null && parsed.value < 0
 
-                        // `onValueChange` also fires on blur; avoid clearing selected transaction unless filter value actually changed.
-                        if (hasAmountFilterChanged) {
-                            onFilterChange()
-                        }
+                        setAmountFilterError(
+                            parsed.isInvalid ? _("Enter an amount, for example {0}", [`1${decimalSeparator}00`])
+                                : isNegative ? _("Amounts are matched by magnitude, so a negative amount cannot match a transaction.")
+                                    : null
+                        )
+
+                        setAmountFilter({
+                            // Only a usable, non-negative number filters anything; 0 means "no filter".
+                            value: parsed.value !== null && !isNegative ? parsed.value : 0,
+                            stringValue: parsed.text
+                        })
                     }}
                     // @ts-expect-error - CurrencyInputProps doesn't have a variant prop but Input does
                     variant={"outline"}
                     customInput={Input}
                 />
+                {amountFilterError && <p
+                    id="bank-rec-amount-filter-error"
+                    role="alert"
+                    className="text-xs text-ink-red-3 max-w-56 text-wrap">
+                    {amountFilterError}
+                </p>}
             </div>
             <div>
                 <DropdownMenu>
@@ -269,6 +366,17 @@ const UnreconciledTransactions = ({ contentHeight }: { contentHeight: number }) 
                     </DropdownMenuContent>
                 </DropdownMenu>
             </div>
+            {/* Reachable whenever a filter is active, not only once the filters have hidden everything.
+                Previously the only way back to the unfiltered list was to empty each control by hand, and
+                a reviewer looking at a short list had no way to tell how much a filter was hiding. */}
+            {hasFilters && <Button
+                type='button'
+                size='md'
+                variant='ghost'
+                onClick={onClearFilters}>
+                <XCircle className="text-ink-gray-5" />
+                {_("Clear Filters")}
+            </Button>}
         </div>
 
         {error && <ErrorBanner error={error} />}
@@ -280,14 +388,30 @@ const UnreconciledTransactions = ({ contentHeight }: { contentHeight: number }) 
             text={hasFilters ? _("No transactions found for the given filters.") : _("No unreconciled transactions found")}
             description={hasFilters ? _("Try adjusting your search or filter criteria.") : _("Import your bank statement to get started.")} />}
 
-        <VirtualizedListBody
-            items={results}
-            height={listHeight}
-            estimateSize={74}
-            getItemKey={(transaction) => transaction.name}
-        >
-            {(transaction) => <UnreconciledTransactionItem transaction={transaction} />}
-        </VirtualizedListBody>
+        <div ref={listRef}>
+            <VirtualizedListBody
+                /*
+                 * A filter change starts a FRESH list, rather than asking the old one to recover.
+                 *
+                 * Filtering a scrolled list down to a couple of rows shortens the scroll area, so the
+                 * browser clamps `scrollTop` to 0 by itself - and it does so without a scroll event, which
+                 * is the only thing the virtualiser listens to. Its remembered offset then belonged to the
+                 * unfiltered list: clearing the filter rendered the rows for that old offset and placed
+                 * every one of them more than a thousand pixels below the visible box, so the pane looked
+                 * empty until the reviewer happened to scroll. Remounting on a filter change gives a
+                 * virtualiser whose offset and element agree from the outset, and starting a new result set
+                 * at the top is what a reviewer expects in any case. Deliberately keyed on the FILTERS and
+                 * not on the row count, so reconciling a row does not throw the reviewer back to the top.
+                 */
+                key={listResetKey}
+                items={results}
+                height={listHeight}
+                estimateSize={74}
+                getItemKey={(transaction) => transaction.name}
+            >
+                {(transaction) => <UnreconciledTransactionItem transaction={transaction} />}
+            </VirtualizedListBody>
+        </div>
 
     </div>
 }
@@ -327,13 +451,51 @@ const UnreconciledTransactionsLoadingState = () => {
     </div>
 }
 
+/**
+ * The direction of a transaction, as an icon that also says which direction it is.
+ *
+ * Direction was previously carried by the arrow's shape and colour alone, which says nothing to a screen
+ * reader and nothing to a reviewer who cannot tell the two greens apart - so each icon now carries a
+ * name, and a `title` puts the same words within reach of the pointer.
+ *
+ * `none` is a real state the server can report: a statement row can carry no amount in either column.
+ * It used to fall through to the deposit arrow and claim money had come in.
+ */
+const TransactionDirectionIcon = ({ direction }: { direction: TransactionDirection }) => {
+
+    const label = direction === 'withdrawal'
+        ? _("Money out")
+        : direction === 'deposit'
+            ? _("Money in")
+            : _("No amount recorded")
+
+    const Icon = direction === 'withdrawal' ? ArrowUpRight : direction === 'deposit' ? ArrowDownRight : MinusIcon
+
+    const theme = direction === 'withdrawal'
+        ? "text-ink-red-3"
+        : direction === 'deposit'
+            ? "text-ink-green-3"
+            : "text-ink-gray-5"
+
+    /* The name and the `title` live on a wrapping span: the icon component accepts no `title` prop, and
+       an `aria-hidden` icon inside a named `role="img"` is the shape that reads as one image. */
+    return <span
+        role="img"
+        aria-label={label}
+        title={label}
+        data-direction={direction}
+        className="inline-flex">
+        <Icon aria-hidden="true" className={cn("size-5 shrink-0", theme)} />
+    </span>
+}
+
 const UnreconciledTransactionItem = ({ transaction }: { transaction: UnreconciledTransaction }) => {
 
     const selectedBank = useAtomValue(selectedBankAccountAtom)
 
-    const [selectedTransaction, setSelectedTransaction] = useAtom(bankRecSelectedTransactionAtom(selectedBank?.name || ''))
+    const [selectedTransaction, setSelectedTransaction] = useAtom(bankRecSelectedTransactionsAtom)
 
-    const { amount, isWithdrawal } = useIsTransactionWithdrawal(transaction)
+    const { amount, direction } = useIsTransactionWithdrawal(transaction)
 
     const isSelected = selectedTransaction?.some((t) => t.name === transaction.name)
 
@@ -359,24 +521,56 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
      */
     const isCurrencyMismatch = Boolean(transaction.currency && accountCurrency && transaction.currency !== accountCurrency)
 
-    const handleSelectTransaction = (event: React.MouseEvent<HTMLDivElement>) => {
-        // If the user is pressing the shift key, add/remove the transaction from the selected transactions
-        if (event.shiftKey) {
+    /** `additive` is the shift modifier: add to or remove from the selection instead of replacing it. */
+    const selectTransaction = (additive: boolean) => {
+        if (additive) {
             setSelectedTransaction(isSelected ? selectedTransaction.filter((t) => t.name !== transaction.name) : [...selectedTransaction, transaction])
         } else {
             setSelectedTransaction([transaction])
         }
     }
 
+    const handleSelectTransaction = (event: React.MouseEvent<HTMLDivElement>) => selectTransaction(event.shiftKey)
+
+    /*
+     * Enter and Space select the row, and shift extends the selection exactly as shift-clicking does.
+     *
+     * The row advertises `role="button"`, but a `div` gets no keyboard activation from the browser, so
+     * Enter did nothing at all and Space fell through to its default: scrolling the virtualised list,
+     * which carried the focused row out of view and left focus stranded on a row the reviewer could no
+     * longer see. Preventing the default is what a native button does.
+     */
+    const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+        if (event.key !== 'Enter' && event.key !== ' ') {
+            return
+        }
+
+        event.preventDefault()
+        selectTransaction(event.shiftKey)
+    }
+
     return <div className="py-1">
-        <div className={cn("border outline rounded-md p-2 mx-0.5 cursor-pointer transition-[color,box-shadow, bg] hover:bg-surface-gray-1",
+        {/* `aria-pressed`, not `aria-selected`: `aria-selected` is not an allowed attribute on
+            `role="button"` and is discarded, so it would have announced nothing. `aria-pressed` is the
+            state a button may carry, and it is what the bank cards use for the same purpose.
+
+            `focus-visible:shadow-focus-gray` is the design system's focus treatment. An outline cannot be
+            used here - the selected state already owns `outline` - and without it a keyboard user had no
+            idea which row they were on. */}
+        <div className={cn("border outline rounded-md p-2 mx-0.5 cursor-pointer transition-[color,box-shadow, bg] hover:bg-surface-gray-1 focus-visible:shadow-focus-gray",
             isSelected ? "bg-surface-gray-1 border-outline-gray-5 outline-outline-gray-5" : "border-outline-gray-2 outline-none"
         )}
             role='button'
             tabIndex={0}
-            onClick={handleSelectTransaction}>
-            <div className="flex justify-between items-start w-full">
-                <div className="space-y-1 overflow-hidden whitespace-pre-wrap">
+            aria-pressed={isSelected}
+            onClick={handleSelectTransaction}
+            onKeyDown={onKeyDown}>
+            <div className="flex justify-between items-start w-full gap-2">
+                {/* `flex-1 min-w-0` on the text column and `shrink-0` on the amount column.
+                    A flex item defaults to `min-width:auto`, so this column refused to narrow below its
+                    content and pushed itself over the amounts instead of letting them keep their space -
+                    a long reference sat across half of the figure it belonged to. */}
+                <div className="flex-1 min-w-0 space-y-1 overflow-hidden whitespace-pre-wrap">
                     {/* `flex-wrap`, plus a bound on every variable-length badge ahead of the advisory.
                         This cluster sits inside an `overflow-hidden` pane and Badge is deliberately
                         `shrink-0 whitespace-nowrap`, so without both an unbounded rule name or
@@ -389,7 +583,10 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
                         ellipsised. `shrink` is what keeps a badge that is alone on a wrapped line from
                         overflowing a pane narrower than its own maximum. */}
                     <div className="flex flex-wrap items-center gap-1">
-                        <span className="font-medium text-sm">{formatDate(transaction.date)}</span>
+                        {/* The date does not shrink and does not wrap. It was the first item in a
+                            wrapping row, so a long badge beside it squeezed "6th August 2026" onto three
+                            lines and set the height of everything after it. */}
+                        <span className="font-medium text-sm shrink-0 whitespace-nowrap">{formatDate(transaction.date)}</span>
                         {transaction.transaction_type &&
                             <Badge theme="blue"
                                 title={transaction.transaction_type}
@@ -414,6 +611,12 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
                             decides whether a post is allowed. `theme="orange"` resolves to the amber ink
                             and surface tokens, since Badge declares no `amber` theme.
 
+                            Size is left at Badge's default `md` deliberately, not by omission. Every badge
+                            in this cluster takes that default, as does the identically themed "Partial
+                            Match" badge in the voucher panel, so an `sm` chip here read as a 16px pill with
+                            a 10px icon among 20px siblings with 12px icons. Subordination is already
+                            carried by `variant="subtle"` and the amber theme; size only broke the rhythm.
+
                             The trigger is a focusable span rather than the Badge itself. Badge renders a
                             plain span, which takes no focus, so a keyboard user reaching this row had no
                             way to reveal the explanation - focusing the row shows nothing. The span
@@ -426,7 +629,7 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
                                         tabIndex={0}
                                         aria-label={_("Currency mismatch: transaction in {0}, bank account in {1}", [transaction.currency ?? '', accountCurrency ?? ''])}
                                         className="inline-flex rounded-full outline-none focus-visible:shadow-focus-gray">
-                                        <Badge variant="subtle" theme="orange" size="sm">
+                                        <Badge variant="subtle" theme="orange">
                                             <AlertCircleIcon /> {transaction.currency}</Badge>
                                     </span>
                                 </TooltipTrigger>
@@ -436,11 +639,18 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
                             </Tooltip>
                         </TooltipProvider>}
                     </div>
-                    <span className="text-sm wrap-anywhere" title={transaction.description}>{transaction.description}</span>
+                    {/* Two lines at most, with the whole description on the `title`. Unbounded, a
+                        multi-line statement narrative grew the row past 400px and pushed every other
+                        transaction off the screen. */}
+                    <span className="text-sm wrap-anywhere line-clamp-2" title={transaction.description}>{transaction.description}</span>
                 </div>
-                <div className="gap-1 flex flex-col items-end min-w-36 h-full text-end">
-                    {isWithdrawal ? <ArrowUpRight className="size-5 text-ink-red-3" /> : <ArrowDownRight className="size-5 text-ink-green-3" />}
-                    {amount && amount > 0 && <span className="font-semibold font-numeric text-base">{formatCurrency(amount, currency)}</span>}
+                <div className="gap-1 flex flex-col items-end min-w-36 shrink-0 h-full text-end">
+                    <TransactionDirectionIcon direction={direction} />
+                    {/* Always a figure, formatted. The guard here was `amount && amount > 0 &&`, which for
+                        a zero-amount transaction evaluated to the number 0 and put a bare, unformatted
+                        `0` on screen with no amount element at all. Zero is a real amount and is shown as
+                        one. */}
+                    <span className="font-semibold font-numeric text-base">{formatCurrency(amount, currency)}</span>
                     {amount !== transaction.unallocated_amount && <span className="text-xs leading-normal text-ink-gray-5">{formatCurrency(transaction.unallocated_amount, currency)} {_("Unallocated")}</span>}
                 </div>
             </div>
@@ -449,29 +659,78 @@ const UnreconciledTransactionItem = ({ transaction }: { transaction: Unreconcile
 }
 
 
+/**
+ * The reason a reconciliation was refused, kept on screen after the dialog has been dismissed.
+ *
+ * The dialog is modal and momentary, and dismissing it used to take the only explanation with it. That
+ * mattered most in the case it exists for: the server refuses because the transaction has already been
+ * reconciled elsewhere, the client re-reads, the row leaves the unreconciled list - and the reviewer is
+ * left looking at an empty pane with nothing saying why what they were working on disappeared.
+ *
+ * It reuses `ErrorBanner`, so the server's own words reach the reviewer here in exactly the form the
+ * dialog showed them, down to the severity the server itself indicated.
+ */
+const LastRefusalNotice = () => {
+
+    const [refusal, setRefusal] = useAtom(bankRecLastRefusalAtom)
+
+    if (!refusal) {
+        return null
+    }
+
+    return <div className="flex flex-col gap-1 pt-2" data-testid="bank-rec-last-refusal">
+        <ErrorBanner
+            error={refusal.error}
+            overrideHeading={refusal.refused
+                ? _("The server refused this reconciliation")
+                : _("This reconciliation was not confirmed")} />
+        <div className="flex items-center justify-between gap-2 px-1">
+            <span className="text-xs text-ink-gray-5">
+                {refusal.refused
+                    ? _("Nothing was posted. This bank account has been re-read, so what you see below is the server's current answer.")
+                    : _("The server did not answer, so it is not known whether this was recorded. This bank account has been re-read.")}
+            </span>
+            <Button
+                type='button'
+                size='sm'
+                variant='ghost'
+                onClick={() => setRefusal(null)}>
+                {_("Dismiss")}
+            </Button>
+        </div>
+    </div>
+}
+
 const VouchersSection = ({ contentHeight }: { contentHeight: number }) => {
 
-    const selectedBank = useAtomValue(selectedBankAccountAtom)
-    const selectedTransactions = useAtomValue(bankRecSelectedTransactionAtom(selectedBank?.name || ''))
+    const selectedTransactions = useAtomValue(bankRecSelectedTransactionsAtom)
 
-
+    /* Rendered above every branch below, including the empty one, because convergence after a refusal
+       can itself be what emptied the pane. */
     if (selectedTransactions.length === 0) {
-        return <Empty>
-            <EmptyMedia>
-                <ReceiptIcon />
-            </EmptyMedia>
-            <EmptyHeader>
-                <EmptyTitle>{_("Select a transaction to match and reconcile with vouchers")}</EmptyTitle>
-            </EmptyHeader>
-        </Empty>
+        return <>
+            <LastRefusalNotice />
+            <Empty>
+                <EmptyMedia>
+                    <ReceiptIcon />
+                </EmptyMedia>
+                <EmptyHeader>
+                    <EmptyTitle>{_("Select a transaction to match and reconcile with vouchers")}</EmptyTitle>
+                </EmptyHeader>
+            </Empty>
+        </>
     }
 
     if (selectedTransactions.length > 1) {
-        return <OptionsForMultipleTransactions transactions={selectedTransactions} />
+        return <>
+            <LastRefusalNotice />
+            <OptionsForMultipleTransactions transactions={selectedTransactions} />
+        </>
     }
 
     return <div style={{ minHeight: contentHeight }} className="mt-2">
-        <OptionsForSingleTransaction transaction={selectedTransactions[0]} contentHeight={contentHeight} />
+        <LastRefusalNotice />
+        <OptionsForSingleTransaction transaction={selectedTransactions[0]} />
     </div>
 }
 
@@ -603,7 +862,7 @@ const OptionsForMultipleTransactions = ({ transactions }: { transactions: Unreco
 }
 
 
-const OptionsForSingleTransaction = ({ transaction, contentHeight }: { transaction: UnreconciledTransaction, contentHeight: number }) => {
+const OptionsForSingleTransaction = ({ transaction }: { transaction: UnreconciledTransaction }) => {
 
     const { setTransferModalOpen, setRecordPaymentModalOpen, setRecordJournalEntryModalOpen } = useKeyboardShortcuts()
 
@@ -670,7 +929,7 @@ const OptionsForSingleTransaction = ({ transaction, contentHeight }: { transacti
             </div>
         </TooltipProvider>
         {transaction.matched_transaction_rule && <RuleAction transaction={transaction} />}
-        <VouchersForTransaction transaction={transaction} contentHeight={contentHeight} />
+        <VouchersForTransaction transaction={transaction} />
     </div>
 }
 
@@ -842,12 +1101,15 @@ const RuleAction = ({ transaction }: { transaction: UnreconciledTransaction }) =
     )
 }
 
-const VouchersForTransaction = ({ transaction, contentHeight }: { transaction: UnreconciledTransaction, contentHeight: number }) => {
+const VouchersForTransaction = ({ transaction }: { transaction: UnreconciledTransaction }) => {
 
     const { data: vouchers, isLoading, error } = useGetVouchersForTransaction(transaction)
 
     const voucherList = vouchers?.message ?? []
-    const listHeight = contentHeight - 120
+
+    /* Sized from the candidate list's own position, for the same reason the transaction list is: the rule
+     * card and the action row above it vary in height with both the data and the viewport. */
+    const [listRef, listHeight] = useAvailableHeight({ min: 240, gutter: 24 })
 
     if (error) {
         return <ErrorBanner error={error} />
@@ -884,21 +1146,22 @@ const VouchersForTransaction = ({ transaction, contentHeight }: { transaction: U
                 <EmptyTitle>{_("No vouchers found for this transaction")}</EmptyTitle>
             </EmptyHeader>
         </Empty>}
-        <VirtualizedListBody
-            items={voucherList}
-            height={listHeight}
-            estimateSize={121}
-            getItemKey={(voucher) => voucher.name}
-        >
-            {(voucher, index) => <VoucherItem voucher={voucher} index={index} />}
-        </VirtualizedListBody>
+        <div ref={listRef}>
+            <VirtualizedListBody
+                items={voucherList}
+                height={listHeight}
+                estimateSize={121}
+                getItemKey={(voucher) => voucher.name}
+            >
+                {(voucher, index) => <VoucherItem voucher={voucher} index={index} />}
+            </VirtualizedListBody>
+        </div>
     </div >
 }
 
 const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number }) => {
 
-    const selectedBank = useAtomValue(selectedBankAccountAtom)
-    const selectedTransaction = useAtomValue(bankRecSelectedTransactionAtom(selectedBank?.name || ''))
+    const selectedTransaction = useAtomValue(bankRecSelectedTransactionsAtom)
 
     const { amountMatches, postingDateMatches, referenceDateMatches, referenceMatchesFull, referenceMatchesPartial, isSuggested } = useMemo(() => {
 

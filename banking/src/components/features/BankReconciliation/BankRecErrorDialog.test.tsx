@@ -9,9 +9,10 @@
  * Severity is asserted on the theme's token CLASSES because `ui/alert.tsx` emits no `data-theme` - it
  * carries the theme only in its `cva` class list, so the class is the sole observable signal.
  */
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { Provider, createStore } from 'jotai'
+import { Provider, createStore, useSetAtom } from 'jotai'
+import { useState } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import {
 	ALREADY_RECONCILED_MESSAGE_TEMPLATE,
@@ -35,7 +36,7 @@ vi.mock('frappe-react-sdk', () => createFrappeSDKMock())
 import BankRecErrorDialog from './BankRecErrorDialog'
 import {
 	bankRecErrorDialogAtom,
-	bankRecSelectedTransactionAtom,
+	bankRecSelectedTransactionsAtom,
 	selectedBankAccountAtom
 } from './bankRecAtoms'
 
@@ -344,6 +345,37 @@ describe('BankRecErrorDialog', () => {
 			expect(scroller?.contains(screen.getByRole('button', { name: DISMISS_LABEL }))).toBe(false)
 		})
 
+		/*
+		 * The row template is the load-bearing half of the height cap, and it is asserted separately
+		 * because it was once absent: the primitive declares `grid` with NO row template, so
+		 * `grid-auto-rows: auto` sized the messages row to its content, `min-h-0` had no flexible track
+		 * to shrink, `overflow-y` never engaged, and a verbose refusal pushed Dismiss outside the capped
+		 * box - off screen and not hit-testable, at every viewport. jsdom computes no layout, so the
+		 * class list is the only observable from here; the resulting geometry is measured in a browser.
+		 */
+		it('gives the messages row a FLEXIBLE track, which is what lets it scroll at all', () => {
+			renderDialog(makeServerMessagesError('Nothing was posted'))
+
+			const content = getDialogContent()
+			expect(content.className).toContain('grid-rows-[auto_minmax(0,1fr)_auto]')
+			// Header, messages, footer: the template describes exactly the three children rendered, so a
+			// fourth child would silently fall outside it.
+			expect(content.children).toHaveLength(3)
+			expect(content.children[1]).toBe(getBanner().parentElement)
+		})
+
+		/*
+		 * Server text legitimately carries tokens with nowhere to break - a reference, an SQL fragment,
+		 * an absolute path. Without this the banner laid one out as a single line thousands of pixels
+		 * wide, readable only by scrolling sideways. `anywhere` rather than `break-word` because only
+		 * `anywhere` also lowers the intrinsic width, and the transaction list already uses it.
+		 */
+		it('wraps an unbroken token instead of laying it out past the dialog', () => {
+			renderDialog(makeServerMessagesError(`Refused: ${'A'.repeat(800)}`))
+
+			expect(getBanner().parentElement?.className).toContain('wrap-anywhere')
+		})
+
 		it('stays mounted and dismissible at a narrow viewport', async () => {
 			const originalWidth = window.innerWidth
 			try {
@@ -362,6 +394,229 @@ describe('BankRecErrorDialog', () => {
 				window.innerWidth = originalWidth
 				window.dispatchEvent(new Event('resize'))
 			}
+		})
+	})
+
+	/*
+	 * FOCUS, which is a FINANCIAL concern here and not only an accessibility one: the controls behind
+	 * this dialog post reconciliations, so a Tab that escapes an open refusal lands on a live Reconcile
+	 * button. The primitive alone does not deliver the trap for this composition - it focuses an
+	 * `AlertDialogCancel` on open and a `Trigger` on close, and an atom-driven report of an error that
+	 * already happened has neither - so the two anchors are supplied here and the specification below is
+	 * what stops them being dropped again.
+	 */
+	describe('focus management', () => {
+		/*
+		 * Mirrors how the dialog is actually reached: a live control on the page is used, the rejection
+		 * handler puts the error on the atom, and the dialog appears with focus still on that control.
+		 * `renderDialog` seeds the atom BEFORE the first render, which cannot express any of that.
+		 *
+		 * The background controls are deliberately the two kinds the audit found reachable - a button on
+		 * the workbench and a file link on the importer list.
+		 */
+		type TriggerFate = 'survives' | 'disappears' | 'disabledWhileInFlight'
+
+		const renderFromTrigger = (error: SeededError, fate: TriggerFate = 'survives') => {
+			const store = createStore()
+
+			const Harness = () => {
+				const setError = useSetAtom(bankRecErrorDialogAtom)
+				const [triggerPresent, setTriggerPresent] = useState(true)
+				const [inFlight, setInFlight] = useState(false)
+
+				return (
+					<>
+						{triggerPresent && (
+							<button
+								type="button"
+								/*
+								 * Every real caller disables its control for the duration of the request, which
+								 * is what stops a double post - and a browser blurs a control the moment it
+								 * becomes disabled, so focus is already off it before the server answers.
+								 */
+								disabled={inFlight}
+								onClick={(event) => {
+									if (fate === 'disabledWhileInFlight') {
+										const control = event.currentTarget
+										setInFlight(true)
+										/*
+										 * The blur is EXPLICIT because jsdom does not implement it: a real browser
+										 * blurs a control as it becomes disabled, which is precisely how focus
+										 * reaches `<body>` before the server answers. Without reproducing it here
+										 * the specification below cannot tell a working restore from a broken one -
+										 * measured in a real browser, where the naive version captured `<body>`.
+										 */
+										control.blur()
+										// The server answers on a later tick, by which time focus has already
+										// been dropped by the disable above.
+										setTimeout(() => {
+											setInFlight(false)
+											setError(error)
+										}, 0)
+										return
+									}
+
+									setError(error)
+									if (fate === 'disappears') {
+										setTriggerPresent(false)
+									}
+								}}
+							>
+								Reconcile
+							</button>
+						)}
+						<button type="button">Create Payment Entry</button>
+						<a href="/statement-importer/BSIL-2024-00001">hdfc-statement-jan-2024.csv</a>
+						<BankRecErrorDialog />
+					</>
+				)
+			}
+
+			render(
+				<Provider store={store}>
+					<Harness />
+				</Provider>
+			)
+
+			return { store }
+		}
+
+		/*
+		 * Every background element is captured BEFORE opening, because the primitive hides the rest of
+		 * the document from the accessibility tree while the dialog is open - so a role query cannot
+		 * reach them, and only an element reference can prove focus never arrived on one.
+		 */
+		const openFromTrigger = async (
+			user: ReturnType<typeof userEvent.setup>,
+			error: SeededError = makeServerMessagesError('Nothing was posted'),
+			fate: TriggerFate = 'survives'
+		) => {
+			const rendered = renderFromTrigger(error, fate)
+			const trigger = screen.getByRole('button', { name: 'Reconcile' })
+			const background = [
+				trigger,
+				screen.getByRole('button', { name: 'Create Payment Entry' }),
+				screen.getByRole('link', { name: 'hdfc-statement-jan-2024.csv' })
+			]
+
+			await user.click(trigger)
+			await screen.findByRole('alertdialog')
+
+			return { ...rendered, trigger, background }
+		}
+
+		it('moves focus into the dialog, onto Dismiss, as it opens', async () => {
+			const user = userEvent.setup()
+			await openFromTrigger(user)
+
+			expect(document.activeElement).toBe(screen.getByRole('button', { name: DISMISS_LABEL }))
+			expect(getDialogContent().contains(document.activeElement)).toBe(true)
+			expect(document.activeElement).not.toBe(document.body)
+		})
+
+		it('holds Tab inside the dialog, so no live control behind it can be reached', async () => {
+			const user = userEvent.setup()
+			const { background } = await openFromTrigger(user)
+			const content = getDialogContent()
+
+			// Eight presses, matching the audit that found 8 of 8 escaping onto background controls.
+			for (let press = 0; press < 8; press += 1) {
+				await user.tab()
+
+				expect(content.contains(document.activeElement)).toBe(true)
+				background.forEach((element) => {
+					expect(document.activeElement).not.toBe(element)
+				})
+			}
+		})
+
+		it('holds Shift+Tab inside the dialog as well', async () => {
+			const user = userEvent.setup()
+			const { background } = await openFromTrigger(user)
+			const content = getDialogContent()
+
+			for (let press = 0; press < 4; press += 1) {
+				await user.tab({ shift: true })
+
+				expect(content.contains(document.activeElement)).toBe(true)
+				background.forEach((element) => {
+					expect(document.activeElement).not.toBe(element)
+				})
+			}
+		})
+
+		it('hands focus back to the control that opened it when Dismiss is pressed', async () => {
+			const user = userEvent.setup()
+			const { trigger } = await openFromTrigger(user)
+
+			await user.click(screen.getByRole('button', { name: DISMISS_LABEL }))
+
+			await waitFor(() => {
+				expect(document.activeElement).toBe(trigger)
+			})
+		})
+
+		it('hands focus back to that control on Escape too', async () => {
+			const user = userEvent.setup()
+			const { trigger } = await openFromTrigger(user)
+
+			await user.keyboard('{Escape}')
+
+			await waitFor(() => {
+				expect(document.activeElement).toBe(trigger)
+			})
+		})
+
+		/*
+		 * THE CASE THAT MATTERS MOST, because it is what every real caller does: the control is disabled
+		 * for the duration of the request, the browser blurs it as it becomes disabled, and the server
+		 * answers only afterwards. Anything that reads `document.activeElement` when the dialog opens
+		 * finds `<body>` here - which is an `HTMLElement`, is connected, and satisfies a naive guard - and
+		 * then "restores" focus to it, which is indistinguishable from restoring nothing.
+		 */
+		it('returns focus to a control that was disabled while its request was in flight', async () => {
+			const user = userEvent.setup()
+			const { trigger } = await openFromTrigger(
+				user,
+				makeServerMessagesError('Nothing was posted'),
+				'disabledWhileInFlight'
+			)
+
+			// The premise of the test: focus really was dropped before the dialog appeared.
+			expect(trigger).toBeEnabled()
+			expect(document.activeElement).toBe(screen.getByRole('button', { name: DISMISS_LABEL }))
+
+			await user.keyboard('{Escape}')
+
+			await waitFor(() => {
+				expect(document.activeElement).toBe(trigger)
+			})
+			expect(document.activeElement).not.toBe(document.body)
+		})
+
+		/*
+		 * The re-read that follows a refusal can drop the row the reviewer was on, taking its control
+		 * with it. Focusing a detached node moves focus to `<body>` silently, so the default is left in
+		 * place for the primitive to resolve instead. Nothing is substituted: the nearest lookalike on a
+		 * refused reconciliation is another voucher's live Reconcile control.
+		 */
+		it('does not chase a control that has since been removed', async () => {
+			const user = userEvent.setup()
+			await openFromTrigger(user, makeServerMessagesError('Nothing was posted'), 'disappears')
+
+			await user.keyboard('{Escape}')
+
+			await waitFor(() => {
+				expect(screen.queryByRole('alertdialog')).toBeNull()
+			})
+			expect(document.activeElement?.isConnected).toBe(true)
+		})
+
+		it('announces itself as modal, so the page behind is not offered alongside it', () => {
+			renderDialog(makeServerMessagesError('Nothing was posted'))
+
+			expect(getDialogContent()).toHaveAttribute('aria-modal', 'true')
+			expect(getDialogContent()).toHaveAttribute('role', 'alertdialog')
 		})
 	})
 
@@ -395,7 +650,7 @@ describe('BankRecErrorDialog', () => {
 
 			const { store } = renderDialog(makeServerMessagesError('Nothing was posted'), (seeded) => {
 				seeded.set(selectedBankAccountAtom, bank)
-				seeded.set(bankRecSelectedTransactionAtom(bank.name), selection)
+				seeded.set(bankRecSelectedTransactionsAtom, selection)
 			})
 
 			await userEvent.click(screen.getByRole('button', { name: DISMISS_LABEL }))
@@ -404,7 +659,7 @@ describe('BankRecErrorDialog', () => {
 				expect(store.get(bankRecErrorDialogAtom)).toBeNull()
 			})
 			expect(store.get(selectedBankAccountAtom)).toBe(bank)
-			expect(store.get(bankRecSelectedTransactionAtom(bank.name))).toBe(selection)
+			expect(store.get(bankRecSelectedTransactionsAtom)).toBe(selection)
 		})
 
 		it('makes no SDK call and triggers no revalidation of its own', async () => {
@@ -425,6 +680,214 @@ describe('BankRecErrorDialog', () => {
 
 			expect(store.get(bankRecErrorDialogAtom)).not.toBeNull()
 			expect(screen.getByRole('alertdialog')).toBeInTheDocument()
+		})
+	})
+
+	/*
+	 * Focus is the whole reason this dialog is worth specifying twice.
+	 *
+	 * Radix's alert dialog deliberately declines its own default autofocus and focuses the CANCEL control
+	 * instead, so that a keyboard lands on the safe way out of a destructive prompt rather than on the
+	 * destructive button. That design has one consequence which is easy to miss: with no cancel control
+	 * rendered there is nothing for it to focus, focus stays on <body> OUTSIDE the focus scope, and the
+	 * trap never engages either - Radix contains focus by watching where it moves away from inside the
+	 * scope, and focus was never inside it to begin with. So Tab walked straight into the page behind a
+	 * modal reporting a refusal, and dismissal returned focus to <body>.
+	 *
+	 * The tests below therefore pin the MECHANISM (the control is Radix's cancel slot) alongside the
+	 * OUTCOME (focus starts inside, stays inside, and comes back somewhere real).
+	 */
+	describe('focus management', () => {
+
+		/**
+		 * Mounts the dialog inside the SPA's real `#root` element, with a focusable control behind it.
+		 *
+		 * The element id matters: `#root` is what the dialog marks `inert` while it is open, and it is
+		 * where focus is placed as a last resort. RTL's default container is an anonymous div, so without
+		 * this neither behaviour would be reachable from a test. The dialog itself portals to <body>, so
+		 * it lands OUTSIDE this element - which is exactly what lets the background be inert while the
+		 * dialog stays operable.
+		 */
+		const renderInAppRoot = (error: SeededError | null) => {
+			const root = document.createElement('div')
+			root.id = 'root'
+			document.body.appendChild(root)
+
+			const store = createStore()
+			store.set(bankRecErrorDialogAtom, error)
+
+			const view = render(
+				<Provider store={store}>
+					<button type="button" data-testid="behind">Behind the dialog</button>
+					<BankRecErrorDialog />
+				</Provider>,
+				{ container: root }
+			)
+
+			return { store, root, ...view }
+		}
+
+		const getDismiss = (): HTMLElement => screen.getByRole('button', { name: DISMISS_LABEL })
+
+		/**
+		 * A control that stands in for the row's Reconcile button and can be taken out of the document
+		 * mid-test, the way converging with the server takes the real one out.
+		 *
+		 * Built outside React's tree on purpose. Removing a React-rendered node by hand leaves React
+		 * holding a fiber for it, and the teardown that follows throws `NotFoundError` trying to remove it
+		 * from a parent it no longer has - which fails the test for a reason that has nothing to do with
+		 * focus. This one belongs to nobody but the test.
+		 */
+		const addStrayOpener = (): HTMLButtonElement => {
+			const shell = document.createElement('div')
+			const opener = document.createElement('button')
+			opener.type = 'button'
+			opener.textContent = 'Reconcile'
+			shell.appendChild(opener)
+			document.body.appendChild(shell)
+			return opener
+		}
+
+		it('renders the dismiss control as Radix\'s cancel slot, which is what gives it a focus target', () => {
+			renderDialog(makeServerMessagesError('Nothing was posted'))
+
+			expect(getDismiss()).toHaveAttribute('data-slot', 'alert-dialog-cancel')
+			// The action slot is what it used to be, and an action is never autofocused by an alert dialog.
+			expect(document.querySelector('[data-slot="alert-dialog-action"]')).toBeNull()
+		})
+
+		it('puts focus on Dismiss as soon as it opens, rather than leaving it on the body', async () => {
+			renderInAppRoot(makeServerMessagesError('Nothing was posted'))
+
+			await waitFor(() => {
+				expect(getDismiss()).toHaveFocus()
+			})
+			expect(document.body).not.toHaveFocus()
+		})
+
+		it('declares itself modal, so a reader that honours it will not read past the dialog', () => {
+			renderDialog(makeServerMessagesError('Nothing was posted'))
+
+			expect(getDialogContent()).toHaveAttribute('aria-modal', 'true')
+		})
+
+		it('makes the application behind it inert while it is open', () => {
+			const { root } = renderInAppRoot(makeServerMessagesError('Nothing was posted'))
+
+			// `aria-hidden`, which Radix sets, hides the page from a reader but leaves it operable by
+			// pointer and by Tab. `inert` is what actually takes it out of play.
+			expect(root).toHaveAttribute('inert')
+			// And the dialog is not inside the part that was made inert.
+			expect(root.contains(getDialogContent())).toBe(false)
+		})
+
+		it('gives the application back once it is dismissed', async () => {
+			const { root } = renderInAppRoot(makeServerMessagesError('Nothing was posted'))
+
+			await userEvent.click(getDismiss())
+
+			await waitFor(() => {
+				expect(root).not.toHaveAttribute('inert')
+			})
+		})
+
+		it('keeps Tab inside the dialog instead of walking into the page behind it', async () => {
+			renderInAppRoot(makeServerMessagesError('Nothing was posted'))
+
+			await waitFor(() => {
+				expect(getDismiss()).toHaveFocus()
+			})
+
+			await userEvent.tab()
+
+			// One tabbable control, so the trap cycles back to it. What matters is what focus is NOT on.
+			expect(screen.getByTestId('behind')).not.toHaveFocus()
+			expect(getDialogContent().contains(document.activeElement)).toBe(true)
+		})
+
+		it('returns focus to whatever the reviewer was using, when it is still there', async () => {
+			const { store, root } = renderInAppRoot(null)
+
+			const opener = screen.getByTestId('behind')
+			opener.focus()
+			expect(opener).toHaveFocus()
+
+			await act(async () => {
+				store.set(bankRecErrorDialogAtom, makeServerMessagesError('Nothing was posted'))
+			})
+
+			await waitFor(() => {
+				expect(getDismiss()).toHaveFocus()
+			})
+
+			await userEvent.click(getDismiss())
+
+			await waitFor(() => {
+				expect(opener).toHaveFocus()
+			})
+			// Nothing was needed from the fallback, so the root is left exactly as it was found.
+			expect(root).not.toHaveAttribute('tabindex')
+		})
+
+		it('places focus at the top of the application when the control it came from has gone', async () => {
+			/*
+			 * This is the common case here, not an edge one: converging with the server after a refusal
+			 * removes the very row whose Reconcile control was clicked, so by the time the dialog closes
+			 * there is nothing left to hand focus back to. Radix focuses a detached node, which silently
+			 * does nothing, and focus falls to <body> - no announced position, and Tab starts again from
+			 * the top of the document.
+			 */
+			const { store, root } = renderInAppRoot(null)
+
+			const opener = addStrayOpener()
+			opener.focus()
+
+			await act(async () => {
+				store.set(bankRecErrorDialogAtom, makeServerMessagesError('Nothing was posted'))
+			})
+			await waitFor(() => {
+				expect(getDismiss()).toHaveFocus()
+			})
+
+			// Stand in for the row leaving the list.
+			opener.remove()
+
+			await userEvent.click(getDismiss())
+
+			await waitFor(() => {
+				expect(root).toHaveFocus()
+			})
+			expect(document.body).not.toHaveFocus()
+			// Focusable programmatically, but NOT a new tab stop for everyone thereafter.
+			expect(root).toHaveAttribute('tabindex', '-1')
+		})
+
+		it('takes the temporary tabindex back off the root once focus leaves it', async () => {
+			const { store, root } = renderInAppRoot(null)
+
+			const opener = addStrayOpener()
+			opener.focus()
+
+			await act(async () => {
+				store.set(bankRecErrorDialogAtom, makeServerMessagesError('Nothing was posted'))
+			})
+			await waitFor(() => {
+				expect(getDismiss()).toHaveFocus()
+			})
+			opener.remove()
+			await userEvent.click(getDismiss())
+			await waitFor(() => {
+				expect(root).toHaveFocus()
+			})
+
+			// Whatever the reviewer focuses next, the document returns to the shape it had before.
+			await act(async () => {
+				root.blur()
+			})
+
+			await waitFor(() => {
+				expect(root).not.toHaveAttribute('tabindex')
+			})
 		})
 	})
 })

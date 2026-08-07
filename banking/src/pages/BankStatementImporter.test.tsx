@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
 	createFrappeSDKMock,
+	frappeContextValue,
 	frappeCreateDoc,
 	frappeFileUpload,
 	frappeHookMutate,
@@ -30,8 +31,13 @@ import {
 	makeImportFailures,
 	makeSelectedBank,
 	makeServerMessagesError,
-	makeWarningServerMessagesError
+	makeTransportFailureError,
+	makeWarningServerMessagesError,
+	TEST_ALTERNATE_CURRENCY,
+	TEST_CURRENCY,
+	TRANSPORT_FAILURE_MESSAGE
 } from '@/test/factories'
+import { formatCurrency } from '@/lib/numbers'
 
 // `vi.hoisted` because the `vi.mock` factory below is lifted above every ordinary declaration and
 // would otherwise close over an uninitialised binding. The stub covers every `toast` member this
@@ -62,6 +68,7 @@ import {
 	selectedBankAccountAtom
 } from '@/components/features/BankReconciliation/bankRecAtoms'
 import { TooltipProvider } from '@/components/ui/tooltip'
+import { formatDate } from '@/lib/date'
 import type { BankStatementImportLog } from '@/types/Accounts/BankStatementImportLog'
 
 type FrappeErrorFixture = ReturnType<typeof makeFrappeError>
@@ -305,6 +312,13 @@ const renderImporter = ({
 const displayedFileName = (log: BankStatementImportLog): string =>
 	log.file.split('/').pop() ?? log.file
 
+/**
+ * The date text the row renders, which is also the accessible name of the link to the import's detail
+ * page. Formatted through the app's own helper so the expectation cannot drift from the rendering.
+ */
+const displayedDate = (log: BankStatementImportLog): string =>
+	formatDate(log.creation, 'Do MMM YYYY')
+
 const rowFor = (log: BankStatementImportLog): HTMLElement => {
 	const link = screen.getByRole('link', { name: displayedFileName(log) })
 	const row = link.closest<HTMLElement>('[data-slot="table-row"]')
@@ -365,6 +379,9 @@ describe('BankStatementImporter', () => {
 		toastError.mockReset()
 		toastSuccess.mockReset()
 		toastWarning.mockReset()
+		// Every upload attempt ends by discarding the placeholder attachment, on both endings, so the
+		// operation is configured for the whole suite rather than per test.
+		frappeContextValue.db.deleteDoc.mockResolvedValue({ message: 'ok' } as never)
 	})
 
 	describe('previous imports list (TC1)', () => {
@@ -380,9 +397,94 @@ describe('BankStatementImporter', () => {
 
 			expect(table.getAllByRole('row')).toHaveLength(ALL_LOGS.length + 1)
 
-			const renderedFileNames = table.getAllByRole('link').map((link) => link.textContent)
+			/*
+			 * Narrowed to the FILE links. Each row now carries two: the imported-on date links to the
+			 * detail page - which is what makes the row's action reachable from a keyboard, since a `tr`
+			 * cannot honestly be a button - and the filename links to the stored file itself. Only the
+			 * latter opens in a new tab, which is what distinguishes them here.
+			 */
+			const renderedFileNames = table
+				.getAllByRole('link')
+				.filter((link) => link.getAttribute('target') === '_blank')
+				.map((link) => link.textContent)
 
 			expect(renderedFileNames).toEqual(ALL_LOGS.map(displayedFileName))
+		})
+
+		it('reaches each import from the keyboard, not by clicking the row alone', () => {
+			// The row's own click handler is a pointer convenience. Before this the detail page had no
+			// keyboard path at all: no focusable element in the row led to it.
+			renderImporter({ logs: [COMPLETED_LOG] })
+
+			const dateLink = screen.getByRole('link', {
+				name: displayedDate(COMPLETED_LOG)
+			})
+
+			expect(dateLink).toHaveAttribute('href', `${IMPORTER_ROUTE}/${COMPLETED_LOG.name}`)
+		})
+
+		it('keeps the filename readable rather than letting it stretch the row', () => {
+			/*
+			 * Bank portals export long, sometimes mixed-script filenames. An unconstrained one widened the
+			 * row until the columns before it were unreadable, so from `md` up it is capped and truncated
+			 * on one line - and the whole name is still available, in `title`.
+			 *
+			 * Below `md` it wraps instead, and both halves of that are asserted: `break-all` on the link,
+			 * which is what gives the column a min-content width of one character so the table's auto
+			 * layout can shrink it to whatever the date and status leave over, and `whitespace-normal` on
+			 * the cell, without which the primitive's default `whitespace-nowrap` would forbid the wrap.
+			 * Measured in a real browser, the 12rem cap alone left the column 49px wider than the pane at
+			 * 390px, which put the filename off the edge of a scroll container nobody knew to scroll.
+			 */
+			const longName = 'HDFC-Bank-Statement-01-04-2024-to-30-04-2024-account-50100XXXXXX987.csv'
+			const log = makeBankStatementImportLog({
+				name: 'BSIL-2024-01111',
+				file: `/private/files/${longName}`
+			})
+
+			renderImporter({ logs: [log] })
+
+			const fileLink = screen.getByRole('link', { name: longName })
+
+			expect(fileLink).toHaveAttribute('title', longName)
+			// Capped and single-line from `md` up.
+			expect(fileLink.className).toContain('md:truncate')
+			expect(fileLink.className).toMatch(/md:max-w-/)
+			// Shrinkable and wrapping below it - no unprefixed cap, so nothing forces the column wide.
+			expect(fileLink.className).toContain('break-all')
+			expect(fileLink.className).not.toMatch(/(^|\s)max-w-/)
+			expect(fileLink.className).not.toMatch(/(^|\s)truncate/)
+
+			const fileCell = fileLink.closest('td')
+			expect(fileCell).not.toBeNull()
+			expect(fileCell?.className).toContain('whitespace-normal')
+		})
+
+		it('keeps the three identifying columns at every width and defers the three quantifying ones', () => {
+			/*
+			 * jsdom applies no stylesheet, so which columns are VISIBLE at 390px cannot be measured here -
+			 * that is measured in a real browser. What is pinned is the ranking itself: six columns of
+			 * non-wrapping text do not fit a narrow pane, and the browser resolved that by pushing the FILE
+			 * column - the one thing identifying which statement a row is - off the edge of a scroll
+			 * container nobody knew to scroll. Imported On, Status and File are unconditional; the three
+			 * that merely quantify the import wait for room.
+			 */
+			renderImporter({ logs: [COMPLETED_LOG] })
+
+			const headers = screen.getAllByRole('columnheader')
+			const deferred = headers.filter((header) => header.className.includes('hidden'))
+
+			expect(deferred.map((header) => header.textContent)).toEqual([
+				'Transaction Dates',
+				'Number of Transactions',
+				'Closing Balance'
+			])
+			expect(deferred.every((header) => header.className.includes('md:table-cell'))).toBe(true)
+
+			for (const label of ['Imported On', 'Status', 'File']) {
+				const header = headers.find((candidate) => candidate.textContent === label)
+				expect(header?.className).not.toContain('hidden')
+			}
 		})
 
 		it('labels all six columns the row projects', () => {
@@ -482,8 +584,11 @@ describe('BankStatementImporter', () => {
 			const [, args] = importLogQueryCall()
 
 			expect(args?.filters).toEqual([['bank_account', '=', SELECTED_BANK.name]])
-			// Exactly the eight fields the row renders — no `password`-bearing or unrelated field is
-			// fetched "just in case".
+			// Exactly the nine fields the row renders — no `password`-bearing or unrelated field is
+			// fetched "just in case". `currency` earns its place because the Closing Balance cell formats
+			// money with each statement's OWN currency; omitting it made that column fall back to the
+			// company/browser default, so a foreign-currency statement showed the right number under the
+			// wrong symbol.
 			expect(args?.fields).toEqual([
 				'name',
 				'file',
@@ -492,10 +597,70 @@ describe('BankStatementImporter', () => {
 				'start_date',
 				'end_date',
 				'closing_balance',
+				'currency',
 				'creation'
 			])
 			expect(args?.orderBy).toEqual({ field: 'creation', order: 'desc' })
 			expect(args?.limit).toBe(10)
+		})
+
+		it("formats each log's Closing Balance in that log's OWN currency", () => {
+			/*
+			 * This list can mix accounts, and the cell used to be formatted with no currency at all - so it
+			 * fell back to the company/browser default and a foreign-currency statement showed the right
+			 * number under the wrong symbol. The detail screen formats the same value from the same field
+			 * and got it right, which is what made the two screens contradict each other.
+			 *
+			 * Two logs in DIFFERENT currencies are rendered together, because a single-currency assertion
+			 * cannot tell a per-row value apart from a constant.
+			 */
+			const homeCurrencyLog = makeBankStatementImportLog({
+				name: 'BSIL-2024-00010',
+				file: '/files/home-currency.csv',
+				closing_balance: 1000,
+				currency: TEST_CURRENCY
+			})
+			const foreignCurrencyLog = makeBankStatementImportLog({
+				name: 'BSIL-2024-00011',
+				file: '/files/foreign-currency.csv',
+				closing_balance: 1111.11,
+				currency: TEST_ALTERNATE_CURRENCY
+			})
+
+			renderImporter({ logs: [homeCurrencyLog, foreignCurrencyLog] })
+
+			expect(rowFor(homeCurrencyLog).textContent)
+				.toContain(formatCurrency(1000, TEST_CURRENCY))
+			expect(rowFor(foreignCurrencyLog).textContent)
+				.toContain(formatCurrency(1111.11, TEST_ALTERNATE_CURRENCY))
+
+			// And the two are genuinely different renderings, not the same string twice.
+			expect(formatCurrency(1111.11, TEST_ALTERNATE_CURRENCY))
+				.not.toBe(formatCurrency(1111.11, TEST_CURRENCY))
+		})
+
+		it('labels each closing balance in the currency that statement was imported in', () => {
+			// The same guarantee as above, pinned against a LITERAL rendering rather than against the
+			// formatter, so the two cannot drift together: a statement carries its own currency, which
+			// need not be the company's, and formatting the balance without it printed the company symbol
+			// against another currency's number - the right figure under the wrong label, on the very row
+			// that leads to the detail view where the same mislabelling was already corrected.
+			const usdLog = makeBankStatementImportLog({
+				name: 'BSIL-2024-00009',
+				file: '/files/chase-statement-jan-2024.csv',
+				status: 'Completed',
+				creation: '2024-01-20 11:00:00.000000',
+				number_of_transactions: 3,
+				closing_balance: 1234.5,
+				currency: 'USD'
+			})
+
+			renderImporter({ logs: [usdLog] })
+
+			const row = screen.getByText('chase-statement-jan-2024.csv').closest('tr')
+			expect(row).not.toBeNull()
+			expect(row).toHaveTextContent('$ 1,234.50')
+			expect(row).not.toHaveTextContent('\u20b9')
 		})
 
 		it('scopes the query to whichever account is selected, not to a fixed one', () => {
@@ -615,12 +780,103 @@ describe('BankStatementImporter', () => {
 
 			expect(statusBadgeIn(rowFor(FAILED_LOG))).toHaveTextContent('Failed')
 
-			// The server still reports this log as `Not Started`, so nothing has overtaken the marker and
-			// the identical object survives - no needless re-render of every consumer.
+			/*
+			 * The server still reports this log as `Not Started`, so nothing has overtaken the marker and
+			 * it survives intact.
+			 *
+			 * By VALUE rather than by reference, and the reason is worth stating: the atom is backed by
+			 * session storage so that a refusal survives a reload, and `atomWithStorage` re-reads the
+			 * stored JSON when the atom mounts - which yields an equal but freshly parsed object. That one
+			 * extra commit on mount is inherent to every persisted atom in this store (the selected bank,
+			 * the date range, the action log), and what matters here is that the prune left the marker's
+			 * CONTENT alone.
+			 */
 			await waitFor(() => {
-				expect(store.get(bankRecImportFailuresAtom)).toBe(markers)
+				expect(store.get(bankRecImportFailuresAtom)).toEqual(markers)
 			})
 			expect(Object.keys(store.get(bankRecImportFailuresAtom))).toEqual([FAILED_LOG.name])
+		})
+
+		/*
+		 * A MARKER OUTLIVES THE PAGE THAT RECORDED IT.
+		 *
+		 * This is the whole of the finding. `Bank Statement Import Log` has no error field, offers only
+		 * `Not Started` and `Completed`, and a refused import rolls back - so the server persists nothing
+		 * about the refusal and reports the row as one nobody has tried yet. A marker held only in memory
+		 * therefore disappeared the moment the reviewer navigated away or reloaded, and they came back to a
+		 * row that looked untouched with no way to learn otherwise.
+		 *
+		 * Session storage rather than local storage: an observation about a request belongs to the sitting
+		 * that made it. Surviving a reload and a navigation is the requirement; surviving a browser restart
+		 * days later would be asserting something about a file nobody remembers uploading.
+		 */
+		describe('durability', () => {
+
+			const STORAGE_KEY = 'bank-rec-import-failures'
+
+			it('still marks the import Failed after the page is reloaded', async () => {
+				const markers = makeImportFailures(FAILED_LOG, FAILED_LOG_MESSAGE)
+				const first = renderImporter({ logs: ALL_LOGS, markers })
+
+				expect(statusBadgeIn(rowFor(FAILED_LOG))).toHaveTextContent('Failed')
+
+				// A fresh store with nothing seeded into it is exactly what a reload produces: the atom's
+				// only remaining source is what the previous page left behind.
+				first.unmount()
+				renderImporter({ logs: ALL_LOGS })
+
+				await waitFor(() => {
+					expect(statusBadgeIn(rowFor(FAILED_LOG))).toHaveTextContent('Failed')
+				})
+			})
+
+			it('writes the refusal to session storage under its own key', () => {
+				renderImporter({
+					logs: ALL_LOGS,
+					markers: makeImportFailures(FAILED_LOG, FAILED_LOG_MESSAGE)
+				})
+
+				const stored = sessionStorage.getItem(STORAGE_KEY)
+
+				expect(stored).not.toBeNull()
+				expect(JSON.parse(stored ?? '{}')).toHaveProperty(FAILED_LOG.name)
+			})
+
+			it('keeps the server\'s own words in the stored record, so a reloaded page can still say why', () => {
+				renderImporter({
+					logs: ALL_LOGS,
+					markers: makeImportFailures(FAILED_LOG, FAILED_LOG_MESSAGE)
+				})
+
+				// The raw Frappe rejection is a plain object of primitives, so it round-trips through JSON
+				// intact - which is what lets a reloaded marker render through the same shared error path as
+				// a live one instead of degrading to a bare "something failed".
+				const stored = JSON.parse(sessionStorage.getItem(STORAGE_KEY) ?? '{}')
+
+				expect(JSON.stringify(stored[FAILED_LOG.name])).toContain(FAILED_LOG_MESSAGE)
+			})
+
+			it('does not outlive the sitting - nothing is written to local storage', () => {
+				renderImporter({
+					logs: ALL_LOGS,
+					markers: makeImportFailures(FAILED_LOG, FAILED_LOG_MESSAGE)
+				})
+
+				expect(localStorage.getItem(STORAGE_KEY)).toBeNull()
+			})
+
+			it('retires an overtaken marker from storage too, so a reload cannot resurrect it', async () => {
+				// Persistence must not defeat the server's authority: if the prune only cleared memory, the
+				// next load would read the stale marker straight back out of storage.
+				renderImporter({
+					logs: ALL_LOGS,
+					markers: makeImportFailures(COMPLETED_LOG, FAILED_LOG_MESSAGE)
+				})
+
+				await waitFor(() => {
+					expect(JSON.parse(sessionStorage.getItem(STORAGE_KEY) ?? '{}')).toEqual({})
+				})
+			})
 		})
 
 		/*
@@ -869,6 +1125,241 @@ describe('BankStatementImporter', () => {
 		})
 	})
 
+	/* ── The banners the reviewer can put away, and the failure nobody phrased ──────── */
+
+	/*
+	 * Two defects the QA report caught on ONE screen.
+	 *
+	 * The banners are fed by the three SDK hooks' own `error` members, which each hold their value
+	 * until that hook is called again. A refusal therefore stayed on the page with no way to clear it:
+	 * the reviewer could change the file, change the account, dismiss the dialog, and still be reading
+	 * the previous attempt's banner with no control to remove it.
+	 *
+	 * And when the failure is a TRANSPORT one - the request never reaching the server - the SDK's own
+	 * handler throws while handling it, because it spreads `error.response.data` without checking that
+	 * a response exists. The rejection the page receives is that internal `TypeError`, and its text
+	 * ("Cannot read properties of undefined (reading 'data')") was shown TWICE for one failure: in the
+	 * dialog and in the banner. Both render through the shared parser, so both are fixed at once, and
+	 * these tests assert it on the surface where the reviewer met it.
+	 */
+	describe('an upload that never reaches the server, and putting the message away', () => {
+
+		/** Drives the transport failure through the real chain: upload rejects, hook exposes the error. */
+		const abortUpload = async (error: FrappeErrorFixture = makeTransportFailureError()) => {
+			frappeFileUpload.mockRejectedValue(error)
+			installFileUploadError(error)
+
+			const rendered = renderImporter({ logs: [] })
+			await chooseStatementFile(rendered.container, csvStatementFile())
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+			return rendered
+		}
+
+		it('never shows the SDK\'s internal message, in the dialog or in the banner', async () => {
+			await abortUpload()
+
+			const dialog = await screen.findByRole('alertdialog')
+			expect(dialog).not.toHaveTextContent(TRANSPORT_FAILURE_MESSAGE)
+			expect(screen.getByRole('alert')).not.toHaveTextContent(TRANSPORT_FAILURE_MESSAGE)
+			expect(screen.queryByText(new RegExp(TRANSPORT_FAILURE_MESSAGE, 'i'))).not.toBeInTheDocument()
+		})
+
+		it('tells the reviewer what to do about it instead', async () => {
+			await abortUpload()
+
+			const dialog = await screen.findByRole('alertdialog')
+			expect(within(dialog).getByText(/network connection/i)).toBeInTheDocument()
+			expect(within(dialog).getByText(/could not be reached/i)).toBeInTheDocument()
+		})
+
+		it('claims nothing about what the server did with a request it never answered', async () => {
+			await abortUpload()
+
+			const dialog = await screen.findByRole('alertdialog')
+			expect(within(dialog).getByText(/may or may not have been applied/i)).toBeInTheDocument()
+		})
+
+		it('writes no failure marker and opens no detail view, because no log was created', async () => {
+			const { store } = await abortUpload()
+
+			await screen.findByRole('alertdialog')
+			expect(frappeCreateDoc).not.toHaveBeenCalled()
+			expect(store.get(bankRecImportFailuresAtom)).toEqual({})
+			expect(screen.queryByText(new RegExp(DETAIL_SENTINEL))).not.toBeInTheDocument()
+		})
+
+		it('lets the reviewer put the inline banner away once the dialog is gone', async () => {
+			await abortUpload()
+
+			await userEvent.click(await screen.findByRole('button', { name: 'Dismiss' }))
+			await waitFor(() => {
+				expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+			})
+
+			// The banner outlives the dialog by design, and now carries its own way out.
+			await userEvent.click(screen.getByRole('button', { name: 'Dismiss message' }))
+
+			expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+			// Dismissing reports nothing and retries nothing: it only stops showing the message.
+			expect(frappeFileUpload).toHaveBeenCalledTimes(1)
+			expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
+		})
+
+		it('brings the banner back for the NEXT attempt, so dismissing cannot hide a fresh refusal', async () => {
+			await abortUpload()
+
+			await userEvent.click(await screen.findByRole('button', { name: 'Dismiss' }))
+			await waitFor(() => {
+				expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+			})
+			await userEvent.click(screen.getByRole('button', { name: 'Dismiss message' }))
+			expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+			expect(await screen.findByRole('alert')).toBeInTheDocument()
+			expect(frappeFileUpload).toHaveBeenCalledTimes(2)
+		})
+
+		it('offers no dismiss control on the banners that are not the upload form\'s', () => {
+			// The prop is opt-in: the import-log list's own banner reports why the list is missing, so
+			// clearing it would leave an empty panel with no explanation.
+			renderImporter({ listError: makeServerMessagesError('Not permitted to read the logs.') })
+
+			expect(screen.getByRole('alert')).toBeInTheDocument()
+			expect(screen.queryByRole('button', { name: 'Dismiss message' })).not.toBeInTheDocument()
+		})
+	})
+
+	/* ── The attachment the upload has to invent a parent for ────────────────────────── */
+
+	/*
+	 * An upload must name a parent document, but the import log does not exist yet and names itself by
+	 * hash on insert, so the placeholder name the client sends is discarded and the attachment is left
+	 * pointing at a document that never comes into being. The framework separately attaches the
+	 * statement to the real log while inserting it, reading the `file` field's own value - so one
+	 * statement finished with TWO `File` rows, one of them permanently dangling, on every import.
+	 *
+	 * The order of the cleanup is the safety argument, and is asserted below rather than assumed:
+	 * Frappe removes a file from disk only when no other row shares its content hash, so discarding the
+	 * placeholder after the log exists takes the row and leaves the statement, while discarding it after
+	 * a refusal takes both - correctly, since nothing references the bytes. Verified against a real
+	 * bench: deleting the placeholder row left the canonical row and the file on disk intact.
+	 */
+	describe('the placeholder attachment an upload has to create', () => {
+
+		const uploadedFile = makeFileUploadResponse()
+
+		const uploadStatement = async () => {
+			const rendered = renderImporter({ logs: [] })
+			await chooseStatementFile(rendered.container, csvStatementFile())
+			await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+			return rendered
+		}
+
+		it('discards it once the log owns an attachment of its own', async () => {
+			frappeFileUpload.mockResolvedValue(uploadedFile)
+			frappeCreateDoc.mockResolvedValue(makeBankStatementImportLog({ name: 'BSIL-2024-00009' }))
+
+			await uploadStatement()
+
+			expect(await screen.findByText(detailViewFor('BSIL-2024-00009'))).toBeInTheDocument()
+			await waitFor(() => {
+				expect(frappeContextValue.db.deleteDoc).toHaveBeenCalledWith('File', uploadedFile.name)
+			})
+			expect(frappeContextValue.db.deleteDoc).toHaveBeenCalledTimes(1)
+		})
+
+		it('discards it only AFTER the log exists, never before', async () => {
+			// Reversed, this would take the statement off disk with it: at that moment the placeholder is
+			// the only row holding the content hash.
+			frappeFileUpload.mockResolvedValue(uploadedFile)
+			frappeCreateDoc.mockResolvedValue(makeBankStatementImportLog({ name: 'BSIL-2024-00009' }))
+
+			await uploadStatement()
+
+			await waitFor(() => {
+				expect(frappeContextValue.db.deleteDoc).toHaveBeenCalled()
+			})
+			expect(frappeCreateDoc.mock.invocationCallOrder[0])
+				.toBeLessThan(frappeContextValue.db.deleteDoc.mock.invocationCallOrder[0])
+		})
+
+		it('discards it when creation was refused, so a refused attempt leaves nothing behind', async () => {
+			const refusal = makeServerMessagesError('No tables found in the PDF file')
+			frappeFileUpload.mockResolvedValue(uploadedFile)
+			frappeCreateDoc.mockRejectedValue(refusal)
+			installCreateDocError(refusal)
+
+			await uploadStatement()
+
+			await screen.findByRole('alertdialog')
+			await waitFor(() => {
+				expect(frappeContextValue.db.deleteDoc).toHaveBeenCalledWith('File', uploadedFile.name)
+			})
+		})
+
+		it('discards nothing when the upload never produced an attachment', async () => {
+			const refusal = makeServerMessagesError('Stream has ended unexpectedly')
+			frappeFileUpload.mockRejectedValue(refusal)
+			installFileUploadError(refusal)
+
+			await uploadStatement()
+
+			await screen.findByRole('alertdialog')
+			expect(frappeContextValue.db.deleteDoc).not.toHaveBeenCalled()
+		})
+
+		it('keeps a failed cleanup to itself: the import still opens and nothing new is reported', async () => {
+			// Housekeeping is not the reviewer's problem. A dangling row is untidy; interrupting a
+			// successful import to say so would be worse.
+			const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+			try {
+				frappeFileUpload.mockResolvedValue(uploadedFile)
+				frappeCreateDoc.mockResolvedValue(makeBankStatementImportLog({ name: 'BSIL-2024-00009' }))
+				frappeContextValue.db.deleteDoc.mockRejectedValue(
+					makeServerMessagesError('Not permitted to delete File') as never
+				)
+
+				await uploadStatement()
+
+				expect(await screen.findByText(detailViewFor('BSIL-2024-00009'))).toBeInTheDocument()
+				await waitFor(() => {
+					expect(consoleError).toHaveBeenCalled()
+				})
+				expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+				expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+				expect(toastError).not.toHaveBeenCalled()
+			} finally {
+				consoleError.mockRestore()
+			}
+		})
+
+		it('leaves the rest of the flow alone: one upload, one log, one navigation', async () => {
+			frappeFileUpload.mockResolvedValue(uploadedFile)
+			frappeCreateDoc.mockResolvedValue(makeBankStatementImportLog({ name: 'BSIL-2024-00009' }))
+
+			await uploadStatement()
+
+			expect(await screen.findByText(detailViewFor('BSIL-2024-00009'))).toBeInTheDocument()
+			expect(frappeFileUpload).toHaveBeenCalledTimes(1)
+			expect(frappeCreateDoc).toHaveBeenCalledTimes(1)
+			// The upload still names the placeholder parent the server expects; only the leftover row
+			// afterwards is new behaviour.
+			expect(frappeFileUpload).toHaveBeenCalledWith(
+				expect.any(File),
+				expect.objectContaining({
+					isPrivate: true,
+					doctype: IMPORT_LOG_DOCTYPE,
+					docname: expect.stringMatching(/^new-bank-statement-import-log-\d+$/),
+					fieldname: 'file'
+				})
+			)
+		})
+	})
+
 	/* ── Refusals that happen before any import log exists ──────────────────────────── */
 
 	/*
@@ -1024,6 +1515,170 @@ describe('BankStatementImporter', () => {
 			} finally {
 				window.removeEventListener('unhandledrejection', unhandled)
 			}
+		})
+
+		/*
+		 * The refusal happens before any import log exists, so the Previous Imports table has no row to
+		 * badge - the table can only ever badge what the server actually has. That left the form itself
+		 * as the only place a per-file failure could be shown, and until it was shown there, dismissing
+		 * the modal erased every trace that the statement had been rejected at all.
+		 */
+		describe('marks the refused file on the form itself', () => {
+
+			const failureIndicator = (): HTMLElement | null => {
+				const badge = screen
+					.queryAllByText('Failed')
+					.find((node) => node.getAttribute('data-slot') === 'badge')
+
+				return badge?.parentElement ?? null
+			}
+
+			it('names the file it refused, so the marker is about that file and not the form', async () => {
+				await refuseCreation()
+				await screen.findByRole('alertdialog')
+
+				const indicator = failureIndicator()
+				expect(indicator).not.toBeNull()
+				expect(indicator).toHaveTextContent('hdfc-statement-jan-2024.csv')
+				expect(indicator).toHaveTextContent('nothing was imported from it')
+			})
+
+			it('outlives the modal, which is the whole point of it', async () => {
+				await refuseCreation()
+
+				await userEvent.click(await screen.findByRole('button', { name: 'Dismiss' }))
+				await waitFor(() => {
+					expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+				})
+
+				expect(failureIndicator()).not.toBeNull()
+			})
+
+			it('is absent until something is actually refused', async () => {
+				const { container } = renderImporter({ logs: [] })
+				await chooseStatementFile(container, csvStatementFile())
+
+				expect(failureIndicator()).toBeNull()
+			})
+
+			it('retires when a different file is chosen, because it described the old one', async () => {
+				const { container } = await refuseCreation()
+
+				// Dismissed first because the modal is genuinely modal: Radix takes pointer events off the
+				// background, so the dropzone is unreachable until it is gone - as it should be.
+				await userEvent.click(await screen.findByRole('button', { name: 'Dismiss' }))
+				await waitFor(() => {
+					expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+				})
+				expect(failureIndicator()).not.toBeNull()
+
+				await chooseStatementFile(container, csvStatementFile('barclays-statement-feb-2024.csv'))
+
+				expect(failureIndicator()).toBeNull()
+			})
+
+			it('retires the moment a retry is dispatched, rather than lingering over it', async () => {
+				await refuseCreation()
+				await screen.findByRole('alertdialog')
+				expect(failureIndicator()).not.toBeNull()
+
+				await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+				await waitFor(() => {
+					expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+				})
+
+				/*
+				 * A retry that never settles. Asserting against a SUCCESSFUL retry would prove nothing
+				 * here, because success navigates away and unmounts the whole form - the marker would be
+				 * gone whether the dispatch cleared it or not. Leaving the retry in flight is what pins
+				 * the actual behaviour: the marker is retired when the attempt goes out.
+				 */
+				frappeCreateDoc.mockReset()
+				frappeCreateDoc.mockReturnValue(new Promise(() => undefined))
+
+				await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+				await waitFor(() => {
+					expect(failureIndicator()).toBeNull()
+				})
+				expect(screen.queryByText(new RegExp(DETAIL_SENTINEL))).not.toBeInTheDocument()
+			})
+
+			it('stays out of the log-keyed marker map, which has no key for it', async () => {
+				const { store } = await refuseCreation()
+				await screen.findByRole('alertdialog')
+
+				expect(failureIndicator()).not.toBeNull()
+				// The marker map is keyed by import log name and pruned against fetched rows; this refusal
+				// produced neither, so putting it there would key it against nothing.
+				expect(store.get(bankRecImportFailuresAtom)).toEqual({})
+			})
+		})
+
+		/*
+		 * One refusal, one presentation. The rejected promise reaches the modal, and the SAME object also
+		 * lands on the create hook's `error` member, which renders the inline banner - so the refusal
+		 * announced itself twice simultaneously, and the banner mounting behind the modal pushed the form
+		 * down while the modal was still being read.
+		 */
+		describe('reports the refusal once at a time, not three times at once', () => {
+
+			/*
+			 * Counted out of the DOM rather than through `getAllByRole('alert')`, and that is not a
+			 * shortcut - it is the only way to see this at all. Radix marks the background `aria-hidden`
+			 * while the modal is open, so a role query cannot observe the duplicate banner even when it is
+			 * rendered: every assertion phrased that way passes whether the bug is present or not
+			 * (confirmed by reverting the fix). The duplication is visual, so the DOM is what has to be
+			 * measured. `aria-hidden` hides a thing from assistive technology; it does not unpaint it, and
+			 * it certainly does not stop it pushing the rest of the form down as it mounts.
+			 */
+			const renderedBanners = (): HTMLElement[] =>
+				Array.from(document.querySelectorAll<HTMLElement>('[data-slot="alert"]'))
+
+			const isInsideDialog = (banner: HTMLElement): boolean =>
+				banner.closest('[data-slot="alert-dialog-content"]') !== null
+
+			it('does not repeat the modal\'s message in a banner behind it', async () => {
+				await refuseCreation()
+				await screen.findByRole('alertdialog')
+
+				// Exactly one banner is painted, and it is the modal's own.
+				const banners = renderedBanners()
+				expect(banners).toHaveLength(1)
+				expect(isInsideDialog(banners[0])).toBe(true)
+				expect(banners[0]).toHaveTextContent(REFUSAL)
+			})
+
+			it('hands the banner back the moment the modal is dismissed', async () => {
+				await refuseCreation()
+
+				await userEvent.click(await screen.findByRole('button', { name: 'Dismiss' }))
+				await waitFor(() => {
+					expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+				})
+
+				// Still exactly one - but now the page's own, which is what carries the server's words
+				// forward once the transient surface has gone.
+				const banners = renderedBanners()
+				expect(banners).toHaveLength(1)
+				expect(isInsideDialog(banners[0])).toBe(false)
+				expect(banners[0]).toHaveTextContent(REFUSAL)
+				expect(screen.getByRole('alert')).toHaveTextContent(REFUSAL)
+			})
+
+			/*
+			 * Suppression is by identity for exactly this reason: a stale value left in the dialog atom
+			 * must never silence a different, genuinely separate failure.
+			 */
+			it('never silences a DIFFERENT error just because the modal holds one', () => {
+				const shownInDialog = makeServerMessagesError('The modal is reporting this one')
+				const shownInBanner = makeServerMessagesError('This is a separate failure')
+
+				installCreateDocError(shownInBanner)
+				renderImporter({ logs: [], dialogError: shownInDialog })
+
+				expect(screen.getByText('This is a separate failure')).toBeInTheDocument()
+			})
 		})
 	})
 

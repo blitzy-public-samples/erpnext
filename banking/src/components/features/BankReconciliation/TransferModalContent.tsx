@@ -1,5 +1,5 @@
 import { useAtomValue, useSetAtom } from 'jotai'
-import { bankRecSelectedTransactionAtom, bankRecTransferModalAtom, bankRecUnreconcileModalAtom, SelectedBank, selectedBankAccountAtom } from './bankRecAtoms'
+import { bankRecSelectedTransactionsAtom, bankRecTransferModalAtom, bankRecUnreconcileModalAtom, SelectedBank, selectedBankAccountAtom } from './bankRecAtoms'
 import { DialogFooter, DialogClose } from '@/components/ui/dialog'
 import _ from '@/lib/translate'
 import { UnreconciledTransaction, useGetBankAccounts, useGetRuleForTransaction, useRefreshUnreconciledTransactions, useUpdateActionLog } from './utils'
@@ -33,7 +33,7 @@ const TransferModalContent = () => {
 
     const selectedBankAccount = useAtomValue(selectedBankAccountAtom)
 
-    const selectedTransaction = useAtomValue(bankRecSelectedTransactionAtom(selectedBankAccount?.name ?? ''))
+    const selectedTransaction = useAtomValue(bankRecSelectedTransactionsAtom)
 
     if (!selectedTransaction || !selectedBankAccount || selectedTransaction.length === 0) {
         return <div className='p-4'>
@@ -349,8 +349,8 @@ const InternalTransferForm = ({ selectedBankAccount, selectedTransaction }: { se
                             data-slot="form-item"
                             className="flex flex-col gap-2"
                         >
-                            <Label>{_("Attachments")}</Label>
-                            <FileDropzone files={files} setFiles={setFiles} />
+                            <Label htmlFor="transfer-attachments">{_("Attachments")}</Label>
+                            <FileDropzone files={files} setFiles={setFiles} inputId="transfer-attachments" />
                         </div>
                     </div>
                 </div>

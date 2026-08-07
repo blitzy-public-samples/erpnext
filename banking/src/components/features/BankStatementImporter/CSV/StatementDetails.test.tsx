@@ -352,6 +352,43 @@ describe('StatementDetails', () => {
 			expect(rowLabelled('Closing Balance as of 31st January 2024')).toHaveTextContent('₹ 152,300.75')
 		})
 
+		it("renders every statement figure in the STATEMENT's currency, never the company's", () => {
+			/*
+			 * The discriminating case for the same code the test above exercises. There, the statement's
+			 * currency and the company's happen to agree, so a screen formatting with the company default
+			 * would look correct. Here they disagree: the log is denominated in the alternate currency
+			 * while the company is on the base one, and EVERY figure the screen formats - the three
+			 * summary totals and both amount columns of the preview - has to follow the log.
+			 *
+			 * The absence assertions carry as much weight as the presence ones: a partial fix that
+			 * corrected the summary and left the preview reading the company default would satisfy the
+			 * positive checks alone, and that split is exactly what was reported - contradictory
+			 * currencies on one screen describing one file.
+			 */
+			renderStatementDetails(
+				makeStatementDetails({ doc: makeImportLog({ currency: TEST_ALTERNATE_CURRENCY }) })
+			)
+
+			expect(rowLabelled('Total Debits')).toHaveTextContent('$ 15,900.25')
+			expect(rowLabelled('Total Credits')).toHaveTextContent('$ 48,250.50')
+			expect(rowLabelled('Closing Balance as of 31st January 2024')).toHaveTextContent('$ 152,300.75')
+
+			const preview = tableWithCaption('Transactions to be imported into the system')
+			const firstRow = within(preview).getByText('NEFT credit from ACME Traders').closest('tr')
+			expect(within(firstRow as HTMLElement).getAllByRole('cell').map((cell) => cell.textContent)).toEqual([
+				'1',
+				'05-01-2024',
+				'NEFT credit from ACME Traders',
+				'NEFT/2024/000145',
+				'$ 0.00',
+				'$ 48,250.50'
+			])
+
+			expect(rowLabelled('Total Debits').textContent).not.toContain('₹')
+			expect(rowLabelled('Total Credits').textContent).not.toContain('₹')
+			expect(preview.textContent).not.toContain('₹')
+		})
+
 		it('lists every parsed transaction, in the order the server returned them', () => {
 			renderStatementDetails(makeStatementDetails())
 
@@ -722,6 +759,161 @@ describe('StatementDetails', () => {
 		})
 	})
 
+	/*
+	 * An import is a single server-side operation that keeps running whether or not anyone is watching,
+	 * so its promise can settle long after the reviewer has clicked Back. It was reported settling into
+	 * a screen that no longer existed: rewriting the workbench's persisted date range, raising a success
+	 * toast over whatever route the reviewer had moved to, and pushing a navigation that buried the
+	 * history entry they had deliberately gone back to.
+	 *
+	 * The line these tests pin is not "ignore everything after unmount" - that would silently discard
+	 * the only record of a refusal, since the import-log schema has no error field and a failed import
+	 * rolls back. It is the distinction between a fact about the FILE, which is written to a store and
+	 * read wherever the reviewer happens to be, and a change to what the reviewer is LOOKING AT, which
+	 * belongs only to the screen that asked for it.
+	 *
+	 * Each test drives the outcome by hand through a deferred promise, because the whole question is
+	 * what happens in the window between dispatch and resolution.
+	 */
+	describe('Issue 5 — an import outcome may not reach a screen the reviewer has left', () => {
+		type Deferred = {
+			resolve: (value: { docs: BankStatementImportLog[] }) => void
+			reject: (reason: unknown) => void
+		}
+
+		/** Hands back the settle controls for each successive `call`, in dispatch order. */
+		const deferImports = (): Deferred[] => {
+			const deferred: Deferred[] = []
+			importCall.mockImplementation(() => new Promise((resolve, reject) => {
+				deferred.push({ resolve: resolve as Deferred['resolve'], reject })
+			}))
+			return deferred
+		}
+
+		const completedResponse = () => ({
+			docs: [makeImportLog({
+				status: 'Completed',
+				start_date: SAVED_START_DATE,
+				end_date: SAVED_END_DATE
+			})]
+		})
+
+		it('applies the whole outcome while the reviewer is still on the screen', async () => {
+			// The control the guards are measured against: without it, every assertion below could be
+			// satisfied by a screen that does nothing at all on success.
+			const deferred = deferImports()
+
+			const { store } = renderStatementDetails(makeStatementDetails())
+			await clickImport()
+			await waitFor(() => expect(deferred).toHaveLength(1))
+
+			await act(async () => { deferred[0].resolve(completedResponse()) })
+
+			await waitFor(() => expect(screen.getByText(RECONCILIATION_SENTINEL)).toBeInTheDocument())
+			expect(store.get(bankRecDateAtom)).toEqual({
+				fromDate: SAVED_START_DATE,
+				toDate: SAVED_END_DATE
+			})
+			expect(toastSuccess).toHaveBeenCalledWith('Bank statement imported.')
+		})
+
+		it('leaves the reviewer where they went and says nothing when a success lands after they leave', async () => {
+			const deferred = deferImports()
+
+			const { store, unmount } = renderStatementDetails(makeStatementDetails())
+			await clickImport()
+			await waitFor(() => expect(deferred).toHaveLength(1))
+
+			// Leaving the page. The request is deliberately NOT cancelled - the server is committing
+			// either way, and abandoning the client's half would lose the outcome entirely.
+			unmount()
+
+			await act(async () => { deferred[0].resolve(completedResponse()) })
+
+			// The persisted range is the reviewer's own setting, and a screen they left may not rewrite it.
+			expect(store.get(bankRecDateAtom)).toEqual({
+				fromDate: PREVIOUS_START_DATE,
+				toDate: PREVIOUS_END_DATE
+			})
+			expect(toastSuccess).not.toHaveBeenCalled()
+			expect(toastError).not.toHaveBeenCalled()
+		})
+
+		it('still retires a stale failure marker for a file that has now imported cleanly', async () => {
+			/*
+			 * The half that must NOT be suppressed. The marker is a claim about the file, and the file has
+			 * just imported, so leaving it standing would keep a red Failed badge against a log the server
+			 * reports as Completed - the exact contradiction the marker is supposed to avoid.
+			 */
+			const deferred = deferImports()
+			const details = makeStatementDetails()
+
+			const { store, unmount } = renderStatementDetails(details, (store) => {
+				store.set(bankRecImportFailuresAtom, makeImportFailures(details.doc))
+			})
+			expect(Object.keys(store.get(bankRecImportFailuresAtom))).toContain(details.doc.name)
+
+			await clickImport()
+			await waitFor(() => expect(deferred).toHaveLength(1))
+			unmount()
+
+			await act(async () => { deferred[0].resolve(completedResponse()) })
+
+			expect(Object.keys(store.get(bankRecImportFailuresAtom))).not.toContain(details.doc.name)
+		})
+
+		it('records a refusal that lands after they leave, without ambushing them with it', async () => {
+			/*
+			 * The refusal is the ONLY record that this file was rejected - the import rolled back and the
+			 * log schema carries no error field - so it is written whatever became of this screen. What is
+			 * withheld is the interruption: no modal over an unrelated route, no toast. The reviewer meets
+			 * it as a red marker against that file in the importer list, which is where they would look.
+			 */
+			const deferred = deferImports()
+			const details = makeStatementDetails()
+			const refusal = makeServerMessagesError('The bank account is disabled. Please enable it')
+
+			const { store, unmount } = renderStatementDetails(details)
+			await clickImport()
+			await waitFor(() => expect(deferred).toHaveLength(1))
+			unmount()
+
+			await act(async () => { deferred[0].reject(refusal) })
+
+			expect(store.get(bankRecImportFailuresAtom)[details.doc.name]).toBe(refusal)
+			expect(store.get(bankRecErrorDialogAtom)).toBeNull()
+			expect(toastError).not.toHaveBeenCalled()
+		})
+
+		it('ignores an outcome entirely once a newer attempt has superseded it', async () => {
+			/*
+			 * Two dispatches, and the FIRST one answers last. Its answer describes a request the screen has
+			 * stopped waiting on, so it may not write the marker either - a superseded refusal would
+			 * otherwise mark a file whose live attempt is still running.
+			 */
+			const deferred = deferImports()
+			const details = makeStatementDetails()
+			const refusal = makeServerMessagesError('Stale attempt')
+
+			const { store } = renderStatementDetails(details)
+			await clickImport()
+			await clickImport()
+			await waitFor(() => expect(deferred).toHaveLength(2))
+
+			await act(async () => { deferred[0].reject(refusal) })
+
+			expect(store.get(bankRecImportFailuresAtom)).toEqual({})
+			expect(store.get(bankRecErrorDialogAtom)).toBeNull()
+			expect(toastError).not.toHaveBeenCalled()
+
+			// The live attempt still owns the screen and its answer is applied in full.
+			await act(async () => { deferred[1].resolve(completedResponse()) })
+
+			await waitFor(() => expect(screen.getByText(RECONCILIATION_SENTINEL)).toBeInTheDocument())
+			expect(toastSuccess).toHaveBeenCalledWith('Bank statement imported.')
+		})
+	})
+
 
 	/*
 	 * THE SERVER'S `progress` IS A PERCENTAGE, NOT A ROW COUNT. `insert_transactions` publishes
@@ -736,11 +928,11 @@ describe('StatementDetails', () => {
 	/*
 	 * The bar's FILL, read off the indicator's inline transform, which is `translateX(-(100 - value)%)`.
 	 *
-	 * Asserted here rather than through `aria-valuenow`, because the shared `ui/progress` primitive
-	 * destructures `value` and never forwards it to the Radix root: the root therefore always reports
-	 * itself indeterminate with no `aria-valuenow` at all, whatever value it is given. That is a defect
-	 * in a design-system primitive this project treats as reference-only, so it is documented rather
-	 * than fixed, and the transform is what remains observable.
+	 * The transform and the announced value are now two readings of the same figure: the shared
+	 * `ui/progress` primitive used to destructure `value` and never hand it to the Radix root, so the bar
+	 * drew a percentage while reporting itself indeterminate with no `aria-valuenow` at all. Both are
+	 * asserted - the transform for what is drawn, and `aria-valuenow` / `aria-valuetext` for what is
+	 * announced - because a bar that draws 67% and says "loading" is worse than one that draws nothing.
 	 */
 	const indicatorTransform = (): string | undefined =>
 		screen
@@ -775,6 +967,29 @@ describe('StatementDetails', () => {
 			expect(screen.getByRole('progressbar')).toBeInTheDocument()
 			expect(indicatorTransform()).toBe('translateX(-100%)')
 			expect(screen.getByText('Importing... 0% complete')).toBeInTheDocument()
+		})
+
+		it('announces the figure it draws, with the wording shown beside it', async () => {
+			await startAnImportThatStaysInFlight()
+
+			act(() => {
+				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 67 })
+			})
+
+			const bar = screen.getByRole('progressbar')
+
+			expect(bar).toHaveAttribute('data-state', 'loading')
+			expect(bar).toHaveAttribute('aria-valuenow', '67')
+			expect(bar).toHaveAccessibleName('Statement import progress')
+			expect(bar).toHaveAttribute('aria-valuetext', 'Importing... 67% complete')
+
+			act(() => {
+				emitFrappeEvent(IMPORT_PROGRESS_CHANNEL, { progress: 100, total: 3 })
+			})
+
+			expect(bar).toHaveAttribute('data-state', 'complete')
+			expect(bar).toHaveAttribute('aria-valuenow', '100')
+			expect(bar).toHaveAttribute('aria-valuetext', 'Imported 3 transactions.')
 		})
 
 		it('reports each pushed figure as a PERCENTAGE, not a transaction count', async () => {

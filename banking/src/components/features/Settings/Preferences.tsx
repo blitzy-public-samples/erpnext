@@ -181,12 +181,22 @@ const ThemeSwitcher = () => {
 
     return <div className="flex flex-col gap-3 pb-3">
         <div className="flex flex-col">
-            <Label className="text-p-base text-ink-gray-6">{_("Theme")}</Label>
-            <p className="text-p-sm text-ink-gray-5">
+            {/* Deliberately NOT a <Label>. Every other row on this panel labels exactly one form
+                control and points `htmlFor` at it, but "Theme" heads a set of THREE toggle buttons,
+                so there is no single control it could reference. A <label> with neither a `for`
+                attribute nor a nested form control labels nothing at all: it was reported by the
+                accessibility audit as "No label associated with a form field" and gave the theme
+                buttons no group name. Rendering it as a plain span and wiring it to the button group
+                through `role="group"` + `aria-labelledby` names all three buttons collectively, which
+                is what was actually intended. The classes reproduce the visual output `Label` gave
+                after tailwind-merge resolved its base `text-base`/`text-ink-gray-5` against the
+                overrides passed here, so the rendering is unchanged. */}
+            <span id="theme-switcher-label" className="flex items-center gap-2 select-none text-p-base text-ink-gray-6">{_("Theme")}</span>
+            <p id="theme-switcher-description" className="text-p-sm text-ink-gray-5">
                 {_("Switch between light, dark, or system theme")}
             </p>
         </div>
-        <div className="flex gap-3">
+        <div className="flex gap-3" role="group" aria-labelledby="theme-switcher-label" aria-describedby="theme-switcher-description">
             {themeCards.map((option) => {
                 const selected = theme === option.value
 

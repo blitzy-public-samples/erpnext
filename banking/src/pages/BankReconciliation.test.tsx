@@ -216,5 +216,101 @@ describe('BankReconciliation page', () => {
 			})
 			expect(screen.getByRole('tabpanel')).toBeInTheDocument()
 		})
+
+		it('watches the header for size changes rather than measuring it once', async () => {
+			/*
+			 * The measurement used to be taken in a layout effect with an empty dependency array, which ran
+			 * BEFORE the account picker and balance tiles had data - understating the real header by more
+			 * than 100px - and never ran again. Observing the header is what makes the later, populated
+			 * header the one the panels are sized from.
+			 */
+			const observed: Element[] = []
+			const original = globalThis.ResizeObserver
+			globalThis.ResizeObserver = class {
+				constructor(private callback: () => void) { }
+				observe(target: Element) {
+					observed.push(target)
+					this.callback()
+				}
+				unobserve() { }
+				disconnect() { }
+			} as unknown as typeof ResizeObserver
+
+			try {
+				renderPage()
+
+				await waitFor(() => {
+					expect(screen.getAllByRole('tab')).toHaveLength(5)
+				})
+				expect(observed.length).toBeGreaterThan(0)
+			} finally {
+				globalThis.ResizeObserver = original
+			}
+		})
+
+		it('recomputes on a window resize instead of keeping the previous viewport', async () => {
+			// Nothing listened for resizes before, so dragging the window left every panel sized for the
+			// viewport it was first painted in.
+			renderPage()
+
+			await waitFor(() => {
+				expect(screen.getAllByRole('tab')).toHaveLength(5)
+			})
+
+			Object.defineProperty(window, 'innerHeight', { value: 640, configurable: true, writable: true })
+			window.dispatchEvent(new Event('resize'))
+
+			// The page must survive the recomputation and keep its panel mounted; the height itself is a
+			// prop handed down to the workbench, which is exercised by that component's own suite.
+			await waitFor(() => {
+				expect(screen.getByRole('tabpanel')).toBeInTheDocument()
+			})
+
+			Object.defineProperty(window, 'innerHeight', { value: 768, configurable: true, writable: true })
+		})
+	})
+
+	describe('reaching the rest of the workflow', () => {
+
+		it('scrolls its own tab strip rather than letting a tab escape the viewport', async () => {
+			/*
+			 * The five triggers are `whitespace-nowrap` and need about 1044px between them. With the strip's
+			 * overflow visible, the surplus widened the DOCUMENT below roughly 1076px - 36px at 1024, 292px
+			 * at 768 - and the last tab ended up partly or wholly outside the viewport with no way to reach
+			 * it. Keeping the overflow inside the strip is what makes every tab reachable at every width.
+			 */
+			renderPage()
+
+			await waitFor(() => {
+				expect(screen.getAllByRole('tab')).toHaveLength(5)
+			})
+
+			const list = screen.getByRole('tablist')
+			expect(list.className).toContain('overflow-x-auto')
+			expect(list.className).toContain('max-w-full')
+		})
+
+		it('offers a route to the statement importer from a populated workbench', async () => {
+			// The importer used to be reachable only from the no-transactions empty state, so an account
+			// with rows in it offered no route to importing more.
+			renderPage()
+
+			await waitFor(() => {
+				expect(screen.getAllByRole('tab')).toHaveLength(5)
+			})
+
+			/*
+			 * Two routes to the importer coexist: this one in the header, always available, and the
+			 * workbench's own empty-state call to action, which only appears when the account has nothing
+			 * to reconcile. The header one is the icon button beside Settings, so it is identified by being
+			 * a tooltip trigger.
+			 */
+			const routes = screen.getAllByRole('link', { name: 'Import Bank Statement' })
+			expect(routes.length).toBeGreaterThan(0)
+			for (const route of routes) {
+				expect(route).toHaveAttribute('href', '/statement-importer')
+			}
+			expect(routes.some((route) => route.getAttribute('data-slot') === 'tooltip-trigger')).toBe(true)
+		})
 	})
 })

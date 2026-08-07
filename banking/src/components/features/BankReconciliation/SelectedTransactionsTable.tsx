@@ -1,16 +1,14 @@
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import _ from '@/lib/translate'
 import { useAtomValue } from 'jotai'
-import { bankRecSelectedTransactionAtom, selectedBankAccountAtom } from './bankRecAtoms'
+import { bankRecSelectedTransactionsAtom } from './bankRecAtoms'
 import { formatDate } from '@/lib/date'
 import { formatCurrency } from '@/lib/numbers'
 import { ArrowDownRight, ArrowUpRight } from 'lucide-react'
 
 const SelectedTransactionsTable = () => {
 
-    const selectedBankAccount = useAtomValue(selectedBankAccountAtom)
-
-    const transactions = useAtomValue(bankRecSelectedTransactionAtom(selectedBankAccount?.name ?? ''))
+    const transactions = useAtomValue(bankRecSelectedTransactionsAtom)
     return (
         <Table>
             <TableHeader>

@@ -3,7 +3,7 @@ import { MissingFiltersBanner } from "./MissingFiltersBanner"
 import { bankRecDateAtom, bankRecUnreconcileModalAtom, selectedBankAccountAtom } from "./bankRecAtoms"
 import { formatDate } from "@/lib/date"
 import { ListView, type ListViewColumnMeta } from "@/components/ui/list-view"
-import { formatCurrency, getCurrencyFormatInfo } from "@/lib/numbers"
+import { formatCurrency, getCurrencyFormatInfo, parseCurrencyInput } from "@/lib/numbers"
 import { getCompanyCurrency } from "@/lib/company"
 import { ArrowDownRight, ArrowUpRight, CheckCircle2, ChevronDown, DollarSign, ExternalLink, ImportIcon, ListIcon, Search, Undo2, XCircle } from "lucide-react"
 import ErrorBanner from "@/components/ui/error-banner"
@@ -195,8 +195,20 @@ const BankTransactionListView = () => {
 
         return data.message.filter((transaction) => {
 
-            if (search && !transaction.description?.toLowerCase().includes(search.toLowerCase())) {
-                return false
+            /*
+             * Search matches the reference number as well as the description. This list already shows a
+             * "Reference #" column, so a reviewer chasing a cheque or UTR number off a paper statement
+             * would type it in, see the number sitting in front of them in the table, and still get an
+             * empty result - the one field they were most likely to search by was the one field the
+             * filter ignored. Either field matching is enough.
+             */
+            if (search) {
+                const needle = search.toLowerCase()
+                const matchesDescription = transaction.description?.toLowerCase().includes(needle)
+                const matchesReference = transaction.reference_number?.toLowerCase().includes(needle)
+                if (!matchesDescription && !matchesReference) {
+                    return false
+                }
             }
 
             if (typeFilter !== 'All') {
@@ -327,6 +339,8 @@ const Filters = ({
 }: FilterProps) => {
     const bankAccount = useAtomValue(selectedBankAccountAtom)
 
+    const [amountFilterError, setAmountFilterError] = useState<string | null>(null)
+
     const currency = bankAccount?.account_currency ?? getCompanyCurrency(bankAccount?.company ?? '')
     const currencySymbol = getCurrencySymbol(currency)
     const formatInfo = getCurrencyFormatInfo(currency)
@@ -335,11 +349,17 @@ const Filters = ({
 
     return <div className="flex py-2 w-full gap-2">
         <InputGroup variant='outline'>
-            <label className="sr-only">{_("Search transactions")}</label>
+            {/* The label used to carry neither `htmlFor` nor the input inside it, so it named nothing and
+                the field fell back to its placeholder. Ids are prefixed for this list specifically: the
+                workbench tab renders a search box of its own, and both can be mounted at once. */}
+            <label className="sr-only" htmlFor="bank-txn-list-search">{_("Search by description or reference")}</label>
             <InputGroupAddon>
                 <Search className="w-4 h-4 text-ink-gray-5" />
             </InputGroupAddon>
             <Input
+                id="bank-txn-list-search"
+                name="bank-txn-list-search"
+                aria-label={_("Search by description or reference")}
                 placeholder={_("Search")} type='search' onChange={onSearchChange} variant='outline' defaultValue={search}
                 className="border-none px-0 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0" />
             <InputGroupAddon align='inline-end'>
@@ -348,8 +368,11 @@ const Filters = ({
         </InputGroup>
 
         <div className="w-[25%]">
-            <label className="sr-only">{_("Filter by amount")}</label>
+            <label className="sr-only" htmlFor="bank-txn-list-amount-filter">{_("Filter by amount")}</label>
             <CurrencyInput
+                id="bank-txn-list-amount-filter"
+                name="bank-txn-list-amount-filter"
+                aria-label={_("Filter by amount")}
                 groupSeparator={groupSeparator}
                 decimalSeparator={decimalSeparator}
                 placeholder={`${currencySymbol}0${decimalSeparator}00`}
@@ -357,23 +380,49 @@ const Filters = ({
                 value={amountFilter.stringValue}
                 maxLength={12}
                 decimalScale={2}
+                /* The library's k/m/b shorthand is off, for the same reason it is off on the workbench
+                   filter: a bank amount is typed in full, and left on it a stray letter multiplies the
+                   figure. `12ab34` was read as `12b34` and filtered on 120,000,000,003. */
+                disableAbbreviations
                 prefix={currencySymbol}
+                aria-invalid={amountFilterError !== null}
+                aria-describedby={amountFilterError ? 'bank-txn-list-amount-filter-error' : undefined}
                 onValueChange={(v, _n, values) => {
-                    // If the input ends with a decimal or a decimal with trailing zeroes, store the string since we need the user to be able to type the decimals.
-                    // When the user eventually types the decimals or blurs out, the value is formatted anyway.
-                    // Otherwise store the float value
-                    // Check if the value ends with a decimal or a decimal with trailing zeroes
-                    const isDecimal = v?.endsWith(decimalSeparator) || v?.endsWith(decimalSeparator + '0')
-                    const newValue = isDecimal ? v : values?.float ?? ''
+                    /*
+                     * The same strict parse the workbench filter uses. Storing "the string while a
+                     * decimal is being typed, otherwise the float" and then running `Number()` over that
+                     * union is what produced `NaN` on a grouped value and inflated 1.23 into
+                     * 1,230,000,000. See `parseCurrencyInput`.
+                     */
+                    const parsed = parseCurrencyInput({ text: v, float: values?.float, decimalSeparator })
+
+                    // A negative can never match: the filter compares against withdrawal and deposit,
+                    // both of which the server stores as positive magnitudes. So it is refused out loud
+                    // rather than accepted and quietly ignored.
+                    const isNegative = parsed.value !== null && parsed.value < 0
+
+                    setAmountFilterError(
+                        parsed.isInvalid ? _("Enter an amount, for example {0}", [`1${decimalSeparator}00`])
+                            : isNegative ? _("Amounts are matched by magnitude, so a negative amount cannot match a transaction.")
+                                : null
+                    )
+
                     setAmountFilter({
-                        value: Number(newValue),
-                        stringValue: newValue
+                        // Only a usable, non-negative number filters anything; 0 means "no filter".
+                        value: parsed.value !== null && !isNegative ? parsed.value : 0,
+                        stringValue: parsed.text
                     })
                 }}
                 // @ts-expect-error - CurrencyInputProps doesn't have a variant prop but Input does
                 variant={"outline"}
                 customInput={Input}
             />
+            {amountFilterError && <p
+                id="bank-txn-list-amount-filter-error"
+                role="alert"
+                className="text-xs text-ink-red-3 text-wrap">
+                {amountFilterError}
+            </p>}
         </div>
         <div className="w-[25%]">
             <DropdownMenu>

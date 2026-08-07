@@ -47,7 +47,7 @@ vi.mock('frappe-react-sdk', () => createFrappeSDKMock())
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { Dialog, DialogContent } from '@/components/ui/dialog'
 import RecordPaymentModalContent from './RecordPaymentModalContent'
-import { bankRecSelectedTransactionAtom, selectedBankAccountAtom } from './bankRecAtoms'
+import { bankRecSelectedTransactionsAtom, selectedBankAccountAtom } from './bankRecAtoms'
 import { makePanelBank } from '@/test/renderPanel'
 
 const OUTSTANDING_ENDPOINT =
@@ -195,7 +195,7 @@ const renderFlow = ({
 	const bank = makePanelBank()
 	const store = createStore()
 	store.set(selectedBankAccountAtom, bank)
-	store.set(bankRecSelectedTransactionAtom(bank.name), [TRANSACTION()])
+	store.set(bankRecSelectedTransactionsAtom, [TRANSACTION()])
 
 	const user = userEvent.setup()
 
@@ -282,20 +282,39 @@ describe('allocating a recorded payment across invoices', () => {
 			expect(picker()).toHaveTextContent(/₹ 4,825.50/)
 		})
 
-		it('QUIRK - leaves a blank where the party NAME should be', async () => {
-			// The heading interpolates `party_name`, but the payment form's defaults set `party` and
-			// never `party_name` - not from the matching rule, and not from the party lookup. So the
-			// sentence renders as "Unpaid invoices from  for ₹ 4,825.50." with a gap, even though the
-			// party is perfectly well known and is what the invoices were fetched for.
-			//
-			// Pinned rather than fixed: the fix belongs in the payment form's default values, which the
-			// plan does not modify, and the amount plus the invoice list already identify the context.
+		it('names the party in the heading rather than leaving a gap where the name should be', async () => {
+			/*
+			 * This heading interpolates `party_name`, which the payment form's defaults do not set -
+			 * neither from the matching rule nor from the party lookup - so the sentence used to render
+			 * as "Unpaid invoices from  for ₹ 4,825.50." with a hole in it, even though the party was
+			 * perfectly well known and was what the invoices had just been fetched for.
+			 *
+			 * It now falls back to the party ID, which is always present. That is the same idiom the
+			 * party fields on this form already use (`party_name !== party ? party_name : undefined`),
+			 * so the sentence always names somebody.
+			 */
 			renderFlow()
 
 			await screen.findByText('Select Invoices')
 
-			expect(picker()).toHaveTextContent('Unpaid invoices from for ₹ 4,825.50.')
-			expect(picker()).not.toHaveTextContent('Unpaid invoices from ACME Traders')
+			expect(picker()).toHaveTextContent('Unpaid invoices from ACME Traders for ₹ 4,825.50.')
+			expect(picker()).not.toHaveTextContent('Unpaid invoices from for')
+		})
+
+		it('reads the amount off the side of the entry that carries it', async () => {
+			/*
+			 * This fixture is a WITHDRAWAL, so the form is a payment (`payment_type: 'Pay'`) and the
+			 * figure lives in `paid_amount`. The heading used to read `paid_amount` unconditionally,
+			 * which is right here and wrong for a receipt, where this form fills `received_amount`
+			 * instead - the same distinction the allocation calls in this component already make.
+			 */
+			renderFlow()
+
+			await screen.findByText('Select Invoices')
+
+			expect(picker()).toHaveTextContent('for ₹ 4,825.50.')
+			// Not a zero, which is what reading the empty side of the entry would have produced.
+			expect(picker()).not.toHaveTextContent('for ₹ 0.00.')
 		})
 
 		it('QUIRK - stays shut when the rule names no account', async () => {
@@ -373,6 +392,96 @@ describe('allocating a recorded payment across invoices', () => {
 			await screen.findByText('Select Invoices')
 
 			expect(within(picker()).getByText('Not permitted')).toBeInTheDocument()
+		})
+
+		it('names the supplier-invoice column after the field it actually renders', async () => {
+			/*
+			 * That column renders `bill_no`, which the server fills ONLY for a Purchase Invoice and which
+			 * ERPNext labels "Supplier Invoice No". Calling it "Invoice No" misdirected the reviewer
+			 * twice over: allocating a customer receipt they read a column of dashes under a heading
+			 * promising invoice numbers, while the invoice number itself sat under "Name".
+			 */
+			renderFlow()
+
+			await screen.findByText('Select Invoices')
+
+			expect(within(picker()).getByText('Supplier Invoice No')).toBeInTheDocument()
+			expect(within(picker()).queryByText('Invoice No')).not.toBeInTheDocument()
+		})
+
+		it("keeps ERPNext's own labels for the columns it already named correctly", async () => {
+			/*
+			 * "Type" and "Name" are the labels the Payment Entry Reference DocType itself gives
+			 * `reference_doctype` and `reference_name`, and the Desk shows the same words over the same
+			 * data. Renaming them to something that reads better would have made this view disagree
+			 * with the rest of the product, so they are pinned as they are.
+			 */
+			renderFlow()
+
+			await screen.findByText('Select Invoices')
+
+			for (const header of ['Type', 'Name', 'Due Date', 'Grand Total', 'Outstanding']) {
+				expect(within(picker()).getByText(header)).toBeInTheDocument()
+			}
+		})
+
+		it('renders a dash when the server sends no supplier invoice number at all', async () => {
+			// The server returns an EMPTY STRING for a Sales Invoice, which `??` let through as a blank
+			// cell; only `undefined` reached the dash.
+			renderFlow({
+				invoices: [
+					{ ...INVOICE_A, bill_no: '' },
+					{ ...INVOICE_B, bill_no: undefined }
+				]
+			})
+
+			await screen.findByText('Select Invoices')
+
+			expect(within(picker()).getAllByText('-')).toHaveLength(2)
+		})
+
+		it("formats every figure in the entry's own currency rather than the system default", async () => {
+			// The picker sits inside a payment for one bank account, so a figure shown in a different
+			// currency to the entry it is being allocated against is simply wrong.
+			renderFlow()
+
+			await screen.findByText('Select Invoices')
+
+			// Both the per-row figures and the running total carry the account's symbol.
+			expect(within(picker()).getByText('₹ 1,825.50')).toBeInTheDocument()
+			expect(picker()).not.toHaveTextContent('$')
+		})
+
+		it('gives the select-all checkbox a name instead of leaving it unlabelled', async () => {
+			renderFlow()
+
+			await screen.findByText('Select Invoices')
+
+			expect(within(picker()).getByRole('checkbox', { name: 'Select all' })).toBeInTheDocument()
+		})
+
+		it('names each row checkbox after the invoice it selects, not by row number', async () => {
+			// The header checkbox was named but the per-row ones were not, so a screen-reader user could
+			// hear "checkbox" with no indication of which invoice they were about to allocate against.
+			renderFlow()
+
+			await screen.findByText('Select Invoices')
+
+			expect(within(picker()).getByRole('checkbox', { name: 'Select invoice ACC-PINV-2026-00001' }))
+				.toBeInTheDocument()
+			expect(within(picker()).getByRole('checkbox', { name: 'Select invoice ACC-PINV-2026-00002' }))
+				.toBeInTheDocument()
+		})
+
+		it('renders a dash for an absent due date, the same as for an absent invoice number', async () => {
+			// A Journal Entry has no due date. A blank cell reads as a rendering failure; the cell beside
+			// it already said "-" for the same absence, so the two now agree.
+			renderFlow({ invoices: [{ ...INVOICE_A, due_date: '', bill_no: '' }] })
+
+			await screen.findByText('Select Invoices')
+
+			// Two dashes on the one row: Supplier Invoice No and Due Date.
+			expect(within(picker()).getAllByText('-')).toHaveLength(2)
 		})
 	})
 
@@ -490,6 +599,48 @@ describe('allocating a recorded payment across invoices', () => {
 			expect(within(allocationTable()).getAllByText('₹ 3,000.00')).toHaveLength(2)
 			expect(within(allocationTable()).getByText('₹ 2,500.00')).toBeInTheDocument()
 			expect(within(allocationTable()).getByText('₹ 1,825.50')).toBeInTheDocument()
+		})
+
+		it('names the supplier-invoice column correctly in the FORM table too, not just the picker', async () => {
+			/*
+			 * The form's own allocation table carried the identical mislabel the picker did: a header
+			 * reading "Invoice No" over a cell rendering `bill_no`. The ERPNext document number lives in
+			 * the "Reference Document" cell beside it, so a reviewer looking for the invoice number was
+			 * being pointed at the wrong column on BOTH surfaces.
+			 */
+			const { user } = renderFlow()
+
+			await screen.findByText('Select Invoices')
+			await allocate(user, ['ACC-PINV-2026-00001'])
+
+			// Asserted on the header ROW, because "Allocated" also appears as the hidden label of the
+			// per-row amount field further down the same table.
+			const headers = Array.from(allocationTable().querySelectorAll('thead th'))
+				.map((cell) => (cell.textContent || '').trim())
+
+			expect(headers).toContain('Supplier Invoice No')
+			expect(headers).not.toContain('Invoice No')
+			// The columns it already named correctly are left alone.
+			expect(headers).toContain('Reference Document')
+			expect(headers).toContain('Allocated')
+		})
+
+		it('renders a dash in the form table for an absent supplier invoice number or due date', async () => {
+			/*
+			 * The server sends an empty string for a Sales Invoice, which `??` let through as a blank cell.
+			 *
+			 * Note the allocation answer has to be overridden as well as the picker's list: these rows come
+			 * from the SERVER's re-allocated document, not from the list the reviewer chose from.
+			 */
+			const bare = { ...INVOICE_A, bill_no: '', due_date: '' }
+
+			const { user } = renderFlow({ invoices: [bare] })
+
+			await screen.findByText('Select Invoices')
+			// The answer has to be passed through `allocate`, which sets the post-call mock itself.
+			await allocate(user, ['ACC-PINV-2026-00001'], makeAllocationAnswer([bare]))
+
+			expect(within(allocationTable()).getAllByText('-')).toHaveLength(2)
 		})
 
 		it('shows each allocated invoice with the figures the server returned', async () => {

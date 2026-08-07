@@ -1,7 +1,7 @@
 import { useDocType } from "@/hooks/useDocType";
 import { getSystemDefault, slug } from "@/lib/frappe";
 import { Filter, useFrappeGetCall } from "frappe-react-sdk"
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { canCreateDocument } from "@/lib/permissions";
 import { useDebounceValue } from "usehooks-ts";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
@@ -102,6 +102,9 @@ export interface LinkFieldComboboxProps {
     /** Button Class name */
     buttonClassName?: string,
     size?: 'sm' | 'md' | 'lg',
+    /** Marks the trigger `aria-required` so the constraint the label's asterisk draws is also
+     *  programmatically determinable. Forwarded from `LinkFormField`'s `isRequired`. */
+    isRequired?: boolean,
 }
 const LinkFieldCombobox = ({
     doctype,
@@ -119,7 +122,8 @@ const LinkFieldCombobox = ({
     limit,
     useInForm,
     buttonClassName,
-    size = 'md'
+    size = 'md',
+    isRequired
 }: LinkFieldComboboxProps) => {
 
     const pageLimit = useMemo(() => limit || getSystemDefault('link_field_results_limit') || 20, [limit])
@@ -132,6 +136,16 @@ const LinkFieldCombobox = ({
     const [open, setOpen] = useState(false)
 
     const [searchInput, setSearchInput] = useDebounceValue('', 400)
+
+    /*
+     * Cancel the pending debounce when this field goes away.
+     *
+     * `useDebounceValue` does attempt this, but it cancels a SECOND debounce instance it builds in an
+     * effect rather than the one it actually calls, so a keystroke typed within the 400ms before unmount
+     * still lands its trailing edge - setting state on a component that no longer exists. The wrapper it
+     * returns cancels the real instance.
+     */
+    useEffect(() => () => setSearchInput.cancel(), [setSearchInput])
 
     const { data: linkTitleData } = useFrappeGetCall('frappe.client.get_value', {
         doctype,
@@ -227,6 +241,8 @@ const LinkFieldCombobox = ({
         disabled: disabled || readOnly,
         "aria-expanded": open,
         "aria-readonly": readOnly,
+        // Exposes the constraint the label's asterisk draws. See `isRequired` on the prop interface.
+        "aria-required": isRequired || undefined,
         className: cn("w-full justify-between font-normal group border border-transparent outline-none",
             "data-[state=open]:bg-surface-white data-[state=open]:border-outline-gray-4 data-[state=open]:shadow-sm",
             readOnly ? "bg-surface-gray-1" : "",

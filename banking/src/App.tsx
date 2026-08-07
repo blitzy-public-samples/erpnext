@@ -7,6 +7,8 @@ import BankStatementImporterContainer from '@/pages/BankStatementImporterContain
 import { TooltipProvider } from './components/ui/tooltip'
 import { LucideProvider } from 'lucide-react'
 import { ThemeProvider } from './components/ui/theme-provider'
+import ErrorBoundary from '@/components/common/ErrorBoundary'
+import AppRenderFailure from '@/components/common/AppRenderFailure'
 
 const BankStatementImporter = lazy(() => import('@/pages/BankStatementImporter'))
 const ViewBankStatementImportLog = lazy(() => import('@/pages/ViewBankStatementImportLog'))
@@ -43,16 +45,29 @@ function App() {
 						defaultTheme={window.frappe?.boot?.desk_theme ?? "Automatic"}
 					>
 						{window.frappe?.boot?.user?.name && window.frappe?.boot?.user?.name !== 'Guest' &&
-							<BrowserRouter basename={import.meta.env.VITE_BASE_NAME ? `/${import.meta.env.VITE_BASE_NAME}` : ''}>
-								<Routes>
-									<Route index element={<BankReconciliation />} />
-									<Route path="/statement-importer" element={<BankStatementImporterContainer />}>
-										<Route index element={<BankStatementImporter />} />
-										<Route path=":id" element={<ViewBankStatementImportLog />} />
-									</Route>
-									<Route path="*" element={<Navigate to="/" />} />
-								</Routes>
-							</BrowserRouter>
+							/*
+							 * Last-resort containment. Individual surfaces that render records they did not
+							 * write contain their own failures far more gracefully - see the per-row boundary
+							 * in the session action log - but nothing else stands between an unforeseen render
+							 * error anywhere in the tree and React tearing the whole document down to a blank
+							 * page with no explanation and no way forward but the browser's reload button.
+							 */
+							<ErrorBoundary label="Banking app root" fallback={<AppRenderFailure />}>
+								<BrowserRouter basename={import.meta.env.VITE_BASE_NAME ? `/${import.meta.env.VITE_BASE_NAME}` : ''}>
+									<Routes>
+										<Route index element={<BankReconciliation />} />
+										<Route path="/statement-importer" element={<BankStatementImporterContainer />}>
+											<Route index element={<BankStatementImporter />} />
+											<Route path=":id" element={<ViewBankStatementImportLog />} />
+										</Route>
+										{/* `replace` REPLACES the unmatched entry instead of pushing over it. Pushing left
+										    the bogus URL on the stack, so Back returned to it and this same route
+										    immediately pushed the redirect again - one unmatched URL cost three history
+										    entries and the reviewer could no longer leave the app with Back. */}
+										<Route path="*" element={<Navigate to="/" replace />} />
+									</Routes>
+								</BrowserRouter>
+							</ErrorBoundary>
 						}
 						<Toaster richColors />
 					</ThemeProvider>

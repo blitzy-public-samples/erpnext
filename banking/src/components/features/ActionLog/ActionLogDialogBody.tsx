@@ -25,6 +25,8 @@ import ErrorBanner from '@/components/ui/error-banner'
 import SelectedTransactionDetails from '../BankReconciliation/SelectedTransactionDetails'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import BankLogo from '@/components/common/BankLogo'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import ErrorBoundary from '@/components/common/ErrorBoundary'
 
 const ActionLogDialogBody = () => {
 
@@ -38,12 +40,28 @@ const ActionLogDialogBody = () => {
                     <div className='ms-2 border-s border-s-outline-gray-2 py-1'>
                         <div className='ms-5'>
                             {action.items.map((item, index) => (
-                                <Row
-                                    item={item}
+                                /*
+                                 * Every row is contained individually rather than the log as a whole. The log
+                                 * is deserialised out of session storage, so it can hold an entry written by a
+                                 * different build whose shape this renderer no longer recognises - and an
+                                 * uncontained throw there took the entire SPA down to a blank page, losing the
+                                 * reviewer's other entries along with it. Contained per row, one unreadable
+                                 * entry costs only itself.
+                                 */
+                                <ErrorBoundary
                                     key={item.bankTransaction.name}
-                                    index={index}
-                                    action={action}
-                                    isLast={index === action.items.length - 1} />
+                                    label={`Action log row ${item.bankTransaction.name}`}
+                                    resetKey={item}
+                                    fallback={<UnrenderableRow
+                                        item={item}
+                                        index={index}
+                                        isLast={index === action.items.length - 1} />}>
+                                    <Row
+                                        item={item}
+                                        index={index}
+                                        action={action}
+                                        isLast={index === action.items.length - 1} />
+                                </ErrorBoundary>
                             ))}
                         </div>
                     </div>
@@ -64,6 +82,34 @@ const ActionLogDialogBody = () => {
 }
 
 
+
+/**
+ * Stands in for a row whose own render threw, keeping the group's frame intact so the reviewer can see
+ * that something was logged here rather than silently losing a line of their audit trail.
+ *
+ * Every field is read defensively: this renders BECAUSE the row's data was not what the renderer expected,
+ * so assuming any particular field is present would throw again - and a fallback that throws escapes to
+ * the boundary above and takes the whole log with it after all.
+ */
+const UnrenderableRow = ({ item, index, isLast }: { item: ActionLogItem, index: number, isLast: boolean }) => {
+
+    const reference = [item?.voucher?.reference_doctype, item?.voucher?.reference_name].filter(Boolean).join(' ')
+
+    return <div className='flex items-center gap-2'>
+        <div className={cn('p-3.5 border-s border-e border-t w-full', isLast ? 'rounded-b border-b' : '', index === 0 ? 'rounded-t' : '')}>
+            <Alert theme='red' role='alert'>
+                <AlertTitle>{_("This entry could not be displayed")}</AlertTitle>
+                <AlertDescription>
+                    {reference
+                        ? _("Some of its details are missing from this session's log. Nothing that was posted has changed - open {} to review it.", [reference])
+                        : _("Some of its details are missing from this session's log. Nothing that was posted has changed.")}
+                </AlertDescription>
+            </Alert>
+        </div>
+        {/* Holds the column the undo control occupies on a readable row, so the group stays aligned. */}
+        <div className='w-10 h-10' />
+    </div>
+}
 
 const ActionGroupHeader = ({ action }: { action: ActionLogType }) => {
 
@@ -155,7 +201,10 @@ const Row = ({ item, index, isLast, action }: { item: ActionLogItem, index: numb
                             {["Payment Entry", "Journal Entry"].includes(item.voucher.reference_doctype) ? "" : _("{} :", [item.voucher.reference_doctype])} {item.voucher.reference_name}
                         </a>
                         {item.voucher.reference_doctype === "Payment Entry" && item.voucher.doc && <PaymentEntryDetails item={item} />}
-                        {item.voucher.reference_doctype === "Journal Entry" && <JournalEntryDetails item={item} bank={bank} />}
+                        {/* `doc` is optional on a log item, and the Journal Entry branch used to omit the guard
+                            its Payment Entry sibling has - so an entry logged without the voucher document
+                            reached a renderer that reads the accounts child table off it and threw. */}
+                        {item.voucher.reference_doctype === "Journal Entry" && item.voucher.doc && <JournalEntryDetails item={item} bank={bank} />}
                     </div>
                 </div>
             </div>
@@ -178,11 +227,21 @@ const JournalEntryAccountsTable = ({ item, bank }: { item: ActionLogItem, bank?:
 
     const accounts = useMemo(() => {
 
-        const allAccounts = (item.voucher.doc as JournalEntry).accounts
+        // Read through the optional chain rather than through a bare cast. The cast asserts a document
+        // that a log entry is not obliged to carry, and dereferencing the accounts table on an absent
+        // one is the throw that used to blank the whole session log.
+        const allAccounts = (item.voucher?.doc as JournalEntry | undefined)?.accounts ?? []
 
         return allAccounts.filter((acc) => bank ? acc.account !== bank.account : true)
 
     }, [item, bank])
+
+    // Not an error state, and not worth a placeholder: the filter above removes the bank's own account on
+    // purpose, so a two-line entry against this very bank legitimately leaves nothing to name. Saying
+    // "split across 0 accounts" - which is what the branch below would have said - would be worse.
+    if (accounts.length === 0) {
+        return null
+    }
 
     return <>
         {accounts.length === 1 ? <span className='text-sm'>{accounts[0].account}</span> :
@@ -215,18 +274,28 @@ const JournalEntryAccountsTable = ({ item, bank }: { item: ActionLogItem, bank?:
 }
 
 const PaymentEntryDetails = ({ item, className }: { item: ActionLogItem, className?: string }) => {
-    if ((item.voucher.doc as PaymentEntry).payment_type === "Internal Transfer") {
+
+    const doc = item.voucher?.doc as PaymentEntry | undefined
+
+    // Each of this component's three call sites guards on the document already. It guards again here
+    // because it is reachable from all three and a fourth would be easy to add: a log entry without its
+    // voucher document must cost the reviewer this one detail, never the log.
+    if (!doc) {
+        return null
+    }
+
+    if (doc.payment_type === "Internal Transfer") {
         return <TransferDetails item={item} className={className} />
     }
 
-    const invoices = (item.voucher.doc as PaymentEntry).references ?? []
+    const invoices = doc.references ?? []
 
-    const currency = item.bankTransaction.withdrawal && item.bankTransaction.withdrawal > 0 ? (item.voucher.doc as PaymentEntry)?.paid_to_account_currency : (item.voucher.doc as PaymentEntry)?.paid_from_account_currency
+    const currency = item.bankTransaction.withdrawal && item.bankTransaction.withdrawal > 0 ? doc.paid_to_account_currency : doc.paid_from_account_currency
 
     return <div className='flex items-center gap-3'>
         <div className={cn('flex items-center gap-2 text-ink-gray-5 text-sm', className)}>
             <UserIcon className='w-4 h-4' />
-            <span className='text-sm'>{(item.voucher.doc as PaymentEntry).party_name}</span>
+            <span className='text-sm'>{doc.party_name}</span>
         </div>
         <Separator orientation='vertical' />
         <HoverCard>
@@ -239,7 +308,9 @@ const PaymentEntryDetails = ({ item, className }: { item: ActionLogItem, classNa
             <HoverCardContent className='w-full p-2' align='end'>
                 <div className='flex flex-col gap-2'>
                     {invoices.map((invoice) => (
-                        <Table>
+                        // Keyed on the child row's own name, falling back to the referenced document: an
+                        // unkeyed list lets React reuse one invoice's cells for another when the set changes.
+                        <Table key={invoice.name ?? `${invoice.reference_doctype}-${invoice.reference_name}`}>
                             <TableHeader>
                                 <TableRow>
                                     <TableHead>{_("Document")}</TableHead>
@@ -273,15 +344,17 @@ const TransferDetails = ({ item, className }: { item: ActionLogItem, className?:
 
     const bank = useMemo(() => {
 
+        // Same reasoning as the Payment Entry renderer: the voucher document is optional on a log entry,
+        // so read it through the chain and resolve to no bank rather than throwing.
+        const doc = item.voucher?.doc as PaymentEntry | undefined
+
+        if (!doc) {
+            return undefined
+        }
+
         const isWithdrawal = item.bankTransaction.withdrawal && item.bankTransaction.withdrawal > 0
 
-        let transferAccount = ""
-
-        if (isWithdrawal) {
-            transferAccount = (item.voucher.doc as PaymentEntry).paid_to
-        } else {
-            transferAccount = (item.voucher.doc as PaymentEntry).paid_from
-        }
+        const transferAccount = isWithdrawal ? doc.paid_to : doc.paid_from
 
         const transferBankAccount = banks?.find((bank) => bank.account === transferAccount)
 
@@ -330,18 +403,31 @@ const CancelActionLogItem = ({ item, type, timestamp, bank }: { item: ActionLogI
 
             setTimeout(() => {
                 actionLog((prev) => {
-                    // Find the action and then remove the item from the action. If the action is empty, remove the action from the array
+                    // Find the action and then remove the item from it. If that empties the action, drop
+                    // the action itself.
                     const action = prev.find((action) => action.timestamp === timestamp)
 
-                    if (action) {
-                        action.items = action.items.filter((i) => i.bankTransaction.name !== item.bankTransaction.name)
+                    if (!action) {
+                        return prev
                     }
-                    // If the action is empty, remove the action from the array
-                    if (action && action.items.length === 0) {
+
+                    /*
+                     * Derived, never assigned back onto `action`.
+                     *
+                     * This read `action.items = action.items.filter(...)`, which mutates the state object
+                     * this updater was handed. Jotai keeps that object - and the log is persisted, so a
+                     * deserialised copy of it is handed to whoever mounts the atom next - and an entry
+                     * whose `items` had been emptied in place then rendered as an action heading with no
+                     * rows under it and, with them, no undo control. Building a new array and a new action
+                     * object leaves the previous state exactly as it was found.
+                     */
+                    const remainingItems = action.items.filter((i) => i.bankTransaction.name !== item.bankTransaction.name)
+
+                    if (remainingItems.length === 0) {
                         return prev.filter((a) => a.timestamp !== timestamp)
-                    } else {
-                        return prev.map((a) => a.timestamp === timestamp ? { ...a, items: action?.items ?? [] } : a)
                     }
+
+                    return prev.map((a) => a.timestamp === timestamp ? { ...a, items: remainingItems } : a)
                 })
             }, 100)
 
@@ -355,6 +441,15 @@ const CancelActionLogItem = ({ item, type, timestamp, bank }: { item: ActionLogI
         })
     }
 
+    /*
+     * Names the control after what it does to THIS entry, and matches the confirmation it opens: the
+     * control read "Cancel" for every row, which in an accounting product means cancelling the voucher
+     * and, on a matched row, is not even what happens - the match is undone and the voucher left alone.
+     */
+    const undoLabel = type === 'match'
+        ? _("Unmatch transaction")
+        : _("Undo {}", [item.voucher.reference_doctype])
+
     return <AlertDialog open={isOpen} onOpenChange={setIsOpen}>
         <Tooltip>
             <TooltipTrigger asChild>
@@ -363,14 +458,30 @@ const CancelActionLogItem = ({ item, type, timestamp, bank }: { item: ActionLogI
                         variant={'ghost'}
                         isIconButton
                         theme='red'
-                        title={_("Cancel")}
-                        className='hover:text-ink-red-3 hover:bg-destructive/5 text-ink-gray-5 hidden group-hover:inline-flex'>
+                        title={undoLabel}
+                        aria-label={undoLabel}
+                        /*
+                         * Permanently visible, and deliberately not revealed on hover.
+                         *
+                         * This started as `hidden` - `display: none` - which took the only way to undo an
+                         * action away from everyone not using a mouse. Fading it in on hover instead kept
+                         * it in the document and in the tab order, but that only moved the problem: hover
+                         * cannot be produced by touch at all, so on a tablet the control was a 28x28
+                         * invisible target that had to be found before it could be revealed, and a reveal
+                         * that requires focus is no help when nothing tells you there is something to focus.
+                         *
+                         * Undoing a reconciliation is the whole purpose of this log, so the control is shown
+                         * at rest in a muted grey and escalates to red on hover and focus. That keeps the row
+                         * calm while leaving the action discoverable by every input device, which is what
+                         * being reachable actually requires.
+                         */
+                        className='text-ink-gray-5 transition-colors hover:text-ink-red-3 hover:bg-destructive/5 focus-visible:text-ink-red-3'>
                         <CircleXIcon className='w-8 h-8' />
                     </Button>
                 </AlertDialogTrigger>
             </TooltipTrigger>
             <TooltipContent>
-                {_("Cancel")}
+                {undoLabel}
             </TooltipContent>
         </Tooltip>
         <AlertDialogContent className='min-w-3xl'>
@@ -381,7 +492,11 @@ const CancelActionLogItem = ({ item, type, timestamp, bank }: { item: ActionLogI
             {error && <ErrorBanner error={error} />}
             <div className='flex flex-col gap-2'>
                 <SelectedTransactionDetails transaction={item.bankTransaction} />
+                {/* Wrapped in a body element rather than hanging rows straight off the table: a browser
+                    inserts one anyway, which left React reconciling against a DOM it had not built and
+                    logging a nesting error on every open. */}
                 <Table>
+                    <TableBody>
                     <TableRow>
                         <TableHead>{_("Action Type")}</TableHead>
                         <TableCell>{ACTION_TYPE_MAP[type]}</TableCell>
@@ -414,6 +529,7 @@ const CancelActionLogItem = ({ item, type, timestamp, bank }: { item: ActionLogI
                         <TableHead>{_("Account")}</TableHead>
                         <TableCell><JournalEntryAccountsTable item={item} bank={bank} /></TableCell>
                     </TableRow>}
+                    </TableBody>
                 </Table>
             </div>
             <AlertDialogFooter>

@@ -1,6 +1,6 @@
 import { useAtom } from "jotai"
 import { SelectedBank, selectedBankAccountAtom } from "./bankRecAtoms"
-import { useCallback } from "react"
+import { useCallback, useEffect, useRef } from "react"
 import { useGetBankAccounts, useGetUnreconciledTransactions } from "./utils"
 import { cn } from "@/lib/utils"
 import { getTimeago } from "@/lib/date"
@@ -13,6 +13,7 @@ import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTi
 import { LandmarkIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useCurrentCompany } from "@/hooks/useCurrentCompany"
+import { Skeleton } from "@/components/ui/skeleton"
 
 const BankPicker = ({ className }: { className?: string }) => {
 
@@ -47,7 +48,18 @@ const BankPicker = ({ className }: { className?: string }) => {
     const { themeValue } = useTheme()
 
     if (isLoading) {
-        return null
+        /*
+         * A skeleton strip rather than nothing. Returning `null` here left the body of the page blank
+         * while the account list was in flight, which is indistinguishable from "this company has no bank
+         * accounts" - and the workbench below withholds its tabs until an account is selected, so the
+         * whole screen read as empty rather than as loading.
+         */
+        return <div className={cn("flex gap-3 items-stretch w-full", className)} aria-busy="true" aria-live="polite">
+            <span className="sr-only">{_("Loading bank accounts...")}</span>
+            {Array.from({ length: 3 }).map((_unused, index) => (
+                <Skeleton key={index} className="h-28 max-w-60 min-w-60 rounded-md" />
+            ))}
+        </div>
     }
 
     if (error) {
@@ -99,16 +111,47 @@ const BankPickerItem = ({ bank }: { bank: SelectedBank }) => {
 
     const { mutate } = useGetUnreconciledTransactions()
 
+    const ref = useRef<HTMLDivElement>(null)
+
+    /*
+     * Bring the selected account into view once the strip has rendered. The selection is persisted in
+     * `localStorage`, so a reload can restore an account that sits outside the strip's visible scroll
+     * range - and because the strip always starts scrolled to the far left, that account looked
+     * unselected. `block: 'nearest'` keeps the page itself from scrolling.
+     */
+    useEffect(() => {
+        if (isSelected) {
+            ref.current?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+        }
+    }, [isSelected])
+
     const onSelect = () => {
         setSelectedBank(bank)
         mutate()
     }
 
+    /*
+     * Enter and Space activate this card. It advertises `role="button"` to assistive technology, but a
+     * `div` receives no implicit keyboard activation from the browser, so before this the account could
+     * not be changed by keyboard at all. Space is prevented from its default page scroll, matching what a
+     * native button does. `aria-pressed` carries the selected state, which colour alone conveyed.
+     */
+    const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault()
+            onSelect()
+        }
+    }
+
     return <div
+        ref={ref}
         role="button"
-        title={`Select ${bank.account_name}`}
+        tabIndex={0}
+        aria-pressed={isSelected}
+        title={_("Select {0}", [bank.account_name ?? bank.name])}
         onClick={onSelect}
-        className={cn('rounded-md border border-outline-gray-1 max-w-60 min-w-60 p-2 overflow-hidden cursor-pointer',
+        onKeyDown={onKeyDown}
+        className={cn('rounded-md border border-outline-gray-1 max-w-60 min-w-60 p-2 overflow-hidden cursor-pointer outline-none focus-visible:shadow-focus-gray',
             isSelected ? 'border-outline-gray-5 bg-surface-gray-1' : 'hover:bg-surface-gray-1'
         )}
     >

@@ -34,7 +34,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { cint, flt, formatCurrency, getCurrencyFormatInfo, lstrip } from '@/lib/numbers'
+import { cint, currencyInputValueToNumber, flt, formatCurrency, getCurrencyFormatInfo, lstrip, parseCurrencyInput } from '@/lib/numbers'
 
 const DEFAULT_CURRENCY = 'INR'
 const ALTERNATE_CURRENCY = 'USD'
@@ -410,6 +410,230 @@ describe('getCurrencyFormatInfo', () => {
 			// configured with such a format would break formatting everywhere rather than degrade.
 			expect(() => getCurrencyFormatInfo(DEFAULT_CURRENCY)).toThrow(TypeError)
 			expect(() => formatCurrency(1234.5, DEFAULT_CURRENCY)).toThrow(TypeError)
+		})
+	})
+})
+
+/**
+ * The two functions below are the READ side of a currency field, and they exist because of a specific
+ * class of defect: a figure a reviewer typed being stored as a DIFFERENT figure, silently.
+ *
+ * `react-currency-input-field` reports both the sanitised text and its own parsed float on every
+ * keystroke, and the field is controlled by whatever the handler stores. Storing a re-read of the text
+ * produced `NaN` for a grouped value and moved the decimal point on a partial one; storing the number
+ * unconditionally swallowed the separator mid-entry, so `-250.50` was saved as -25050. The split below is
+ * what makes both impossible: `parseCurrencyInput` decides whether the text or the number is authoritative
+ * yet, and `currencyInputValueToNumber` is the only sanctioned way to read the resulting union back.
+ */
+describe('parseCurrencyInput', () => {
+
+	describe('an empty field', () => {
+
+		it('carries no value and is not an error, because that is how a filter is switched off', () => {
+			expect(parseCurrencyInput({ text: '', float: null })).toEqual({
+				value: null, text: '', isInvalid: false, keepText: false
+			})
+		})
+
+		it('treats whitespace as empty', () => {
+			expect(parseCurrencyInput({ text: '   ', float: null })).toMatchObject({
+				value: null, isInvalid: false
+			})
+		})
+
+		it('treats an absent text and an absent float as empty rather than as a refusal', () => {
+			expect(parseCurrencyInput({})).toMatchObject({ value: null, isInvalid: false, keepText: false })
+		})
+	})
+
+	describe('a figure the library parsed', () => {
+
+		it('takes the float verbatim, never re-reading the text', () => {
+			expect(parseCurrencyInput({ text: '1,234.56', float: 1234.56 })).toMatchObject({
+				value: 1234.56, isInvalid: false
+			})
+		})
+
+		it('keeps zero, because zero is a figure and not a missing one', () => {
+			expect(parseCurrencyInput({ text: '0', float: 0 })).toMatchObject({
+				value: 0, isInvalid: false, keepText: false
+			})
+		})
+
+		it('keeps the sign of a negative, including one that arrived by paste', () => {
+			expect(parseCurrencyInput({ text: '-250.5', float: -250.5 })).toMatchObject({
+				value: -250.5, isInvalid: false
+			})
+		})
+
+		it('does not inflate a small decimal, which is how 1.23 became 1,230,000,000', () => {
+			expect(parseCurrencyInput({ text: '1.23', float: 1.23 })).toMatchObject({ value: 1.23 })
+		})
+
+		it('does not truncate a long figure to fit, which is how a filter ran on a silent 12', () => {
+			expect(parseCurrencyInput({ text: '123456789012', float: 123456789012 })).toMatchObject({
+				value: 123456789012, isInvalid: false
+			})
+		})
+	})
+
+	describe('a decimal still being typed', () => {
+
+		it('asks for the text back once the separator is pressed, so the keystroke survives', () => {
+			// `250.` parses to 250. Echoing 250 into a controlled field drops the separator and sends the
+			// next digit into the units - the exact route by which -250.50 was stored as -25050.
+			expect(parseCurrencyInput({ text: '250.', float: 250 })).toMatchObject({
+				value: 250, keepText: true, isInvalid: false
+			})
+		})
+
+		it('counts a trailing zero as unfinished, because 1.0 is on its way to 1.05', () => {
+			expect(parseCurrencyInput({ text: '1.0', float: 1 })).toMatchObject({ keepText: true })
+		})
+
+		it('counts a fully typed 0.00 as unfinished text too, so the zeroes are not erased under the cursor', () => {
+			expect(parseCurrencyInput({ text: '0.00', float: 0 })).toMatchObject({
+				value: 0, keepText: true, isInvalid: false
+			})
+		})
+
+		it('stops asking for the text once a significant decimal digit lands', () => {
+			expect(parseCurrencyInput({ text: '1.05', float: 1.05 })).toMatchObject({
+				value: 1.05, keepText: false
+			})
+		})
+
+		it('does not mistake a whole number ending in zero for a decimal in progress', () => {
+			expect(parseCurrencyInput({ text: '10', float: 10 })).toMatchObject({
+				value: 10, keepText: false
+			})
+		})
+	})
+
+	describe('a prefix of a figure', () => {
+
+		it('accepts a lone minus sign as unfinished rather than wrong', () => {
+			expect(parseCurrencyInput({ text: '-', float: null })).toEqual({
+				value: null, text: '-', isInvalid: false, keepText: true
+			})
+		})
+
+		it('accepts a bare separator as unfinished', () => {
+			expect(parseCurrencyInput({ text: '.', float: null })).toMatchObject({
+				value: null, isInvalid: false, keepText: true
+			})
+		})
+	})
+
+	describe('text that cannot be used as a figure', () => {
+
+		it('refuses it out loud instead of offering a number derived from part of it', () => {
+			expect(parseCurrencyInput({ text: '1.2.3', float: null })).toMatchObject({
+				value: null, isInvalid: true
+			})
+		})
+
+		it('refuses a NaN float, which is what a field showing NaN was previously built from', () => {
+			expect(parseCurrencyInput({ text: 'abc', float: Number.NaN })).toMatchObject({
+				value: null, isInvalid: true
+			})
+		})
+
+		it('refuses an infinite float', () => {
+			expect(parseCurrencyInput({ text: '1e999', float: Number.POSITIVE_INFINITY })).toMatchObject({
+				value: null, isInvalid: true
+			})
+		})
+
+		it('keeps the text alongside the refusal, so the reviewer still sees what they typed', () => {
+			expect(parseCurrencyInput({ text: '1.2.3', float: null }).text).toBe('1.2.3')
+		})
+	})
+
+	describe('a currency whose decimal separator is a comma', () => {
+
+		it('reads a comma as the separator being pressed', () => {
+			expect(parseCurrencyInput({ text: '1,', float: 1, decimalSeparator: ',' })).toMatchObject({
+				value: 1, keepText: true, isInvalid: false
+			})
+		})
+
+		it('accepts a bare comma as a prefix', () => {
+			expect(parseCurrencyInput({ text: ',', float: null, decimalSeparator: ',' })).toMatchObject({
+				isInvalid: false, keepText: true
+			})
+		})
+
+		it('does not treat a full stop as that currency\'s separator', () => {
+			expect(parseCurrencyInput({ text: '.', float: null, decimalSeparator: ',' })).toMatchObject({
+				isInvalid: true
+			})
+		})
+	})
+})
+
+describe('currencyInputValueToNumber', () => {
+
+	describe('reading the number branch of the union', () => {
+
+		it('passes a finite number through, zero and negatives included', () => {
+			expect(currencyInputValueToNumber(1234.56)).toBe(1234.56)
+			expect(currencyInputValueToNumber(0)).toBe(0)
+			expect(currencyInputValueToNumber(-250.5)).toBe(-250.5)
+		})
+
+		it('reports no figure for NaN and Infinity rather than passing them to the server', () => {
+			expect(currencyInputValueToNumber(Number.NaN)).toBeNull()
+			expect(currencyInputValueToNumber(Number.POSITIVE_INFINITY)).toBeNull()
+		})
+	})
+
+	describe('reading the text branch of the union', () => {
+
+		it('reads a decimal in progress as the figure typed so far', () => {
+			expect(currencyInputValueToNumber('250.')).toBe(250)
+		})
+
+		it('reads a fully typed 0.00 as zero, so a statement closing at zero can be saved', () => {
+			expect(currencyInputValueToNumber('0.00')).toBe(0)
+		})
+
+		it('strips group separators, which is what made Number() return NaN on a grouped figure', () => {
+			expect(currencyInputValueToNumber('1,234.56')).toBe(1234.56)
+		})
+
+		it('handles the Indian lakh grouping the default number format produces', () => {
+			expect(currencyInputValueToNumber('12,34,567.89')).toBe(1234567.89)
+		})
+
+		it('honours the separators of the currency in force rather than assuming them', () => {
+			expect(currencyInputValueToNumber('1.234,56', {
+				groupSeparator: '.', decimalSeparator: ','
+			})).toBe(1234.56)
+		})
+
+		it('keeps the sign of a negative read out of text', () => {
+			expect(currencyInputValueToNumber('-250.50')).toBe(-250.5)
+		})
+
+		it('reports no figure for an emptied field, which is what "required" means', () => {
+			expect(currencyInputValueToNumber('')).toBeNull()
+			expect(currencyInputValueToNumber('   ')).toBeNull()
+		})
+
+		it('reports no figure for a lone minus or unusable text', () => {
+			expect(currencyInputValueToNumber('-')).toBeNull()
+			expect(currencyInputValueToNumber('1.2.3')).toBeNull()
+			expect(currencyInputValueToNumber('abc')).toBeNull()
+		})
+	})
+
+	describe('reading anything else', () => {
+
+		it('reports no figure, so an unset field cannot be mistaken for zero', () => {
+			expect(currencyInputValueToNumber(undefined)).toBeNull()
+			expect(currencyInputValueToNumber(null)).toBeNull()
+			expect(currencyInputValueToNumber({})).toBeNull()
 		})
 	})
 })

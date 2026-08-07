@@ -43,7 +43,9 @@ import {
 	makeLeadingColonExceptionError,
 	makeMessageOnlyError,
 	makeServerMessagesError,
-	makeWarningServerMessagesError
+	makeTransportFailureError,
+	makeWarningServerMessagesError,
+	TRANSPORT_FAILURE_MESSAGE
 } from '@/test/factories'
 
 
@@ -375,6 +377,70 @@ describe('getErrorMessages', () => {
 			expect(result[0].message).toBe('Internal Server Error')
 		})
 	})
+
+	/*
+	 * PATH 5 — the request that never reached a server.
+	 *
+	 * The SDK builds every rejection by spreading `error.response.data` and guards neither layer, so a
+	 * dropped or cancelled request makes its own failure handler throw, and the rejection the SPA
+	 * receives is that internal `TypeError`. Before this branch existed it fell through to the bare
+	 * `message` and every error surface showed "Cannot read properties of undefined (reading 'data')" —
+	 * the QA report caught it twice on one screen, in the dialog and in the inline banner, because both
+	 * render through this one parser.
+	 *
+	 * The branch is deliberately LAST: it is only consulted once no server message has been parsed, so
+	 * a refusal Frappe actually spoke through can never reach it.
+	 */
+	describe('path 5 — the transport failure that carries no server response', () => {
+
+		it('replaces the SDK\'s internal TypeError with something a reviewer can act on', () => {
+			const result = getErrorMessages(makeTransportFailureError())
+
+			expect(result).toHaveLength(1)
+			expect(result[0].message).not.toContain(TRANSPORT_FAILURE_MESSAGE)
+			expect(result[0].message).not.toContain('undefined')
+			expect(result[0].message).toMatch(/network connection/i)
+			expect(result[0].title).toBe('Could not reach the server')
+			expect(result[0].indicator).toBe('red')
+		})
+
+		it('stays OUTCOME-NEUTRAL, because with no reply the client cannot know what was applied', () => {
+			// Saying "nothing was changed" would be a claim about the server that the client is in no
+			// position to make: the request may well have been applied before the reply was lost.
+			const [{ message }] = getErrorMessages(makeTransportFailureError())
+
+			expect(message).toMatch(/may or may not have been applied/i)
+			expect(message).not.toMatch(/nothing (was|has been) (changed|applied|recorded)/i)
+		})
+
+		it('treats any response-less rejection the same way, whatever its internal wording', () => {
+			const result = getErrorMessages(makeTransportFailureError('Network Error'))
+
+			expect(result[0].message).not.toBe('Network Error')
+			expect(result[0].title).toBe('Could not reach the server')
+		})
+
+		it('does NOT claim it for a response that arrived carrying only a message', () => {
+			// `makeMessageOnlyError` has an HTTP status, so the server DID answer; its words stand.
+			const result = getErrorMessages(makeMessageOnlyError('Internal Server Error'))
+
+			expect(result[0].message).toBe('Internal Server Error')
+			expect(result[0].title).toBe('Error')
+		})
+
+		it('does NOT claim it for a refusal that carries an exception but no status', () => {
+			const result = getErrorMessages(makeExceptionError('Voucher is over-allocated'))
+
+			expect(result[0].message.trim()).toBe('Voucher is over-allocated')
+		})
+
+		it('never outranks the server: a refusal WITH messages is reported in its own words', () => {
+			const result = getErrorMessages(makeAlreadyReconciledError('ACC-BTN-2026-00001'))
+
+			expect(result[0].message).toBe(formatAlreadyReconciledMessage('ACC-BTN-2026-00001'))
+			expect(result[0].title).not.toBe('Could not reach the server')
+		})
+	})
 })
 
 describe('getErrorMessage', () => {
@@ -388,8 +454,17 @@ describe('getErrorMessage', () => {
 		expect(getErrorMessage(null)).toBe('')
 	})
 
-	it('returns the bare message for a transport-failure envelope', () => {
+	it('returns the bare message for a response that carried nothing but a message', () => {
 		expect(getErrorMessage(makeMessageOnlyError('Network Error'))).toBe('Network Error')
+	})
+
+	it('returns the actionable text, not the internal one, for a request that reached no server', () => {
+		// This is what a toast description carries, so the substitution has to happen in the parser
+		// rather than in any one renderer.
+		const description = getErrorMessage(makeTransportFailureError())
+
+		expect(description).not.toContain(TRANSPORT_FAILURE_MESSAGE)
+		expect(description).toMatch(/could not be reached/i)
 	})
 
 	it('yields readable text for every shape that carries text in a DIFFERENT field', () => {

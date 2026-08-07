@@ -17,6 +17,11 @@
  *      difference correct on first paint.
  *   6. The progress figure is derived by SUBTRACTION - total submitted transactions minus the
  *      unreconciled ones - rather than being counted directly.
+ *
+ * Two presentation rules are load-bearing rather than cosmetic and are pinned alongside them: the
+ * difference names its state in WORDS (surplus / shortfall / balanced) rather than relying on colour, and
+ * announces it once through a live region; and the progress bar is determinate, so it exposes the figure
+ * it is drawing rather than reporting itself as indeterminate.
  */
 
 import { describe, expect, it, vi, beforeEach } from 'vitest'
@@ -26,8 +31,10 @@ import userEvent from '@testing-library/user-event'
 import {
 	TEST_BANK_ACCOUNT,
 	createFrappeSDKMock,
+	frappeContextValue,
 	frappePostCall,
 	frappeSDKMock,
+	frappeSWRMutate,
 	makeUnreconciledTransaction
 } from '@/test/factories'
 
@@ -51,6 +58,11 @@ interface BalanceOptions {
 	statement?: { balance: number, date?: string }
 	unreconciled?: number
 	isLoading?: boolean
+	/**
+	 * Leaves the outstanding-transaction read UNANSWERED - `data` undefined with `isLoading` set - which
+	 * is the state the progress figure must withhold itself in rather than treat as "none outstanding".
+	 */
+	unreconciledPending?: boolean
 }
 
 /**
@@ -62,7 +74,8 @@ const answerBalances = ({
 	closing = 12000,
 	statement = { balance: 12000, date: PANEL_TO_DATE },
 	unreconciled = 0,
-	isLoading = false
+	isLoading = false,
+	unreconciledPending = false
 }: BalanceOptions = {}) => {
 	frappeSDKMock.useFrappeGetCall.mockImplementation(((
 		method: string,
@@ -84,6 +97,9 @@ const answerBalances = ({
 		}
 
 		if (method === UNRECONCILED) {
+			if (unreconciledPending) {
+				return { data: undefined, error: undefined, isLoading: true, isValidating: true, mutate: vi.fn() }
+			}
 			return {
 				data: {
 					message: Array.from({ length: unreconciled }, (_unused, index) =>
@@ -200,6 +216,84 @@ describe('BankBalance', () => {
 			expect(difference.className).toContain('text-ink-red-3')
 		})
 
+		it('names a shortfall in words, not only in red', async () => {
+			/*
+			 * A surplus and a shortfall were rendered in the identical red and a balanced account differed
+			 * only in being grey, so the tile carried three meanings in two colours and named none of them.
+			 */
+			answerBalances({ closing: 12000, statement: { balance: 11500, date: PANEL_TO_DATE } })
+
+			renderPanel(<BankBalance />)
+
+			expect(await screen.findByText('Shortfall')).toBeInTheDocument()
+			expect(screen.queryByText('Surplus')).not.toBeInTheDocument()
+			expect(screen.queryByText('Balanced')).not.toBeInTheDocument()
+		})
+
+		it('names a surplus, which used to look exactly like a shortfall', async () => {
+			answerBalances({ closing: 11500, statement: { balance: 12000, date: PANEL_TO_DATE } })
+
+			renderPanel(<BankBalance />)
+
+			expect(await screen.findByText('Surplus')).toBeInTheDocument()
+			expect(screen.queryByText('Shortfall')).not.toBeInTheDocument()
+		})
+
+		it('says a balanced account is balanced, rather than leaving a bare zero to be inferred', async () => {
+			answerBalances({ closing: 12000, statement: { balance: 12000, date: PANEL_TO_DATE } })
+
+			renderPanel(<BankBalance />)
+
+			expect(await screen.findByText('Balanced')).toBeInTheDocument()
+		})
+
+		it('calls an account balanced to the last paisa balanced, whatever residue the sum carries', async () => {
+			/*
+			 * The system's closing balance is a sum of ledger amounts, so a fully reconciled account can
+			 * answer 7.275957614183426e-12 instead of 0. The state used to be decided on that unrounded
+			 * figure, so the tile displayed zero while calling it a shortfall and colouring it red.
+			 */
+			answerBalances({
+				closing: 7.275957614183426e-12,
+				statement: { balance: 0, date: PANEL_TO_DATE }
+			})
+
+			renderPanel(<BankBalance />)
+
+			expect(await screen.findByText('Balanced')).toBeInTheDocument()
+			expect(screen.queryByText('Shortfall')).not.toBeInTheDocument()
+
+			const zero = screen.getAllByText('₹ 0.00').find((node) => node.className.includes('font-numeric'))
+			expect(zero).toBeDefined()
+			expect(zero?.className).not.toContain('text-ink-red-3')
+		})
+
+		it('announces the figure and its state once, through a live region', async () => {
+			/*
+			 * One sentence, with the visual figure and word hidden from assistive technology, so a change
+			 * is announced in full rather than as a bare number read twice.
+			 */
+			answerBalances({ closing: 12000, statement: { balance: 11500, date: PANEL_TO_DATE } })
+
+			renderPanel(<BankBalance />)
+
+			const live = await screen.findByRole('status')
+
+			expect(live).toHaveAttribute('aria-live', 'polite')
+			// A live region announces its CONTENT rather than its name, so the sentence lives inside it.
+			expect(live).toHaveTextContent(
+				'Difference ₹ -500.00, a shortfall against the closing balance as per system.'
+			)
+			// And the figure and the word are hidden from assistive technology, so nothing is read twice.
+			expect(screen.getByText('₹ -500.00').closest('[aria-hidden="true"]')).not.toBeNull()
+			expect(screen.getByText('Shortfall').closest('[aria-hidden="true"]')).not.toBeNull()
+			// The sentence itself is NOT hidden - it is the thing that gets announced.
+			expect(
+				screen.getByText('Difference ₹ -500.00, a shortfall against the closing balance as per system.')
+					.closest('[aria-hidden="true"]')
+			).toBeNull()
+		})
+
 		it('does not colour a difference of exactly zero', async () => {
 			answerBalances({ closing: 12000, statement: { balance: 12000, date: PANEL_TO_DATE } })
 
@@ -253,10 +347,16 @@ describe('BankBalance', () => {
 			).toBeInTheDocument()
 		})
 
-		it('refuses to save an empty balance rather than posting a zero', async () => {
-			// Posting zero would silently assert the bank says the account is empty.
+		it('saves a zero balance, because a statement can genuinely close at zero', async () => {
+			/*
+			 * The guard here used to be `if (data.balance)`, which is falsy for 0: a reviewer whose
+			 * statement closed at zero was told the balance was "required", no request was sent, and there
+			 * was no way to record it at all - while the difference tile went on comparing against a value
+			 * that could not be entered.
+			 */
 			const user = userEvent.setup()
 
+			frappePostCall.mockResolvedValue({ message: 'ok' })
 			answerBalances({ statement: { balance: 0 } })
 
 			renderPanel(<BankBalance />)
@@ -266,8 +366,121 @@ describe('BankBalance', () => {
 			await user.click(await screen.findByRole('button', { name: 'Save' }))
 
 			await waitFor(() => {
+				expect(frappePostCall).toHaveBeenCalledWith(expect.objectContaining({
+					bank_account: TEST_BANK_ACCOUNT,
+					date: PANEL_TO_DATE,
+					balance: 0
+				}))
+			})
+		})
+
+		it('refuses to save when the field has been emptied, because that is no figure at all', async () => {
+			// The distinction the fix turns on: zero is a balance, an empty field is a missing one.
+			const user = userEvent.setup()
+
+			answerBalances({ statement: { balance: 12000 } })
+
+			renderPanel(<BankBalance />)
+
+			const triggers = await screen.findAllByRole('button', { name: /₹/ })
+			await user.click(triggers[0])
+
+			const field = await screen.findByRole('textbox')
+			await user.clear(field)
+			await user.click(await screen.findByRole('button', { name: 'Save' }))
+
+			await waitFor(() => {
 				expect(frappePostCall).not.toHaveBeenCalled()
 			})
+		})
+
+		it('saves a negative balance with its sign intact, because an account can be overdrawn', async () => {
+			/*
+			 * Typing past the decimal point is the part that broke: the field is controlled by what this
+			 * handler stores, so storing the parsed number for `-250.` echoed `-250` back, swallowed the
+			 * separator, and sent the final digit into the units - saving -25050 for -250.50.
+			 */
+			/*
+			 * A gap between events, because the field is CONTROLLED: each character is echoed back through
+			 * React before the next one is composed, and with no gap a keystroke can be built on a value
+			 * React has not re-rendered yet and be lost. That is a race in the harness rather than in the
+			 * product - it appeared only under the slower coverage run - and the gap removes it.
+			 */
+			const user = userEvent.setup({ delay: 20 })
+
+			frappePostCall.mockResolvedValue({ message: 'ok' })
+			answerBalances({ statement: { balance: 12000 } })
+
+			renderPanel(<BankBalance />)
+
+			const triggers = await screen.findAllByRole('button', { name: /₹/ })
+			await user.click(triggers[0])
+
+			const field = await screen.findByRole('textbox')
+			await user.clear(field)
+			await user.type(field, '-250.50')
+			await user.click(await screen.findByRole('button', { name: 'Save' }))
+
+			await waitFor(() => {
+				expect(frappePostCall).toHaveBeenCalledWith(expect.objectContaining({ balance: -250.5 }))
+			})
+		})
+	})
+
+	describe('deleting a saved statement balance', () => {
+
+		const STATEMENT_KEY =
+			`bank-reconciliation-account-closing-balance-as-per-statement-${TEST_BANK_ACCOUNT}-${PANEL_TO_DATE}`
+
+		it('re-reads the statement balance, so the tiles do not keep the figure that was just removed', async () => {
+			/*
+			 * Deletion used to refresh only the table it was performed in. The tile and the Difference beside
+			 * it went on showing the deleted balance until the page was reloaded, which reads as a
+			 * reconciliation gap that no longer exists.
+			 */
+			const user = userEvent.setup()
+
+			frappeSDKMock.useFrappeGetDocList.mockReturnValue({
+				data: [{ name: 'bab-1', date: PANEL_TO_DATE, balance: 12000 }],
+				error: undefined,
+				isLoading: false,
+				isValidating: false,
+				mutate: vi.fn()
+			} as never)
+			frappeContextValue.db.deleteDoc.mockResolvedValue({ message: 'ok' } as never)
+			answerBalances({ statement: { balance: 12000, date: PANEL_TO_DATE } })
+
+			renderPanel(<BankBalance />)
+
+			const triggers = await screen.findAllByRole('button', { name: /₹/ })
+			await user.click(triggers[0])
+
+			await user.click(await screen.findByRole('button', { name: 'Delete' }))
+
+			await waitFor(() => {
+				expect(frappeContextValue.db.deleteDoc).toHaveBeenCalledWith('Bank Account Balance', 'bab-1')
+			})
+			await waitFor(() => {
+				expect(frappeSWRMutate).toHaveBeenCalledWith(STATEMENT_KEY)
+			})
+		})
+
+		it('adopts a zero from the server, which is what it answers once no balance is left', async () => {
+			/*
+			 * The success handler used to test the balance for truthiness, so the `{balance: 0}` the endpoint
+			 * returns when no row remains was discarded and the atom - and therefore the Difference - kept
+			 * the deleted figure. Zero is an answer, not the absence of one.
+			 */
+			answerBalances({ closing: 12000, statement: { balance: 0, date: undefined } })
+
+			const { store } = renderPanel(<BankBalance />)
+
+			await waitFor(() => {
+				expect(store.get(bankRecClosingBalanceAtom(TEST_BANK_ACCOUNT))).toMatchObject({ value: 0 })
+			})
+			// 0 stated against 12,000 in the system is the whole balance outstanding, as a shortfall.
+			expect(await screen.findByText('₹ -12,000.00')).toBeInTheDocument()
+			expect(screen.getByText('Shortfall')).toBeInTheDocument()
 		})
 	})
 
@@ -297,6 +510,58 @@ describe('BankBalance', () => {
 			expect(await screen.findByText('0 / 2 reconciled')).toBeInTheDocument()
 		})
 
+		it('exposes the figure it is drawing, rather than reporting itself as indeterminate', async () => {
+			/*
+			 * The primitive was handed a label and a hint but never the VALUE: every bar in the application
+			 * rendered `data-state="indeterminate"` with no `aria-valuenow`, so a screen reader was told a
+			 * known figure - here 3 of 4 - was simply loading.
+			 */
+			frappeSDKMock.useFrappeGetDocCount.mockReturnValue({
+				data: 4, error: undefined, isLoading: false, isValidating: false, mutate: vi.fn()
+			})
+			answerBalances({ unreconciled: 1 })
+
+			renderPanel(<BankBalance />)
+
+			const bar = await screen.findByRole('progressbar')
+
+			expect(bar).toHaveAttribute('data-state', 'loading')
+			expect(bar).toHaveAttribute('aria-valuenow', '75')
+			expect(bar).toHaveAttribute('aria-valuemax', '100')
+			expect(bar).toHaveAccessibleName('Reconciliation progress')
+			// The spoken value is the same wording a sighted reviewer reads beside the bar.
+			expect(bar).toHaveAttribute('aria-valuetext', '3 / 4 reconciled')
+		})
+
+		it('shows no figure at all while the total is still being counted', async () => {
+			/*
+			 * Rather than "0 / undefined reconciled", which is what interpolating a missing total produced.
+			 *
+			 * This case is pinned on the ABSENCE of a figure rather than on a stand-in caption. An earlier
+			 * fix for the same defect kept the bar up and swapped the figures for a "Counting
+			 * transactions..." hint; that removes the literal "undefined", but leaves a determinate bar
+			 * reporting a `value` derived from only one of the two reads - it asserts "0% reconciled" when
+			 * the truth is not yet known. The behaviour that ships withholds the whole widget instead, so
+			 * what this test guarantees is that neither a number nor a percentage is put in front of the
+			 * reviewer while the pair is incomplete. `isValidating: false` is the point of this case: it is
+			 * the same in-flight state as the one below, reached without the revalidation flag set.
+			 */
+			frappeSDKMock.useFrappeGetDocCount.mockReturnValue({
+				data: undefined, error: undefined, isLoading: true, isValidating: false, mutate: vi.fn()
+			})
+			answerBalances({ unreconciled: 0 })
+
+			const { container } = renderPanel(<BankBalance />)
+
+			await waitFor(() => {
+				expect(screen.getByText('Opening Balance')).toBeInTheDocument()
+			})
+			expect(screen.queryByText(/undefined/)).not.toBeInTheDocument()
+			expect(screen.queryByText(/reconciled/)).not.toBeInTheDocument()
+			expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+			expect(container.querySelectorAll('[data-slot="skeleton"]')).toHaveLength(1)
+		})
+
 		it('copes with an account that has no transactions at all', async () => {
 			// Division by the total would be NaN, which would render as a broken bar.
 			frappeSDKMock.useFrappeGetDocCount.mockReturnValue({
@@ -307,6 +572,75 @@ describe('BankBalance', () => {
 			renderPanel(<BankBalance />)
 
 			expect(await screen.findByText('0 / 0 reconciled')).toBeInTheDocument()
+		})
+
+		it('withholds the figure behind a placeholder while the transaction COUNT is in flight', async () => {
+			// The subtraction has only one of its two operands here, and half a subtraction is not an
+			// approximation: it reported "-1 / undefined reconciled" to the reviewer AND to the
+			// accessibility tree, so neither number may be shown at all until both reads have answered.
+			frappeSDKMock.useFrappeGetDocCount.mockReturnValue({
+				data: undefined, error: undefined, isLoading: true, isValidating: true, mutate: vi.fn()
+			})
+			answerBalances({ unreconciled: 1 })
+
+			const { container } = renderPanel(<BankBalance />)
+
+			await waitFor(() => {
+				expect(screen.getByText('Opening Balance')).toBeInTheDocument()
+			})
+			expect(screen.queryByText('Progress')).not.toBeInTheDocument()
+			expect(screen.queryByText(/reconciled/)).not.toBeInTheDocument()
+			expect(screen.queryByText(/undefined/)).not.toBeInTheDocument()
+			expect(container.querySelectorAll('[data-slot="skeleton"]')).toHaveLength(1)
+		})
+
+		it('withholds it too when the count has answered but the outstanding list has NOT', async () => {
+			// The other half of the same pair. Treating an unanswered list as "none outstanding" would
+			// report a fully reconciled period to a reviewer who is looking at an unread one.
+			frappeSDKMock.useFrappeGetDocCount.mockReturnValue({
+				data: 4, error: undefined, isLoading: false, isValidating: false, mutate: vi.fn()
+			})
+			answerBalances({ unreconciledPending: true })
+
+			const { container } = renderPanel(<BankBalance />)
+
+			await waitFor(() => {
+				expect(screen.getByText('Opening Balance')).toBeInTheDocument()
+			})
+			expect(screen.queryByText(/reconciled/)).not.toBeInTheDocument()
+			expect(container.querySelectorAll('[data-slot="skeleton"]')).toHaveLength(1)
+		})
+
+		it('QUIRK - withholds it when a read reports NOT loading while still carrying no data', async () => {
+			// SWR reports `isLoading: false` for a key it has not resolved yet, so the load flags alone
+			// would let the raw `undefined` through; the figures are gated on the DATA as well.
+			frappeSDKMock.useFrappeGetDocCount.mockReturnValue({
+				data: undefined, error: undefined, isLoading: false, isValidating: false, mutate: vi.fn()
+			})
+			answerBalances({ unreconciled: 3 })
+
+			const { container } = renderPanel(<BankBalance />)
+
+			await waitFor(() => {
+				expect(screen.getByText('Opening Balance')).toBeInTheDocument()
+			})
+			expect(screen.queryByText(/undefined/)).not.toBeInTheDocument()
+			expect(screen.queryByText(/-3/)).not.toBeInTheDocument()
+			expect(container.querySelectorAll('[data-slot="skeleton"]')).toHaveLength(1)
+		})
+
+		it('floors the figure at zero when the two reads disagree about the same period', async () => {
+			// They are independent queries over different filter sets, so the outstanding list can be
+			// longer than the count. A negative count of reconciled transactions is never a true
+			// statement about a bank account, so it is floored rather than rendered.
+			frappeSDKMock.useFrappeGetDocCount.mockReturnValue({
+				data: 1, error: undefined, isLoading: false, isValidating: false, mutate: vi.fn()
+			})
+			answerBalances({ unreconciled: 4 })
+
+			renderPanel(<BankBalance />)
+
+			expect(await screen.findByText('0 / 1 reconciled')).toBeInTheDocument()
 		})
 	})
 

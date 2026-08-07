@@ -7,7 +7,7 @@ from frappe.model.docstatus import DocStatus
 from frappe.model.document import Document
 from frappe.query_builder import Tuple
 from frappe.query_builder.functions import Abs, Max, Sum
-from frappe.utils import flt, getdate
+from frappe.utils import flt, fmt_money, getdate
 
 
 class BankTransaction(Document):
@@ -161,6 +161,18 @@ class BankTransaction(Document):
 		is_new_voucher - is used to set the reonciliation type - whether the voucher was added as a result of "Matching" or a new voucher was created.
 		Used in bank reconciliation
 		"""
+		# Only a SUBMITTED transaction has a posted balance to allocate against, and this is the one
+		# place that gate can live: `set_status` derives `status` from `docstatus` and
+		# `unallocated_amount` and writes nothing at all for a draft, so a draft that reached here had
+		# its child rows appended and its allocation rewritten while its status stayed "Pending" - a
+		# reconciliation that never reached the ledger and that no status could reveal. Rejected before
+		# the first `append` so nothing is mutated.
+		if self.docstatus != DocStatus.SUBMITTED:
+			frappe.throw(
+				_("Bank Transaction {0} must be submitted before it can be reconciled").format(self.name),
+				title=_("Not Submitted"),
+			)
+
 		if 0.0 >= self.unallocated_amount:
 			frappe.throw(_("Bank Transaction {0} is already fully reconciled").format(self.name))
 
@@ -211,7 +223,18 @@ class BankTransaction(Document):
 			)
 
 			if allocable_amount < 0:
-				frappe.throw(_("Voucher {0} is over-allocated by {1}").format(allocable_amount))
+				# Two placeholders, and both are now filled. Passing only the amount made `str.format`
+				# raise `IndexError: Replacement index 1 out of range`, so the one path that detects an
+				# over-allocated voucher answered HTTP 500 with a formatting error instead of the
+				# validation error it had already decided on - the reviewer was told nothing about which
+				# voucher was over-allocated, or by how much.
+				frappe.throw(
+					_("Voucher {0} is over-allocated by {1}").format(
+						frappe.bold(f"{payment_entry.payment_document} {payment_entry.payment_entry}"),
+						frappe.bold(fmt_money(abs(allocable_amount), currency=self.currency)),
+					),
+					title=_("Over-allocated Voucher"),
+				)
 
 			if remaining_amount <= 0:
 				self.remove(payment_entry)
@@ -371,7 +394,11 @@ def get_doctypes_for_bank_reconciliation():
 	return frappe.get_hooks("bank_reconciliation_doctypes")
 
 
-@frappe.whitelist()
+# POST-only because this CANCELS accounting vouchers and removes allocations. Left unrestricted it
+# answered a bare GET with HTTP 200: the request-level rollback that follows a read-only GET kept the
+# changes from persisting, so nothing broke - but the caller was told an undo had happened when none
+# had, and any crawler or prefetch could ask for one. The SPA has always sent POST.
+@frappe.whitelist(methods=["POST"])
 def unreconcile_transaction(transaction_name: str | int):
 	"""
 	Unreconcile an entire bank transaction - this does not handle individual entries but clears the entire transaction
@@ -411,6 +438,7 @@ def unreconcile_transaction_entry(bank_transaction_id: str | int, voucher_type: 
 	bank_transaction.check_permission("write")
 
 	# Find the voucher in the bank transaction and depending on the action, either remove it or cancel the voucher
+	undone = False
 	for entry in bank_transaction.payment_entries:
 		if entry.payment_document == voucher_type and entry.payment_entry == voucher_id:
 			if entry.reconciliation_type == "Voucher Created":
@@ -418,6 +446,19 @@ def unreconcile_transaction_entry(bank_transaction_id: str | int, voucher_type: 
 			else:
 				bank_transaction.remove_payment_entry(entry)
 				bank_transaction.save()
+			undone = True
+
+	# `{"success": True}` used to be returned unconditionally, including when the loop above matched
+	# nothing - so asking to undo a voucher that was never linked to this transaction reported a
+	# successful undo while changing nothing at all. A caller reconciling its own view from that answer
+	# would drop a link the server still holds. Named explicitly instead.
+	if not undone:
+		frappe.throw(
+			_("{0} {1} is not linked to Bank Transaction {2}").format(
+				voucher_type, frappe.bold(voucher_id), frappe.bold(bank_transaction.name)
+			),
+			title=_("Nothing to Undo"),
+		)
 
 	return {"success": True}
 

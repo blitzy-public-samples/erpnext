@@ -772,6 +772,28 @@ export const makeMessageOnlyError = (
 		...overrides
 	})
 
+/**
+ * The verbatim text the SDK's own failure handler produces when a request never reaches a server.
+ *
+ * Both the call layer and the file layer build their rejection by spreading `error.response.data`
+ * without checking that `response` exists, so on a dropped, cancelled or unroutable request the
+ * handler itself throws and THAT `TypeError` becomes the rejection the SPA receives. This exact
+ * string is what a reviewer was shown.
+ */
+export const TRANSPORT_FAILURE_MESSAGE = "Cannot read properties of undefined (reading 'data')"
+
+/**
+ * PATH 5 — a rejection that carries NO Frappe envelope at all: no server messages, no error message,
+ * no exception, and no HTTP status, because no response was ever received.
+ *
+ * A real `TypeError` instance rather than a shaped object, because that is literally what the SDK
+ * throws, and because an `Error` carries its `message` on the prototype chain - a fixture spreading
+ * `{ message }` into a plain object would test a shape the runtime never produces.
+ */
+export const makeTransportFailureError = (
+	message: string = TRANSPORT_FAILURE_MESSAGE
+): FrappeError => new TypeError(message) as unknown as FrappeError
+
 /** The default refusal message this module attaches; a caller passes the message it wants to model. */
 const IMPORT_FAILURE_MESSAGE = 'No tables found in the PDF file'
 

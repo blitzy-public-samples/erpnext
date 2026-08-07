@@ -15,11 +15,13 @@ export type PartyTypeDropdownProps = {
     hideOptionsByType?: boolean,
     valueProps?: ComponentProps<typeof SelectValue>,
     triggerProps?: ComponentProps<typeof SelectTrigger>,
+    /** Marks the trigger `aria-required`. Forwarded from `PartyTypeFormField`'s `isRequired`. */
+    isRequired?: boolean,
     // If true, the component will be wrapped in a FormControl component
     useInForm?: boolean
 }
 
-const PartyTypeDropdown = ({ value, onChange, readOnly, disabled, type, hideOptionsByType, valueProps, triggerProps, useInForm }: PartyTypeDropdownProps) => {
+const PartyTypeDropdown = ({ value, onChange, readOnly, disabled, type, hideOptionsByType, valueProps, triggerProps, useInForm, isRequired }: PartyTypeDropdownProps) => {
 
     const { data } = useFrappeGetDocList("Party Type", {
         fields: ['name', 'account_type'],
@@ -63,7 +65,7 @@ const PartyTypeDropdown = ({ value, onChange, readOnly, disabled, type, hideOpti
     return (
         <Select onValueChange={onSelect} value={value} disabled={disabled}>
             {useInForm ? <FormControl>
-                <SelectTrigger tabIndex={0} aria-readonly={readOnly} disabled={disabled || readOnly} {...triggerProps}>
+                <SelectTrigger tabIndex={0} aria-readonly={readOnly} aria-required={isRequired || undefined} disabled={disabled || readOnly} {...triggerProps}>
                     <SelectValue placeholder={_("Type")} aria-readonly={readOnly} {...valueProps} />
                 </SelectTrigger>
             </FormControl> : <SelectTrigger tabIndex={0} {...triggerProps}>

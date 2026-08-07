@@ -9,8 +9,9 @@
  * Five behaviours are surprising on first reading, and each is pinned below under a QUIRK label:
  *
  *   1. Mapping edits SAVE THEMSELVES on a debounce, with no save button, so the preview stays live.
- *   2. The debounce reads the mapping from a REF at fire time, so two quick edits are sent together
- *      rather than the second overwriting the first with a stale snapshot.
+ *   2. The debounce reads the mapping from a REF at fire time, so a save carries the mapping as it
+ *      stands when the timer fires rather than the snapshot taken when the edit was made - which is
+ *      what lets a burst of edits go out together instead of the second losing to the first.
  *   3. A header change is sent IMMEDIATELY, not debounced, and the server's re-derived mapping REPLACES
  *      the local one - the reviewer's column choices are deliberately discarded, because the columns
  *      themselves have just been renamed.
@@ -19,7 +20,7 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import { render, screen, waitFor, fireEvent } from '@testing-library/react'
+import { act, render, screen, waitFor, fireEvent } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { toast } from 'sonner'
 
@@ -84,7 +85,10 @@ const makeDetails = (
 	...overrides
 })
 
-const renderPreview = (data: GetStatementDetailsResponse = makeDetails()) => {
+const renderPreview = (
+	data: GetStatementDetailsResponse = makeDetails(),
+	{ instantInteractions = false }: { instantInteractions?: boolean } = {}
+) => {
 	const updateMapping = vi.fn().mockResolvedValue({ message: data })
 	const setHeader = vi.fn().mockResolvedValue({ message: data })
 	const mutate = vi.fn()
@@ -105,7 +109,15 @@ const renderPreview = (data: GetStatementDetailsResponse = makeDetails()) => {
 		reset: vi.fn()
 	})) as never)
 
-	const user = userEvent.setup()
+	/*
+	 * `delay: null` drops the `setTimeout(0)` user-event awaits between every low-level event it
+	 * dispatches - around a dozen per dropdown selection. Only the one test that has to fit TWO
+	 * selections inside the component's 500ms save debounce asks for it: with the default delay those
+	 * macrotask hops alone can outlast the window on a contended machine, at which point the first edit
+	 * saves by itself and the test reports a collapse the component was never given the chance to make.
+	 * Nothing about the events dispatched changes - only the pauses between them.
+	 */
+	const user = instantInteractions ? userEvent.setup({ delay: null }) : userEvent.setup()
 
 	render(
 		<TooltipProvider>
@@ -149,6 +161,67 @@ const mapColumn = async (
 	await user.click(columnControl(currentLabel))
 	// A Radix Select, so the choices are options rather than menu items.
 	await user.click(await screen.findByRole('option', { name: newLabel }))
+}
+
+/** Matches the debounce the component schedules its mapping save on. */
+const SAVE_DEBOUNCE_MS = 500
+
+/**
+ * Runs `burst` with long timers held rather than left to the wall clock, and hands back a way to fire
+ * them, as the real clock eventually would.
+ *
+ * A burst is only a burst if both edits land inside the 500ms debounce - and two Radix Select
+ * interactions routinely take longer than that on a loaded machine, which fires the first save on its
+ * own and hides the collapsing this test exists to pin. Vitest's fake timers cannot be used to hold the
+ * clock: React Testing Library's async wrapper awaits a real `setTimeout(0)` and only advances a faked
+ * clock when it detects Jest, so under Vitest every awaited interaction would hang for ever. Holding
+ * only the long timers avoids that entirely - everything React, Radix and user-event schedule is short
+ * and keeps running on the real clock.
+ */
+const withHeldLongTimers = async (burst: () => Promise<void>) => {
+	const held = new Map<number, () => void>()
+	const realSetTimeout = globalThis.setTimeout
+	const realClearTimeout = globalThis.clearTimeout
+	// Far above any id jsdom hands out in one test, so a real timer's id can never be mistaken for a
+	// held one when the component cancels its previous save.
+	let nextHeldId = 1_000_000
+
+	const setTimeoutSpy = vi
+		.spyOn(globalThis, 'setTimeout')
+		.mockImplementation(((handler: () => void, ms?: number, ...rest: unknown[]) => {
+			if (typeof ms === 'number' && ms >= SAVE_DEBOUNCE_MS) {
+				const id = ++nextHeldId
+				held.set(id, handler)
+				return id
+			}
+
+			return realSetTimeout(handler, ms, ...rest)
+		}) as never)
+
+	const clearTimeoutSpy = vi
+		.spyOn(globalThis, 'clearTimeout')
+		.mockImplementation(((id?: number) => {
+			if (typeof id === 'number' && held.delete(id)) return
+
+			realClearTimeout(id as never)
+		}) as never)
+
+	try {
+		await burst()
+	} finally {
+		setTimeoutSpy.mockRestore()
+		clearTimeoutSpy.mockRestore()
+	}
+
+	/** Fires everything still scheduled - one save if the burst was collapsed, two if it was not. */
+	return async () => {
+		const due = [...held.values()]
+		held.clear()
+
+		await act(async () => {
+			due.forEach((handler) => handler())
+		})
+	}
 }
 
 describe('CSVRawDataPreview', () => {
@@ -222,28 +295,78 @@ describe('CSVRawDataPreview', () => {
 			})
 		})
 
-		it('QUIRK - collapses a burst of edits into one save carrying all of them', async () => {
-			// The mapping is read from a ref at fire time. Reading the closure instead would send the
-			// first edit twice and lose the second.
-			const { updateMapping, user } = renderPreview()
+		it('QUIRK - a burst of edits saves the mapping as it stands when the timer fires, never a stale snapshot', async () => {
+			/*
+			 * The mapping is read from `mappingRef.current` AT FIRE TIME, not from the closure the timer
+			 * was created in. A save built from a captured `mapping` would be a snapshot from BEFORE one
+			 * of the two edits and would silently drop it - and THAT, rather than how many saves went out,
+			 * is what this pins.
+			 *
+			 * `withHeldLongTimers` keeps the debounce off the wall clock for the duration of the burst, so
+			 * both edits provably land inside one window and the "nothing sent yet" assertion below is a
+			 * statement about the component rather than about the machine.
+			 *
+			 * Deliberately NOT asserted: that the burst collapses into exactly ONE save. Once the held
+			 * timers are released the component is back on the real clock, and each mapping edit needs a
+			 * Radix listbox opened and an option found before it can be made at all - one interaction
+			 * measures 230-410 ms in this harness against a 500 ms window. An exact call count therefore
+			 * reported machine speed: green in isolation, intermittently red inside a full parallel run,
+			 * always by finding a save that carried only the first edit. Both splits - one save with both
+			 * edits, or one save per edit - are correct debounce behaviour, and the ref property below
+			 * holds under either. The debounce itself is pinned separately and deterministically by
+			 * 'saves itself, with no save button anywhere' above (one edit, one save, no save button) and
+			 * by the header test below, which contrasts an immediate send with this deferred one.
+			 *
+			 * The PDF editor's sibling test CAN assert the count, and the difference is the control rather
+			 * than the intent: two region switches are dispatched synchronously with `fireEvent`, so both
+			 * edits provably land in one task.
+			 *
+			 * `instantInteractions` keeps the burst quick on top of all of that.
+			 */
+			const { updateMapping, user } = renderPreview(undefined, { instantInteractions: true })
 
-			await mapColumn(user, 'Withdrawal', 'Do not import')
-			await mapColumn(user, 'Deposit', 'Reference')
+			const fireHeldTimers = await withHeldLongTimers(async () => {
+				await mapColumn(user, 'Withdrawal', 'Do not import') // column index 2
+				await mapColumn(user, 'Deposit', 'Reference') // column index 3
+			})
 
+			// Deterministic: the debounce was held for the whole burst, so no save can have gone out yet
+			// however slow the machine was.
+			expect(updateMapping).not.toHaveBeenCalled()
+
+			await fireHeldTimers()
+
+			// However the burst was split, the LAST save carries BOTH edits, because the ref holds the
+			// mapping as it stands at the moment the timer fires.
 			await waitFor(
 				() => {
-					expect(updateMapping).toHaveBeenCalledTimes(1)
+					// Indexed rather than `Array.prototype.at`, which `tsconfig.app.json`'s ES2020 target
+					// does not declare.
+					const calls = updateMapping.mock.calls
+					expect(calls[calls.length - 1]?.[0].column_mapping).toEqual(
+						expect.arrayContaining([
+							expect.objectContaining({ index: 2, maps_to: 'Do not import' }),
+							expect.objectContaining({ index: 3, maps_to: 'Reference' })
+						])
+					)
 				},
 				{ timeout: 3000 }
 			)
 
-			const sent = updateMapping.mock.calls[0][0].column_mapping
-			expect(sent).toEqual(
-				expect.arrayContaining([
-					expect.objectContaining({ index: 2, maps_to: 'Do not import' }),
-					expect.objectContaining({ index: 3, maps_to: 'Reference' })
-				])
-			)
+			// A stale closure shows itself two ways, and neither may appear: a save carrying the later
+			// edit while the earlier one is missing, and more saves than edits were made.
+			for (const [payload] of updateMapping.mock.calls) {
+				expect(payload).toMatchObject({ statement_import_id: 'csv-log-1' })
+				const mapping = payload.column_mapping
+				const mapsTo = (index: number) =>
+					mapping.find((column: BankStatementImportLogColumnMap) => column.index === index)?.maps_to
+
+				if (mapsTo(3) === 'Reference') {
+					expect(mapsTo(2)).toBe('Do not import')
+				}
+			}
+
+			expect(updateMapping.mock.calls.length).toBeLessThanOrEqual(2)
 		})
 
 		it('reports a refused save rather than pretending it landed', async () => {

@@ -69,7 +69,18 @@ function SettingsDialog({
                     data-slot="settings-dialog"
                     orientation="vertical"
                     className={cn(
-                        "flex h-[calc(100vh-8rem)] bg-surface-menu-bar",
+                        // `min-w-0` here is the one that actually contains the dialog, and it is easy to
+                        // mistake for a duplicate of the `min-w-0` on `SettingsPanels`. They do different
+                        // jobs. `DialogContent` is `display:grid`, so THIS element is a grid item, and a
+                        // grid item's default `min-width:auto` resolves to its content-based minimum -
+                        // meaning the widest thing anywhere inside the dialog set the width of this row,
+                        // and any excess spilled outside the dialog's clipping box where it could neither
+                        // be seen nor clicked. `min-w-0` on `SettingsPanels` alone could not prevent that:
+                        // a `min-width` of 0 is a floor that PERMITS shrinking, not a cap that forces it,
+                        // and nothing was forcing it while this row was free to grow. Clamping the grid
+                        // item pins the row to the grid area, which in turn is what finally gives the
+                        // panel a definite width to shrink into and lets text truncation take effect.
+                        "flex h-[calc(100vh-8rem)] min-w-0 bg-surface-menu-bar",
                         className
                     )}
                     {...props}
@@ -171,7 +182,16 @@ function SettingsPanels({
         <div
             data-slot="settings-panels"
             className={cn(
-                "flex flex-col flex-1 overflow-y-auto bg-surface-modal",
+                // `min-w-0` is load-bearing, not cosmetic. This element is the `flex-1` child of the
+                // dialog's flex row, and a flex item's default `min-width:auto` means it can never
+                // shrink below its own min-content width. A single wide, untruncated descendant (for
+                // example a long Bank Transaction Rule name) therefore inflated the whole flex row
+                // past the dialog's fixed `min-w-5xl`, which pushed the panel header's action buttons
+                // outside the dialog's clipping box and made them impossible to hit-test or click.
+                // Clamping to `min-w-0` pins the panel to the dialog's width; because this element is
+                // already an overflow container, any content that is still too wide now scrolls
+                // inside the panel instead of displacing the dialog's own chrome.
+                "flex flex-col flex-1 min-w-0 overflow-y-auto bg-surface-modal",
                 className
             )}
             {...props}

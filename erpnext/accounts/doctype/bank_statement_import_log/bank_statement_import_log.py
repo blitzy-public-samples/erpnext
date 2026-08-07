@@ -214,6 +214,17 @@ class BankStatementImportLog(Document):
 		elif extension == ".xls":
 			data = read_xls_file_from_attached_file(content)
 
+		if not data:
+			# A file that parses to no rows at all has nothing to detect a header or a column mapping
+			# from, and `set_file_properties` reached straight past the end of it - `detect_header_row`
+			# answers index 0 for an empty list, so `data[0]` raised a bare IndexError HTTP 500. There is
+			# also nothing here the reviewer could remap, unlike a statement whose columns merely need
+			# correcting, so it is refused outright rather than accepted as an empty import log.
+			frappe.throw(
+				_("No rows could be read from this file. Please check that it is a bank statement."),
+				title=_("Empty Statement"),
+			)
+
 		return data
 
 	def set_header_row_index(self, data: list[list[str]]):
@@ -314,8 +325,13 @@ class BankStatementImportLog(Document):
 
 				closing_balance = transaction.get("balance")
 
-		self.start_date = getdate(statement_start_date)
-		self.end_date = getdate(statement_end_date)
+		# `getdate(None)` returns TODAY, so a statement in which no row carried a readable date used to be
+		# stamped with a start and end date of the day it was uploaded - a range the file never contained.
+		# The preview showed it, the import list showed it, and `insert_transactions` then wrote a closing
+		# balance against it. Leaving them unset keeps the range honest: the list renders "-" for a log
+		# with no dates, and the closing-balance write below is already guarded on `end_date`.
+		self.start_date = getdate(statement_start_date) if statement_start_date else None
+		self.end_date = getdate(statement_end_date) if statement_end_date else None
 		self.closing_balance = get_float_amount(closing_balance)
 
 	def get_final_transactions(self, transaction_rows: list):
@@ -515,6 +531,21 @@ class BankStatementImportLog(Document):
 			raw_data = self.get_data()
 			transaction_rows, _starting_index, _ending_index = self.get_transaction_rows(raw_data)
 			final_transactions = self.get_final_transactions(transaction_rows=transaction_rows)
+
+		if not final_transactions:
+			# Nothing usable was parsed out of the statement - a header-only or malformed file, or a
+			# column mapping that resolves to no dated rows. The loop below simply did not run, so the
+			# request answered HTTP 200 and marked the log "Completed" having created no Bank Transaction
+			# at all: the reviewer was told an import had succeeded when the statement had not been
+			# imported. Refusing here is what surfaces the failure - it happens before any row is written
+			# and before the status is advanced, so the log stays importable after the file or the mapping
+			# is corrected.
+			frappe.throw(
+				_(
+					"No transactions could be read from this statement. Please check the column mapping and the header row."
+				),
+				title=_("Nothing to Import"),
+			)
 
 		total_transactions = len(final_transactions)
 
@@ -1213,16 +1244,48 @@ def reextract_pdf_table(statement_import_id: str, page: int, table_index: int, b
 	if doc.status == "Completed":
 		frappe.throw(_("This statement has already been imported."), title=_("Already Imported"))
 
-	bbox = frappe.parse_json(bbox)
+	# The box is four numbers from the client, and it used to be handed straight to the extractor with no
+	# checking at all: a value that is not JSON raised `JSONDecodeError`, a short list an `IndexError` and
+	# a non-numeric entry a `ValueError` - every one of them an HTTP 500 rather than a rejected request.
+	try:
+		bbox = frappe.parse_json(bbox)
+	except (ValueError, TypeError):
+		frappe.throw(_("The table region could not be read."), title=_("Invalid Table Region"))
 
 	page = int(page)
 	table_index = int(table_index)
 
-	content = doc.get_file_doc().get_content()
-	password = doc.get_statement_password()
-	rows = extract_table_in_bbox(content, password, page, [float(v) for v in bbox])
+	if not isinstance(bbox, list | tuple) or len(bbox) != 4:
+		frappe.throw(
+			_("A table region must be given as four numbers: left, top, right, bottom."),
+			title=_("Invalid Table Region"),
+		)
+
+	try:
+		bbox = [float(v) for v in bbox]
+	except (TypeError, ValueError):
+		frappe.throw(_("A table region must be given as four numbers."), title=_("Invalid Table Region"))
 
 	tables = doc.get_pdf_tables()
+
+	# The target table is resolved BEFORE the page is re-extracted, for two reasons: an out-of-range
+	# page reached the extractor and failed there as an IndexError HTTP 500, and a page/index pair that
+	# matched no table fell straight through the loop below and answered HTTP 200 having changed
+	# nothing - so a stale client was told its re-extraction had been applied.
+	target = next(
+		(t for t in tables if t["page"] == page and t["table_index"] == table_index),
+		None,
+	)
+	if target is None:
+		frappe.throw(
+			_("This statement has no table {0} on page {1}.").format(table_index, page),
+			title=_("Table Not Found"),
+		)
+
+	content = doc.get_file_doc().get_content()
+	password = doc.get_statement_password()
+	rows = extract_table_in_bbox(content, password, page, bbox)
+
 	for table in tables:
 		if table["page"] == page and table["table_index"] == table_index:
 			old_columns = max((len(row) for row in table.get("rows", [])), default=0)
@@ -1269,6 +1332,15 @@ def set_pdf_table_header(statement_import_id: str, page: int, table_index: int, 
 	header_index = int(header_index)
 
 	tables = doc.get_pdf_tables()
+
+	# A page/index pair matching no table used to fall through the loop below and answer HTTP 200 having
+	# changed nothing, so a stale client believed its header choice had been saved.
+	if not any(t["page"] == page and t["table_index"] == table_index for t in tables):
+		frappe.throw(
+			_("This statement has no table {0} on page {1}.").format(table_index, page),
+			title=_("Table Not Found"),
+		)
+
 	for table in tables:
 		if table["page"] == page and table["table_index"] == table_index:
 			rows = table.get("rows", [])

@@ -9,7 +9,13 @@ const FileUploadBanner = ({
         <div className="flex flex-col items-center gap-4">
             <CheckCircle size={48} className="text-ink-green-3" />
             <span className="text-ink-gray-8 text-p-base">{_("The document has been created and reconciled. Uploading attachments...")}</span>
-            <Progress value={Math.round(uploadProgress * 100)} size="lg" />
+            {/* Named, because a bar announcing a bare number says nothing about what is progressing. */}
+            <Progress
+                value={Math.round(uploadProgress * 100)}
+                max={100}
+                size="lg"
+                aria-label={_("Attachment upload progress")}
+            />
         </div>
     </div>
 }

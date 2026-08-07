@@ -25,6 +25,9 @@ export interface AccountsDropdownProps {
     useInForm?: boolean,
     buttonClassName?: string,
     size?: 'sm' | 'md' | 'lg',
+    /** Marks the trigger `aria-required` so the constraint the label's asterisk draws is also
+     *  programmatically determinable. Forwarded from `AccountFormField`'s `isRequired`. */
+    isRequired?: boolean,
 }
 /**
  * Component to select an account - supports fuzzy search
@@ -35,7 +38,7 @@ export interface AccountsDropdownProps {
  * @param onChange - The function to call when the value changes
  * @returns 
  */
-const AccountsDropdown = ({ root_type, report_type, account_type, value, onChange, readOnly, disabled, company, filterFunction, useInForm, buttonClassName, size = 'md' }: AccountsDropdownProps) => {
+const AccountsDropdown = ({ root_type, report_type, account_type, value, onChange, readOnly, disabled, company, filterFunction, useInForm, buttonClassName, size = 'md', isRequired }: AccountsDropdownProps) => {
 
     const { data } = useGetAccounts(root_type, report_type, account_type, company, filterFunction)
 
@@ -125,6 +128,7 @@ const AccountsDropdown = ({ root_type, report_type, account_type, value, onChang
                         tabIndex={0}
                         disabled={disabled || readOnly}
                         aria-readonly={readOnly}
+                        aria-required={isRequired || undefined}
                         aria-expanded={open}
                         className={cn("w-full justify-between font-normal",
                             readOnly ? "bg-surface-gray-1 pointer-events-none" : ""

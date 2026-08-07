@@ -255,6 +255,21 @@ describe('BankTransactionList', () => {
 
 	describe('its filters', () => {
 
+		/*
+		 * The amount box is CONTROLLED and mounts already holding ₹0.00, so it has to be emptied before
+		 * a figure is typed - otherwise the keystrokes land after the zeros. And each keystroke needs a
+		 * gap, so it is composed on a value React has re-rendered rather than on a stale one: a race in
+		 * the harness, not in the product.
+		 */
+		const typeAmount = async (user: ReturnType<typeof userEvent.setup>, amount: string) => {
+			const field = await screen.findByPlaceholderText('₹0.00')
+			await user.clear(field)
+			await user.type(field, amount)
+			return field
+		}
+
+		const typist = () => userEvent.setup({ delay: 20 })
+
 		it('offers a search box and an amount box', async () => {
 			answerWith([transaction()])
 
@@ -290,6 +305,132 @@ describe('BankTransactionList', () => {
 			await waitFor(() => {
 				expect(screen.getByText('RTGS outbound to Globex Supplies')).toBeInTheDocument()
 			}, { timeout: 3000 })
+		})
+
+		it('narrows the list to a searched reference number, which is a column the reviewer can see', async () => {
+			// The regression this pins: the filter tested `description` alone, so a reviewer chasing a
+			// cheque or UTR number off a paper statement could read that number in the "Reference #"
+			// column and still be told there were no results.
+			const user = userEvent.setup()
+
+			answerWith([
+				transaction({
+					name: 'ACC-BTN-2026-00001',
+					description: 'NEFT inbound from ACME Traders',
+					reference_number: 'UTR-778899'
+				}),
+				transaction({
+					name: 'ACC-BTN-2026-00002',
+					description: 'RTGS outbound to Globex Supplies',
+					reference_number: 'CHQ-112233'
+				})
+			])
+
+			renderPanel(<BankTransactions />)
+
+			await screen.findByText('NEFT inbound from ACME Traders')
+
+			await user.type(await screen.findByPlaceholderText('Search'), 'CHQ-112233')
+
+			// The discriminating wait: the row that does NOT match must leave. Waiting for the matching
+			// row to appear would pass before the debounce had fired, since both start on screen.
+			await waitFor(() => {
+				expect(screen.queryByText('NEFT inbound from ACME Traders')).not.toBeInTheDocument()
+			}, { timeout: 3000 })
+
+			// And the row found only by its reference number survived.
+			expect(screen.getByText('RTGS outbound to Globex Supplies')).toBeInTheDocument()
+		})
+
+		it('matches a reference case-insensitively, the way it already matched a description', async () => {
+			const user = userEvent.setup()
+
+			answerWith([
+				transaction({ name: 'ACC-BTN-2026-00001', description: 'Alpha', reference_number: 'UTR-778899' }),
+				transaction({ name: 'ACC-BTN-2026-00002', description: 'Beta', reference_number: 'chq-112233' })
+			])
+
+			renderPanel(<BankTransactions />)
+			await screen.findByText('Alpha')
+
+			await user.type(await screen.findByPlaceholderText('Search'), 'CHQ')
+
+			await waitFor(() => {
+				expect(screen.queryByText('Alpha')).not.toBeInTheDocument()
+			}, { timeout: 3000 })
+			expect(screen.getByText('Beta')).toBeInTheDocument()
+		})
+
+		it('keeps a row whose reference is absent but whose description still matches', async () => {
+			// `reference_number` is optional on the endpoint's payload, so the reference test must not
+			// throw away a row that has none.
+			const user = userEvent.setup()
+
+			answerWith([
+				transaction({ name: 'ACC-BTN-2026-00001', description: 'Globex settlement', reference_number: undefined })
+			])
+
+			renderPanel(<BankTransactions />)
+			await screen.findByText('Globex settlement')
+
+			await user.type(await screen.findByPlaceholderText('Search'), 'Globex')
+
+			await waitFor(() => {
+				expect(screen.getByText('Globex settlement')).toBeInTheDocument()
+			}, { timeout: 3000 })
+		})
+
+		it('gives both filter boxes an accessible name rather than leaving the label orphaned', async () => {
+			// Both labels previously carried neither `htmlFor` nor the input inside them, so they named
+			// nothing and each field fell back to its placeholder.
+			answerWith([transaction()])
+
+			renderPanel(<BankTransactions />)
+
+			const search = await screen.findByPlaceholderText('Search')
+			const amount = await screen.findByPlaceholderText('₹0.00')
+
+			expect(search).toHaveAccessibleName('Search by description or reference')
+			expect(amount).toHaveAccessibleName('Filter by amount')
+
+			// The <label> must actually resolve to the control, not merely sit beside it.
+			const searchLabel = document.querySelector('label[for="bank-txn-list-search"]')
+			const amountLabel = document.querySelector('label[for="bank-txn-list-amount-filter"]')
+			expect(searchLabel).toBeInTheDocument()
+			expect(amountLabel).toBeInTheDocument()
+			expect(document.getElementById('bank-txn-list-search')).toBe(search)
+			expect(document.getElementById('bank-txn-list-amount-filter')).toBe(amount)
+		})
+
+		it('drops stray letters from the amount box instead of reading one as a magnitude', async () => {
+			// The same defect this list shared with the workbench filter: the library's k/m/b shorthand
+			// read the `b` in `12ab34` as "billion" and filtered on a figure nobody typed.
+			const user = typist()
+
+			answerWith([transaction()])
+
+			renderPanel(<BankTransactions />)
+
+			const amount = await typeAmount(user, '12ab34')
+
+			expect((amount as HTMLInputElement).value).not.toContain('b')
+			expect((amount as HTMLInputElement).value).toBe('₹1,234')
+		})
+
+		it('refuses a negative amount out loud rather than accepting it and filtering nothing', async () => {
+			const user = typist()
+
+			answerWith([transaction()])
+
+			renderPanel(<BankTransactions />)
+
+			const amount = await typeAmount(user, '-50')
+
+			const message = await screen.findByRole('alert')
+			expect(message).toHaveTextContent(/negative amount cannot match/i)
+			expect(amount).toHaveAttribute('aria-invalid', 'true')
+			expect(amount).toHaveAttribute('aria-describedby', 'bank-txn-list-amount-filter-error')
+			expect(message).toHaveAttribute('id', 'bank-txn-list-amount-filter-error')
 		})
 	})
 

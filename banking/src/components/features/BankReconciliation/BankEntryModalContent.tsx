@@ -1,5 +1,5 @@
 import { useAtomValue, useSetAtom } from "jotai"
-import { bankRecRecordJournalEntryModalAtom, bankRecSelectedTransactionAtom, bankRecUnreconcileModalAtom, selectedBankAccountAtom } from "./bankRecAtoms"
+import { bankRecRecordJournalEntryModalAtom, bankRecSelectedTransactionsAtom, bankRecUnreconcileModalAtom, selectedBankAccountAtom } from "./bankRecAtoms"
 import { DialogFooter, DialogClose } from "@/components/ui/dialog"
 import _ from "@/lib/translate"
 import { UnreconciledTransaction, useGetRuleForTransaction, useRefreshUnreconciledTransactions, useUpdateActionLog } from "./utils"
@@ -34,7 +34,7 @@ const RecordBankEntryModalContent = () => {
 
     const selectedBankAccount = useAtomValue(selectedBankAccountAtom)
 
-    const selectedTransaction = useAtomValue(bankRecSelectedTransactionAtom(selectedBankAccount?.name ?? ''))
+    const selectedTransaction = useAtomValue(bankRecSelectedTransactionsAtom)
 
     if (!selectedTransaction || !selectedBankAccount || selectedTransaction.length === 0) {
         return <div className='p-4'>
@@ -397,8 +397,8 @@ const BankEntryForm = ({ selectedTransaction }: { selectedTransaction: Unreconci
                             data-slot="form-item"
                             className="flex flex-col gap-2"
                         >
-                            <Label>{_("Attachments")}</Label>
-                            <FileDropzone files={files} setFiles={setFiles} />
+                            <Label htmlFor="bank-entry-attachments">{_("Attachments")}</Label>
+                            <FileDropzone files={files} setFiles={setFiles} inputId="bank-entry-attachments" />
                         </div>
                     </div>
                 </div>
@@ -566,8 +566,10 @@ const Entries = ({ company, isWithdrawal, currency }: { company: string, isWithd
                     <TableHead>{_("Account")}</TableHead>
                     <TableHead>{_("Cost Center")}</TableHead>
                     <TableHead>{_("Remarks")}</TableHead>
-                    <TableHead className="text-end">{_("Debit")}</TableHead>
-                    <TableHead className="text-end">{_("Credit")}</TableHead>
+                    {/* Mirrors the body cells' minimum so the column keeps its width even when the
+                        table is rendered with no entry rows. */}
+                    <TableHead className="text-end min-w-40">{_("Debit")}</TableHead>
+                    <TableHead className="text-end min-w-40">{_("Credit")}</TableHead>
                 </TableRow>
             </TableHeader>
             <TableBody>
@@ -643,7 +645,16 @@ const Entries = ({ company, isWithdrawal, currency }: { company: string, isWithd
                                 hideLabel
                             />
                         </TableCell>
-                        <TableCell className={cn("text-end align-top")}>
+                        {/* The amount columns were the only ones in this table without a minimum width.
+                            Every other wide column declares one (Account min-w-64, Cost Center min-w-48,
+                            Remarks min-w-64), so auto table layout handed the two amount cells whatever
+                            was left over and squeezed the currency inputs until a posted figure was cut
+                            off mid-number - unreadable, and on a monetary field, dangerous. min-w-40
+                            (160px) holds the widest value these fields accept: the CurrencyInput caps the
+                            value at maxLength 12, so with the currency prefix the longest string is about
+                            15 glyphs. The Table's own overflow-x-auto absorbs the extra width, which is
+                            the right trade - a scrollable row beats a clipped amount. */}
+                        <TableCell className={cn("text-end align-top min-w-40")}>
                             <CurrencyFormField
                                 name={`entries.${index}.debit`}
                                 label={_("Debit")}
@@ -660,7 +671,7 @@ const Entries = ({ company, isWithdrawal, currency }: { company: string, isWithd
                                 </Tooltip> : undefined}
                             />
                         </TableCell>
-                        <TableCell className={cn("text-end align-top")}>
+                        <TableCell className={cn("text-end align-top min-w-40")}>
                             <CurrencyFormField
                                 name={`entries.${index}.credit`}
                                 style={index === 0 && isWithdrawal ? {

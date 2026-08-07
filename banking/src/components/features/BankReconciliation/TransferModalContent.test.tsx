@@ -31,7 +31,7 @@ import { createFrappeSDKMock, frappeSDKMock, makeUnreconciledTransaction } from 
 vi.mock('frappe-react-sdk', () => createFrappeSDKMock())
 
 import TransferModalContent from './TransferModalContent'
-import { bankRecSelectedTransactionAtom, selectedBankAccountAtom } from './bankRecAtoms'
+import { bankRecSelectedTransactionsAtom, selectedBankAccountAtom } from './bankRecAtoms'
 import { makePanelBank } from '@/test/renderPanel'
 
 const SINGLE_ENDPOINT =
@@ -52,7 +52,7 @@ const transfer = (overrides: Record<string, unknown> = {}) =>
 const renderModal = (selection: ReturnType<typeof transfer>[] = [], bank = makePanelBank()) => {
 	const store = createStore()
 	store.set(selectedBankAccountAtom, bank)
-	store.set(bankRecSelectedTransactionAtom(bank?.name ?? ''), selection)
+	store.set(bankRecSelectedTransactionsAtom, selection)
 
 	return {
 		store,
@@ -198,8 +198,15 @@ describe('TransferModalContent', () => {
 
 		it('sees nothing when the selection was made against a DIFFERENT account', () => {
 			const store = createStore()
+
+			/*
+			 * The selection is made while ANOTHER account is picked, then the account is switched. That is
+			 * how a cross-scope selection actually arises, and it also pins the half that used to fail:
+			 * the selection is orphaned rather than parked, so switching back cannot replay it.
+			 */
+			store.set(selectedBankAccountAtom, makePanelBank({ name: 'Some Other Account' }))
+			store.set(bankRecSelectedTransactionsAtom, [transfer()])
 			store.set(selectedBankAccountAtom, makePanelBank())
-			store.set(bankRecSelectedTransactionAtom('Some Other Account'), [transfer()])
 
 			render(
 				<Provider store={store}>

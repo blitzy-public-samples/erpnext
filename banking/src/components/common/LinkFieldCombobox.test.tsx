@@ -21,7 +21,7 @@
  *      leaves for the desk rather than opening a nested form.
  */
 
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { afterAll, describe, expect, it, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
@@ -139,6 +139,29 @@ const renderCombobox = ({
 
 	return { user, onChange }
 }
+
+/**
+ * The debounce this component searches through, in milliseconds — `useDebounceValue('', 400)`.
+ *
+ * Two tests below assert immediately after typing, which deliberately leaves that timer pending: the
+ * point of those tests is that the intermediate keystrokes never reach the server. The timer then has
+ * to be drained before this file's jsdom environment is destroyed, because `usehooks-ts` cancels the
+ * wrong instance on unmount — `useDebounceCallback` invokes the `debounce` built inside its `useMemo`
+ * but `useUnmount` cancels the separate one built in its `useEffect` — so the pending timer outlives
+ * both the unmounted component and the environment. Firing after teardown makes React's
+ * `resolveUpdatePriority` read a `window` that no longer exists, which surfaces as an unhandled
+ * `ReferenceError` and fails the whole run even though every test passed.
+ */
+const SEARCH_DEBOUNCE_MS = 400
+
+/*
+ * Let those timers fire while the environment is still alive, where the state update they carry is a
+ * harmless no-op on an unmounted root. Real timers are used rather than fake ones because
+ * `userEvent.setup()` above drives the typing on the real clock.
+ */
+afterAll(async () => {
+	await new Promise((resolve) => setTimeout(resolve, SEARCH_DEBOUNCE_MS + 100))
+})
 
 const trigger = () => screen.getByRole('combobox')
 

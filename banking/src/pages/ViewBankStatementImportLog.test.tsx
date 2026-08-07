@@ -5,16 +5,18 @@
  * the spreadsheet workflow or the PDF workflow. Everything visible belongs to one of those two, so the
  * behaviour worth specifying is the routing itself and the states it refuses to route in.
  *
- * Four behaviours are surprising on first reading, and each is pinned below under a QUIRK label:
+ * The ORDER of its four guards is the behaviour most worth pinning, because getting it wrong is how this
+ * page came to render a blank frame for both of the states a reviewer most needs explained. `data` is
+ * absent while a read is in flight AND after one fails, so a no-data guard placed first swallows the two
+ * states below it: pending and failed became indistinguishable, and both looked like an empty page. The
+ * order asserted here is pending, then failed, then genuinely-absent, then the workflow itself.
+ *
+ * Two behaviours are surprising on first reading, and each is pinned below under a QUIRK label:
  *
  *   1. The choice of workflow is made from the FILE EXTENSION, not from a field on the document, and the
  *      comparison is case-insensitive - so `STATEMENT.PDF` routes correctly.
- *   2. The "Loading..." branch is DEAD CODE. The no-data guard is checked first, and while a read is in
- *      flight there is no data, so the page renders nothing at all instead of a loading message.
- *   3. It renders nothing rather than an empty frame when the log is absent, which is what keeps a bad
- *      URL from looking like an empty statement.
- *   4. A failed read still offers a way back to the list, because the reviewer would otherwise be
- *      stranded on a dead route.
+ *   2. A failed read still offers a way back to the list, because the reviewer would otherwise be
+ *      stranded on a dead route - and so does the absent-log state, for the same reason.
  *
  * The two workflow components are lazily imported, so each routing assertion waits for the chunk rather
  * than asserting synchronously.
@@ -22,7 +24,7 @@
 
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
-import { MemoryRouter } from 'react-router'
+import { MemoryRouter, Route, Routes } from 'react-router'
 import { Provider, createStore } from 'jotai'
 
 import {
@@ -120,11 +122,16 @@ const renderRoute = ({ details, error, isLoading = false }: RouteOptions = {}) =
 
 	const store = createStore()
 
+	// Mounted behind its real route pattern rather than directly, because the page reads the log's id out
+	// of the route params and reports it in the absent-log state: rendered bare, `useParams` yields nothing
+	// and that reporting would go untested.
 	return render(
 		<Provider store={store}>
 			<TooltipProvider>
 				<MemoryRouter initialEntries={['/statement-importer/log-1']}>
-					<ViewBankStatementImportLog />
+					<Routes>
+						<Route path="/statement-importer/:id" element={<ViewBankStatementImportLog />} />
+					</Routes>
 				</MemoryRouter>
 			</TooltipProvider>
 		</Provider>
@@ -143,30 +150,37 @@ describe('ViewBankStatementImportLog', () => {
 		} as never)
 	})
 
-	describe('before the log has arrived', () => {
+	describe('while the read is in flight', () => {
 
-		it('QUIRK - renders nothing rather than an empty frame', () => {
-			// A bad or deleted id must not look like a statement with no transactions in it.
-			const { container } = renderRoute()
+		it('says it is loading, in place of the statement', () => {
+			// The reviewer arrives here by clicking a row in the importer list, so SOMETHING has to occupy
+			// the page while the read runs: a blank one reads as "this import is empty".
+			renderRoute({ isLoading: true })
 
-			expect(container).toBeEmptyDOMElement()
+			expect(screen.getByRole('status')).toHaveTextContent('Loading')
 		})
 
-		it('QUIRK - never shows its own loading message, because that branch is unreachable', () => {
-			// The no-data guard runs BEFORE the `isLoading` check, and a read in flight has no data,
-			// so `Loading...` can never render. Pinned rather than fixed: the empty render is the
-			// better behaviour anyway, and reordering the guards would introduce a flash of text that
-			// no other route in the SPA shows.
+		it('shows a skeleton of the grid it is about to draw, not an error and not a way back', () => {
+			// A pending read is not a failure, so neither the refusal nor its escape hatch belongs here -
+			// offering "Back" while a read is merely slow invites the reviewer to abandon it.
 			const { container } = renderRoute({ isLoading: true })
 
-			expect(screen.queryByText('Loading...')).not.toBeInTheDocument()
-			expect(container).toBeEmptyDOMElement()
+			expect(container.querySelectorAll('[data-slot="skeleton"]').length).toBeGreaterThan(0)
+			expect(screen.queryByRole('link', { name: /Back/ })).not.toBeInTheDocument()
 		})
 	})
 
 	describe('when the read fails', () => {
 
-		it('shows the refusal', () => {
+		it('shows the refusal even though the failed read left no data behind', () => {
+			// The whole point of the guard order: a server that throws returns no `data`, so a no-data
+			// guard checked first would swallow this and render an empty page instead of the reason.
+			renderRoute({ error: makeServerMessagesError('Not permitted') })
+
+			expect(screen.getByText('Not permitted')).toBeInTheDocument()
+		})
+
+		it('shows the refusal when a previous read had already delivered data', () => {
 			renderRoute({
 				details: makeDetails('statement.csv'),
 				error: makeServerMessagesError('Not permitted')
@@ -177,15 +191,52 @@ describe('ViewBankStatementImportLog', () => {
 
 		it('QUIRK - still offers a way back to the list', () => {
 			// Without this the reviewer is stranded: the route renders no navigation of its own.
-			renderRoute({
-				details: makeDetails('statement.csv'),
-				error: makeServerMessagesError('Not permitted')
-			})
+			renderRoute({ error: makeServerMessagesError('Not permitted') })
 
 			expect(screen.getByRole('link', { name: /Back/ })).toHaveAttribute(
 				'href',
 				'/statement-importer'
 			)
+		})
+
+		it('does not also draw the loading skeleton', () => {
+			const { container } = renderRoute({ error: makeServerMessagesError('Not permitted') })
+
+			expect(container.querySelectorAll('[data-slot="skeleton"]')).toHaveLength(0)
+		})
+	})
+
+	describe('when the log itself is absent', () => {
+
+		it('names the state instead of rendering an empty page', () => {
+			// A settled read that returned nothing is a deleted or mistyped log, and it must not look like
+			// a statement that happens to hold no transactions.
+			renderRoute()
+
+			expect(screen.getByText('This statement import could not be opened')).toBeInTheDocument()
+		})
+
+		it('names the id it could not open, so the reviewer can tell which one is gone', () => {
+			renderRoute()
+
+			expect(screen.getByText(/log-1/)).toBeInTheDocument()
+		})
+
+		it('offers the same way back to the list', () => {
+			renderRoute()
+
+			expect(screen.getByRole('link', { name: /Back/ })).toHaveAttribute(
+				'href',
+				'/statement-importer'
+			)
+		})
+
+		it('does not claim a failure it was not told about', () => {
+			// Nothing was refused here - the read simply came back empty - so no error surface belongs on
+			// the page. `alert` is what the refusal branch renders through.
+			renderRoute()
+
+			expect(screen.queryByRole('alert')).not.toBeInTheDocument()
 		})
 	})
 

@@ -1,10 +1,10 @@
 import _ from '@/lib/translate'
-import { Dispatch, SetStateAction, useCallback } from 'react'
-import { Accept, useDropzone } from 'react-dropzone'
+import { Dispatch, SetStateAction, useCallback, useId } from 'react'
+import { Accept, ErrorCode, useDropzone, type FileRejection } from 'react-dropzone'
 import { cn } from '@/lib/utils'
 import { formatBytes, getFileExtension } from '@/lib/file'
 import { Button } from './button'
-import { Trash2Icon } from 'lucide-react'
+import { CircleAlertIcon, Trash2Icon } from 'lucide-react'
 
 type Props = {
     files: File[],
@@ -14,12 +14,60 @@ type Props = {
     onDrop?: (acceptedFiles: File[]) => void,
     onUpdate?: VoidFunction
     className?: string
+    /**
+     * Id placed on the file input, so a caller's own `<Label>` can carry a matching `htmlFor`.
+     *
+     * The input is deliberately not `aria-hidden` - it IS the control - but it lives inside the dropzone
+     * while the label that describes it sits outside, so without an explicit id the two could not be
+     * associated and Chrome reported "No label associated with a form field".
+     */
+    inputId?: string
 }
 
-export const FileDropzone = ({ files, setFiles, accept, multiple = true, onDrop, className, onUpdate }: Props) => {
+/**
+ * Says why a file was turned away, in the reviewer's language rather than the library's.
+ *
+ * The refusal happens entirely on the client - the file never reaches the server - so nothing else can
+ * explain it. The supported extensions are read back out of the `accept` map the caller supplied, so the
+ * message can never drift from what is actually accepted.
+ */
+const describeRejection = (rejection: FileRejection, accept?: Accept): string => {
+
+    const extensions = accept ? Object.values(accept).flat().join(', ') : ''
+
+    return rejection.errors.map((error) => {
+        switch (error.code) {
+            case ErrorCode.FileInvalidType:
+                return extensions
+                    ? _("{0} is not a file type we can read. Supported types: {1}.", [rejection.file.name, extensions])
+                    : _("{0} is not a file type we can read.", [rejection.file.name])
+            case ErrorCode.FileTooLarge:
+                return _("{0} is too large to upload.", [rejection.file.name])
+            case ErrorCode.FileTooSmall:
+                return _("{0} is too small to be a statement.", [rejection.file.name])
+            case ErrorCode.TooManyFiles:
+                return _("Only one file can be uploaded at a time.")
+            default:
+                // A validator the caller supplied, or a code this version of the library added later:
+                // pass its own message through rather than swallowing the refusal.
+                return _("{0} was not accepted. {1}", [rejection.file.name, error.message])
+        }
+    }).join(' ')
+}
+
+export const FileDropzone = ({ files, setFiles, accept, multiple = true, onDrop, className, onUpdate, inputId }: Props) => {
 
     const onFileDrop = useCallback((acceptedFiles: File[]) => {
-        // Do something with the files
+        /*
+         * The library calls this for EVERY drop, including one where it accepted nothing - and in
+         * single-file mode the assignment below then replaced the staged file with an empty list. So
+         * dropping an unsupported file on top of a perfectly good statement silently discarded the good
+         * one, and the reviewer had to find and choose it again. A refusal must cost nothing.
+         */
+        if (acceptedFiles.length === 0) {
+            return
+        }
+
         if (multiple) {
             setFiles?.((prev) => [...prev, ...acceptedFiles])
         } else {
@@ -29,11 +77,53 @@ export const FileDropzone = ({ files, setFiles, accept, multiple = true, onDrop,
         onUpdate?.()
 
     }, [setFiles, onDrop, multiple, onUpdate])
-    const { getRootProps, getInputProps } = useDropzone({ onDrop: onFileDrop, accept, multiple })
+
+    /*
+     * `fileRejections` is what makes a refusal visible at all. A file that fails the `accept` map is
+     * dropped from `acceptedFiles` and never reaches `onFileDrop`, so before this the component looked
+     * exactly as it did when idle: no message, no styling, and an Upload button that simply stayed
+     * disabled for no stated reason. The list is reset by the library on every new drop or pick, so a
+     * successful selection clears the previous complaint without any bookkeeping here.
+     */
+    const { getRootProps, getInputProps, isDragActive, isDragAccept, isDragReject, fileRejections } =
+        useDropzone({ onDrop: onFileDrop, accept, multiple })
+
+    const rejectionId = useId()
+    const hasRejections = fileRejections.length > 0
+
     return (
-        <div {...getRootProps()} className={cn('border border-outline-gray-2 border-dashed p-4 rounded bg-surface-gray-1 focus-within:bg-surface-gray-2 hover:bg-surface-gray-2 hover:border-outline-gray-3 focus-within:border-outline-gray-3 focus-within:outline-none', className)}>
-            <input {...getInputProps()} />
+        <div
+            {...getRootProps()}
+            /* The drag state is exposed as data rather than inferred from classes, so it can be asserted. */
+            data-drag-state={isDragReject ? 'reject' : isDragAccept ? 'accept' : isDragActive ? 'active' : 'idle'}
+            className={cn(
+                'border border-outline-gray-2 border-dashed p-4 rounded bg-surface-gray-1 focus-within:bg-surface-gray-2 hover:bg-surface-gray-2 hover:border-outline-gray-3 focus-within:border-outline-gray-3 focus-within:outline-none',
+                // Answers the drag BEFORE the drop, so a file that is about to be refused says so while
+                // the reviewer can still change their mind.
+                isDragAccept && 'border-outline-green-3 bg-surface-green-1',
+                (isDragReject || hasRejections) && 'border-outline-red-3 bg-surface-red-1',
+                className
+            )}>
+            <input
+                {...getInputProps()}
+                id={inputId}
+                aria-invalid={hasRejections || undefined}
+                aria-describedby={hasRejections ? rejectionId : undefined} />
             {files.length === 0 ? <p className='text-sm text-ink-gray-5 text-center h-8 flex items-center justify-center'>{multiple ? _("Drop some files here, or click to select files") : _("Drop a file here, or click to select a file")}</p> : null}
+            {hasRejections && (
+                /* `alert` rather than `status`: the reviewer's action was refused and they are waiting on
+                   the outcome, so it is worth interrupting for. */
+                <div id={rejectionId} role='alert' className='flex items-start gap-2 pt-3 text-p-sm text-ink-red-3'>
+                    <CircleAlertIcon className='size-4 shrink-0 mt-0.5' aria-hidden='true' />
+                    <div className='flex flex-col gap-0.5'>
+                        {fileRejections.map((rejection) => (
+                            <span key={`${rejection.file.name}-${rejection.file.size}`}>
+                                {describeRejection(rejection, accept)}
+                            </span>
+                        ))}
+                    </div>
+                </div>
+            )}
             <div className='flex flex-col gap-4'>
                 {files.map(f => <div key={f.name} className='flex justify-between items-center'>
                     <div className='flex items-center gap-2'>

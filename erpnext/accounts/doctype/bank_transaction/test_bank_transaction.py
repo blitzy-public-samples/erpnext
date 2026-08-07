@@ -11,6 +11,7 @@ from erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool 
 	get_linked_payments,
 	reconcile_vouchers,
 )
+from erpnext.accounts.doctype.bank_transaction.bank_transaction import unreconcile_transaction_entry
 from erpnext.accounts.doctype.mode_of_payment.test_mode_of_payment import (
 	set_default_account_for_mode_of_payment,
 )
@@ -265,6 +266,199 @@ class TestBankTransaction(ERPNextTestSuite):
 		bank_transaction.reload()
 		self.assertEqual(bank_transaction.status, "Reconciled")
 		self.assertEqual(bank_transaction.unallocated_amount, 0)
+
+	def test_reconcile_refuses_a_draft_transaction(self):
+		"""
+		Only a submitted transaction may be reconciled.
+
+		`set_status` derives `status` from `docstatus` and writes nothing at all for a draft, so before
+		this guard a draft accepted the whole reconciliation - child row, allocation, cleared voucher -
+		while still reporting "Pending". Nothing downstream could then tell that the money had been
+		claimed against a transaction the ledger had never seen.
+		"""
+		submitted = frappe.get_doc(
+			"Bank Transaction",
+			dict(description="1512567 BG/000003025 OPSKATTUZWXXX AT776000000098709849 Herr G"),
+		)
+		draft = frappe.get_doc(
+			{
+				"doctype": "Bank Transaction",
+				"description": "draft transaction that must not be reconcilable",
+				"date": submitted.date,
+				"deposit": 1700,
+				"currency": submitted.currency,
+				"bank_account": submitted.bank_account,
+			}
+		).insert()
+		self.assertTrue(draft.docstatus.is_draft())
+
+		payment = frappe.get_doc("Payment Entry", dict(party="Mr G", paid_amount=1700))
+		vouchers = json.dumps(
+			[
+				{
+					"payment_doctype": "Payment Entry",
+					"payment_name": payment.name,
+					"amount": draft.unallocated_amount,
+				}
+			]
+		)
+		self.assertRaises(
+			frappe.ValidationError,
+			reconcile_vouchers,
+			bank_transaction_name=draft.name,
+			vouchers=vouchers,
+		)
+
+		# Refused before the first `append`, so none of the three things a reconciliation writes exist.
+		draft.reload()
+		self.assertEqual(draft.payment_entries, [])
+		self.assertEqual(draft.allocated_amount, 0)
+		self.assertEqual(draft.unallocated_amount, 1700)
+		self.assertEqual(draft.status, "Pending")
+		self.assertIsNone(frappe.db.get_value("Payment Entry", payment.name, "clearance_date"))
+
+	def test_over_allocated_voucher_is_reported_as_a_validation_error(self):
+		"""
+		The over-allocation refusal has to reach the caller as the validation error it is.
+
+		Its message carries two placeholders but was given one argument, so `str.format` raised
+		`IndexError: Replacement index 1 out of range` from inside the refusal itself: the request
+		answered HTTP 500 with a formatting bug, and the reviewer learned neither which voucher was
+		over-allocated nor by how much. The rollback was always correct - only the answer was not.
+		"""
+		first = frappe.get_doc(
+			"Bank Transaction",
+			dict(description="1512567 BG/000002918 OPSKATTUZWXXX AT776000000098709837 Herr G"),
+		)
+		payment = frappe.get_doc("Payment Entry", dict(party="Mr G", paid_amount=1200))
+		reconcile_vouchers(
+			first.name,
+			json.dumps(
+				[
+					{
+						"payment_doctype": "Payment Entry",
+						"payment_name": payment.name,
+						"amount": first.unallocated_amount,
+					}
+				]
+			),
+		)
+
+		# Drift the persisted allocation past the voucher's own amount. This is the state that makes
+		# `get_clearance_details` return a negative allocable amount for the next transaction, and it is
+		# reachable in real data whenever a voucher is amended after it was allocated.
+		allocation = frappe.db.get_value("Bank Transaction Payments", {"parent": first.name}, "name")
+		frappe.db.set_value(
+			"Bank Transaction Payments", allocation, "allocated_amount", 1201, update_modified=False
+		)
+
+		second = frappe.get_doc(
+			"Bank Transaction",
+			dict(description="1512567 BG/000003025 OPSKATTUZWXXX AT776000000098709849 Herr G"),
+		)
+		before = frappe.db.get_value(
+			"Bank Transaction", second.name, ["status", "allocated_amount", "unallocated_amount"]
+		)
+
+		with self.assertRaises(frappe.ValidationError) as refusal:
+			reconcile_vouchers(
+				second.name,
+				json.dumps(
+					[
+						{
+							"payment_doctype": "Payment Entry",
+							"payment_name": payment.name,
+							"amount": second.unallocated_amount,
+						}
+					]
+				),
+			)
+
+		# The refusal names the voucher and the amount, which is what the failed `format` call could not.
+		message = frappe.utils.strip_html(str(refusal.exception))
+		self.assertIn("over-allocated", message)
+		self.assertIn(payment.name, message)
+
+		# And the transaction it refused is byte-identical to how it started.
+		self.assertEqual(
+			frappe.db.get_value(
+				"Bank Transaction", second.name, ["status", "allocated_amount", "unallocated_amount"]
+			),
+			before,
+		)
+		self.assertIsNone(
+			frappe.db.get_value(
+				"Bank Transaction Payments",
+				{"parent": second.name, "payment_entry": payment.name},
+				"name",
+			)
+		)
+
+	def test_unreconcile_entry_undoes_a_linked_voucher(self):
+		# The refusal below is only meaningful if the ordinary undo still works.
+		bank_transaction = frappe.get_doc(
+			"Bank Transaction",
+			dict(description="1512567 BG/000003025 OPSKATTUZWXXX AT776000000098709849 Herr G"),
+		)
+		payment = frappe.get_doc("Payment Entry", dict(party="Mr G", paid_amount=1700))
+		reconcile_vouchers(
+			bank_transaction.name,
+			json.dumps(
+				[
+					{
+						"payment_doctype": "Payment Entry",
+						"payment_name": payment.name,
+						"amount": bank_transaction.unallocated_amount,
+					}
+				]
+			),
+		)
+		bank_transaction.reload()
+		self.assertEqual(len(bank_transaction.payment_entries), 1)
+
+		self.assertEqual(
+			unreconcile_transaction_entry(bank_transaction.name, "Payment Entry", payment.name),
+			{"success": True},
+		)
+
+		bank_transaction.reload()
+		self.assertEqual(bank_transaction.payment_entries, [])
+		self.assertEqual(bank_transaction.unallocated_amount, 1700)
+
+	def test_unreconcile_entry_refuses_a_voucher_that_is_not_linked(self):
+		"""
+		`{"success": True}` was returned unconditionally, even when the loop matched nothing.
+
+		So asking to undo a voucher that had never been linked to this transaction reported a successful
+		undo while changing nothing - and a caller reconciling its own view from that answer would drop a
+		link the server still holds.
+		"""
+		bank_transaction = frappe.get_doc(
+			"Bank Transaction",
+			dict(description="1512567 BG/000003025 OPSKATTUZWXXX AT776000000098709849 Herr G"),
+		)
+		unlinked = frappe.get_doc("Payment Entry", dict(party="Mr G", paid_amount=1200))
+		self.assertEqual(bank_transaction.payment_entries, [])
+
+		before = frappe.db.get_value(
+			"Bank Transaction", bank_transaction.name, ["status", "allocated_amount", "unallocated_amount"]
+		)
+
+		with self.assertRaises(frappe.ValidationError) as refusal:
+			unreconcile_transaction_entry(bank_transaction.name, "Payment Entry", unlinked.name)
+
+		self.assertIn(unlinked.name, frappe.utils.strip_html(str(refusal.exception)))
+
+		# Refused without touching either side.
+		self.assertEqual(
+			frappe.db.get_value(
+				"Bank Transaction",
+				bank_transaction.name,
+				["status", "allocated_amount", "unallocated_amount"],
+			),
+			before,
+		)
+		self.assertEqual(frappe.db.get_value("Payment Entry", unlinked.name, "docstatus"), 1)
 
 	# Raise an error if debitor transaction vs debitor payment
 	def test_clear_sales_invoice(self):

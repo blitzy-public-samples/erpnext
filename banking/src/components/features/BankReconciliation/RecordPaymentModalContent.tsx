@@ -1,5 +1,5 @@
 import { atom, useAtom, useAtomValue, useSetAtom } from "jotai"
-import { bankRecRecordPaymentModalAtom, bankRecSelectedTransactionAtom, bankRecUnreconcileModalAtom, SelectedBank, selectedBankAccountAtom } from "./bankRecAtoms"
+import { bankRecRecordPaymentModalAtom, bankRecSelectedTransactionsAtom, bankRecUnreconcileModalAtom, SelectedBank, selectedBankAccountAtom } from "./bankRecAtoms"
 import { Dialog, DialogContent, DialogTitle, DialogDescription, DialogHeader, DialogFooter, DialogClose, DialogTrigger } from "@/components/ui/dialog"
 import _ from "@/lib/translate"
 import { UnreconciledTransaction, useGetRuleForTransaction, useRefreshUnreconciledTransactions, useUpdateActionLog } from "./utils"
@@ -41,7 +41,7 @@ const RecordPaymentModalContent = () => {
 
     const selectedBankAccount = useAtomValue(selectedBankAccountAtom)
 
-    const selectedTransaction = useAtomValue(bankRecSelectedTransactionAtom(selectedBankAccount?.name ?? ''))
+    const selectedTransaction = useAtomValue(bankRecSelectedTransactionsAtom)
 
     if (!selectedTransaction || !selectedBankAccount || selectedTransaction.length === 0) {
         return <div className='p-4'>
@@ -472,8 +472,8 @@ const PaymentEntryForm = ({ selectedTransaction, selectedBankAccount }: { select
                             data-slot="form-item"
                             className="flex flex-col gap-2"
                         >
-                            <Label>{_("Attachments")}</Label>
-                            <FileDropzone files={files} setFiles={setFiles} />
+                            <Label htmlFor="record-payment-attachments">{_("Attachments")}</Label>
+                            <FileDropzone files={files} setFiles={setFiles} inputId="record-payment-attachments" />
                         </div>
                     </div>
                     <SmallTextField
@@ -668,7 +668,7 @@ const InvoicesSection = ({ currency }: { currency: string }) => {
     return <div className="flex flex-col gap-2">
         <div className="flex gap-4 items-center">
             <H4 className="text-base">{_("Invoices")}</H4>
-            <GetUnpaidInvoicesButton />
+            <GetUnpaidInvoicesButton currency={currency} />
         </div>
         <Table>
             <TableHeader>
@@ -680,7 +680,7 @@ const InvoicesSection = ({ currency }: { currency: string }) => {
                         checked={selectedRows.length > 0 && selectedRows.length === fields.length}
                         onCheckedChange={onSelectAll} /></TableHead>
                     <TableHead>{_("Reference Document")}</TableHead>
-                    <TableHead>{_("Invoice No")}</TableHead>
+                    <TableHead>{_("Supplier Invoice No")}</TableHead>
                     <TableHead>{_("Due Date")}</TableHead>
                     <TableHead className="text-end">{_("Grand Total")}</TableHead>
                     <TableHead className="text-end">{_("Outstanding")}</TableHead>
@@ -707,10 +707,10 @@ const InvoicesSection = ({ currency }: { currency: string }) => {
                                 href={`/desk/${slug(field.reference_doctype)}/${field.reference_name}`}>{field.reference_doctype}: {field.reference_name}</a>
                         </TableCell>
                         <TableCell>
-                            {field.bill_no ?? "-"}
+                            {field.bill_no || "-"}
                         </TableCell>
                         <TableCell>
-                            {formatDate(field.due_date)}
+                            {field.due_date ? formatDate(field.due_date) : "-"}
                         </TableCell>
                         <TableCell className="text-end">
                             {formatCurrency(field.total_amount, currency)}
@@ -885,7 +885,7 @@ const Summary = ({ currency }: { currency: string }) => {
 
     </div>
 }
-const GetUnpaidInvoicesButton = () => {
+const GetUnpaidInvoicesButton = ({ currency }: { currency: string }) => {
 
     const [isOpen, setIsOpen] = useAtom(isUnpaidInvoicesButtonOpen)
 
@@ -894,20 +894,38 @@ const GetUnpaidInvoicesButton = () => {
     const partyType = useWatch({ control, name: 'party_type' })
     const party = useWatch({ control, name: 'party' })
     const partyName = useWatch({ control, name: 'party_name' })
-    const amount = useWatch({ control, name: 'paid_amount' })
+    const paymentType = useWatch({ control, name: 'payment_type' })
+    const paidAmount = useWatch({ control, name: 'paid_amount' })
+    const receivedAmount = useWatch({ control, name: 'received_amount' })
+
+    /*
+     * `party_name` is only populated when the party-details fetch succeeds, and is reset to an empty
+     * string when it does not - so interpolating it raw produced "Unpaid invoices from  for x", a
+     * sentence with a hole in it. Falling back to the party ID mirrors what the party fields on this
+     * same form already do (`party_name !== party ? party_name : undefined`): the ID is always
+     * present, so the sentence always names somebody.
+     */
+    const partyLabel = partyName || party
+
+    /*
+     * The amount is read from the side of the entry that actually carries it. This form fills
+     * `paid_amount` for a payment and `received_amount` for a receipt, which is the same rule the
+     * allocation calls in this file already apply, so a receipt no longer advertises the wrong figure.
+     */
+    const amount = paymentType === 'Pay' ? paidAmount : receivedAmount
 
     return <>
 
         <Dialog open={isOpen} onOpenChange={setIsOpen}>
             {partyType && party && <DialogTrigger asChild>
-                <Button variant='outline' size='sm' type='button'>Get Unpaid Invoices</Button>
+                <Button variant='outline' size='sm' type='button'>{_("Get Unpaid Invoices")}</Button>
             </DialogTrigger>}
             <DialogContent className="min-w-[75vw]">
                 <DialogHeader>
-                    <DialogTitle>Select Invoices</DialogTitle>
-                    <DialogDescription>Unpaid invoices from {partyName} for {formatCurrency(amount)}.</DialogDescription>
+                    <DialogTitle>{_("Select Invoices")}</DialogTitle>
+                    <DialogDescription>{_("Unpaid invoices from {0} for {1}.", [partyLabel ?? '', formatCurrency(amount, currency)])}</DialogDescription>
                 </DialogHeader>
-                <FetchInvoicesModal onClose={() => setIsOpen(false)} />
+                <FetchInvoicesModal onClose={() => setIsOpen(false)} currency={currency} />
             </DialogContent>
         </Dialog>
     </>
@@ -925,7 +943,7 @@ interface OutstandingInvoice {
     account?: string,
     allocated_amount?: number,
 }
-const FetchInvoicesModal = ({ onClose }: { onClose: () => void }) => {
+const FetchInvoicesModal = ({ onClose, currency }: { onClose: () => void, currency: string }) => {
 
     const { getValues, setValue } = useFormContext<PaymentEntry>()
 
@@ -1018,31 +1036,34 @@ const FetchInvoicesModal = ({ onClose }: { onClose: () => void }) => {
             <TableHeader>
                 <TableRow>
                     <TableHead>
-                        <Checkbox checked={selectedInvoices.length === data?.message?.length} onCheckedChange={(checked) => {
-                            if (checked) {
-                                setSelectedInvoices(data?.message)
-                            } else {
-                                setSelectedInvoices([])
-                            }
-                        }} />
+                        <Checkbox
+                            // Make this accessible to screen readers
+                            aria-label={_("Select all")}
+                            checked={selectedInvoices.length === data?.message?.length} onCheckedChange={(checked) => {
+                                if (checked) {
+                                    setSelectedInvoices(data?.message)
+                                } else {
+                                    setSelectedInvoices([])
+                                }
+                            }} />
                     </TableHead>
                     <TableHead>
-                        Type
+                        {_("Type")}
                     </TableHead>
                     <TableHead>
-                        Name
+                        {_("Name")}
                     </TableHead>
                     <TableHead>
-                        Invoice No
+                        {_("Supplier Invoice No")}
                     </TableHead>
                     <TableHead>
-                        Due Date
+                        {_("Due Date")}
                     </TableHead>
                     <TableHead className="text-end">
-                        Grand Total
+                        {_("Grand Total")}
                     </TableHead>
                     <TableHead className="text-end">
-                        Outstanding
+                        {_("Outstanding")}
                     </TableHead>
                 </TableRow>
             </TableHeader>
@@ -1059,7 +1080,10 @@ const FetchInvoicesModal = ({ onClose }: { onClose: () => void }) => {
                         }}
                         className="cursor-pointer">
                         <TableCell>
-                            <Checkbox checked={selectedInvoices.includes(ref)}
+                            <Checkbox
+                                // Make this accessible to screen readers
+                                aria-label={_("Select invoice {0}", [ref.voucher_no])}
+                                checked={selectedInvoices.includes(ref)}
                                 onCheckedChange={(checked) => {
                                     if (checked) {
                                         setSelectedInvoices([...selectedInvoices, ref])
@@ -1079,16 +1103,19 @@ const FetchInvoicesModal = ({ onClose }: { onClose: () => void }) => {
                                 href={`/desk/${slug(ref.voucher_type)}/${ref.voucher_no}`}>{ref.voucher_no}</a>
                         </TableCell>
                         <TableCell>
-                            {ref.bill_no ?? "-"}
+                            {ref.bill_no || "-"}
                         </TableCell>
                         <TableCell>
-                            {formatDate(ref.due_date)}
+                            {/* A dash rather than an emptiness, matching the Supplier Invoice No cell
+                                beside it: a Journal Entry has no due date, and a blank cell reads as a
+                                rendering failure rather than as "there is no date". */}
+                            {ref.due_date ? formatDate(ref.due_date) : "-"}
                         </TableCell>
                         <TableCell className="text-end">
-                            {formatCurrency(ref.invoice_amount)}
+                            {formatCurrency(ref.invoice_amount, currency)}
                         </TableCell>
                         <TableCell className="text-end font-medium">
-                            {formatCurrency(ref.outstanding_amount)}
+                            {formatCurrency(ref.outstanding_amount, currency)}
                         </TableCell>
                     </TableRow>
                 ))}
@@ -1096,14 +1123,14 @@ const FetchInvoicesModal = ({ onClose }: { onClose: () => void }) => {
         </Table> : null}
         <div className="flex justify-between items-center sticky bottom-0 bg-surface-modal">
             <div className="flex gap-2">
-                <span className="text-ink-gray-5">Invoices: <span className="text-ink-gray-8 font-numeric font-medium">{selectedInvoices.length}</span></span> /
-                <span className="text-ink-gray-5">Total: <span className="text-ink-gray-8 font-numeric font-medium">{formatCurrency(selectedInvoices.reduce((acc, invoice) => acc + invoice.outstanding_amount, 0))}</span></span>
+                <span className="text-ink-gray-5">{_("Invoices:")} <span className="text-ink-gray-8 font-numeric font-medium">{selectedInvoices.length}</span></span> /
+                <span className="text-ink-gray-5">{_("Total:")} <span className="text-ink-gray-8 font-numeric font-medium">{formatCurrency(selectedInvoices.reduce((acc, invoice) => acc + invoice.outstanding_amount, 0), currency)}</span></span>
             </div>
             <DialogFooter className="pt-2">
                 <DialogClose asChild>
-                    <Button variant='outline' size='md' disabled={allocateAmountToReferencesLoading}>Cancel</Button>
+                    <Button variant='outline' size='md' disabled={allocateAmountToReferencesLoading}>{_("Cancel")}</Button>
                 </DialogClose>
-                <Button onClick={onSelect} size='md' disabled={allocateAmountToReferencesLoading}>Select</Button>
+                <Button onClick={onSelect} size='md' disabled={allocateAmountToReferencesLoading}>{_("Select")}</Button>
             </DialogFooter>
         </div>
 

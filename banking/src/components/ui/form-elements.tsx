@@ -16,11 +16,24 @@ import PartyTypeDropdown, { PartyTypeDropdownProps } from "../common/PartyTypeDr
 import CurrencyInput from "react-currency-input-field"
 import { getSystemDefault } from "@/lib/frappe"
 import { getCurrencySymbol } from "@/lib/currency"
-import { getCurrencyFormatInfo } from "@/lib/numbers"
+import { getCurrencyFormatInfo, parseCurrencyInput } from "@/lib/numbers"
 import LinkFieldCombobox, { LinkFieldComboboxProps } from "../common/LinkFieldCombobox"
 import { Select, SelectContent, SelectTrigger, SelectValue } from "./select"
 import { InputGroup, InputGroupAddon } from "./input-group"
 
+/*
+ * `isRequired` used to draw a red asterisk beside the label and nothing else, so the constraint
+ * existed only for a sighted reader: an asterisk is punctuation that a screen reader either skips
+ * or reads as "star", and nothing in the accessibility tree marked the control itself as required.
+ * Every component below now also forwards `aria-required` to the control it renders, which is what
+ * makes the constraint programmatically determinable.
+ *
+ * `aria-required` and not the native `required` attribute, deliberately. None of the ten <form>
+ * elements in this app sets `noValidate`, so a native `required` would engage the browser's own
+ * constraint validation - which runs BEFORE the submit handler - and the user would get Chrome's
+ * bubble in place of the `FormMessage` that react-hook-form renders from this form's own rules.
+ * `aria-required` announces the constraint without taking validation away from the form.
+ */
 interface FormElementProps {
     name: string,
     rules?: Omit<RegisterOptions<FieldValues, string>, "disabled" | "valueAsNumber" | "valueAsDate" | "setValueAs">,
@@ -49,7 +62,7 @@ export const DataField = ({ name, rules, label, isRequired, formDescription, inp
             <FormItem className='flex flex-col'>
                 <FormLabel className={hideLabel ? 'sr-only' : ''}>{label}{isRequired && <FormRequiredIndicator />}</FormLabel>
                 <FormControl>
-                    <Input {...field} maxLength={140} aria-readonly={readOnly} readOnly={readOnly} {...inputProps} />
+                    <Input {...field} maxLength={140} aria-readonly={readOnly} readOnly={readOnly} aria-required={isRequired || undefined} {...inputProps} />
                 </FormControl>
                 {formDescription && <FormDescription>{formDescription}</FormDescription>}
                 <FormMessage />
@@ -77,7 +90,7 @@ export const SelectFormField = ({ name, rules, label, isRequired, formDescriptio
                 <FormControl>
                     <Select onValueChange={field.onChange} value={field.value} disabled={disabled || readOnly} aria-readonly={readOnly}>
                         <FormControl>
-                            <SelectTrigger className="w-full">
+                            <SelectTrigger className="w-full" aria-required={isRequired || undefined}>
                                 <SelectValue />
                             </SelectTrigger>
                         </FormControl>
@@ -146,12 +159,17 @@ export const DateField = ({ name, rules, label, isRequired, formDescription, inp
                         }
                     }}
                     maxLength={140}
+                    aria-required={isRequired || undefined}
                     {...inputProps} />
             </FormControl>
+            {/* The calendar trigger's id is derived from the field rather than being the literal
+                "date-picker-button" it carried: the Bank Entry form renders a date field per row, so a
+                fixed id appeared several times in one document. Duplicate ids are invalid and make
+                `getElementById` and any `for`/`aria-*` reference ambiguous. */}
             <Popover open={open} onOpenChange={setOpen}>
                 <PopoverTrigger asChild>
                     <Button
-                        id="date-picker-button"
+                        id={`${field.name}-date-picker-button`}
                         variant="ghost"
                         className="absolute top-1/2 ltr:right-2 rtl:left-2 size-6 -translate-y-1/2"
                     >
@@ -211,7 +229,7 @@ export const SmallTextField = ({ name, rules, label, isRequired, formDescription
             <FormItem className='flex flex-col'>
                 <FormLabel className={hideLabel ? 'sr-only' : ''}>{label}{isRequired && <FormRequiredIndicator />}</FormLabel>
                 <FormControl>
-                    <Textarea {...field} {...inputProps} readOnly={readOnly} aria-readonly={readOnly} />
+                    <Textarea {...field} {...inputProps} readOnly={readOnly} aria-readonly={readOnly} aria-required={isRequired || undefined} />
                 </FormControl>
                 {formDescription && <FormDescription>{formDescription}</FormDescription>}
                 <FormMessage />
@@ -235,7 +253,7 @@ export const AccountFormField = (props: AccountFormFieldProps) => {
         render={({ field }) => (
             <FormItem className='flex flex-col'>
                 <FormLabel className={props.hideLabel ? 'sr-only' : ''}>{props.label}{props.isRequired && <FormRequiredIndicator />}</FormLabel>
-                <AccountsDropdown {...props} value={field.value} onChange={field.onChange} useInForm readOnly={props.readOnly} />
+                <AccountsDropdown {...props} value={field.value} onChange={field.onChange} useInForm readOnly={props.readOnly} isRequired={props.isRequired} />
                 {props.formDescription && <FormDescription>{props.formDescription}</FormDescription>}
                 <FormMessage />
             </FormItem>
@@ -259,7 +277,7 @@ export const PartyTypeFormField = ({ name, rules, label, isRequired, formDescrip
         render={({ field }) => (
             <FormItem className='flex flex-col'>
                 <FormLabel className={hideLabel ? 'sr-only' : ''}>{label}{isRequired && <FormRequiredIndicator />}</FormLabel>
-                <PartyTypeDropdown {...inputProps} value={field.value} onChange={field.onChange} useInForm readOnly={readOnly} />
+                <PartyTypeDropdown {...inputProps} value={field.value} onChange={field.onChange} useInForm readOnly={readOnly} isRequired={isRequired} />
                 {formDescription && <FormDescription>{formDescription}</FormDescription>}
                 <FormMessage />
             </FormItem>
@@ -295,7 +313,18 @@ export const CurrencyFormField = ({ name, rules, label, isRequired, formDescript
             }, 100)
         }, [])
 
-        const { formItemId } = useFormField()
+        /*
+         * The accessibility wiring is applied HERE, on the control itself, rather than by wrapping this
+         * field in a `FormControl`.
+         *
+         * `FormControl` is a Radix `Slot`: it stamps `id`, `aria-describedby` and `aria-invalid` onto its
+         * single direct child. The only child it can reach here is the `InputGroup` DIV that has to sit
+         * between it and the input, so the id landed on that div while this component put the SAME id on
+         * the real input - two elements sharing one id, with the label's `htmlFor` resolving to the div.
+         * A div is not a labelable element, so every currency field in the app computed an EMPTY
+         * accessible name, and the error message was associated with the wrapper rather than the field.
+         */
+        const { formItemId, formDescriptionId, formMessageId, error } = useFormField()
 
         // Get the correct separators for the currency
         const formatInfo = getCurrencyFormatInfo(currency ?? defaultCurrency)
@@ -314,6 +343,9 @@ export const CurrencyFormField = ({ name, rules, label, isRequired, formDescript
             disabled={field.disabled}
             readOnly={readOnly}
             aria-readonly={readOnly}
+            aria-required={isRequired || undefined}
+            aria-invalid={!!error}
+            aria-describedby={error ? `${formDescriptionId} ${formMessageId}` : formDescriptionId}
             onFocus={onFocus}
             groupSeparator={groupSeparator}
             decimalSeparator={decimalSeparator}
@@ -322,15 +354,25 @@ export const CurrencyFormField = ({ name, rules, label, isRequired, formDescript
             value={field.value}
             maxLength={12}
             decimalScale={2}
+            /* The library's k/m/b shorthand is off. These fields carry posted monetary amounts, and a
+               stray letter multiplied the figure by up to a billion without a word - `1b` became
+               1,000,000,000. Off, non-numeric characters are simply dropped. */
+            disableAbbreviations
             prefix={currencySymbol + " "}
             onValueChange={(v, _n, values) => {
-                // If the input ends with a decimal or a decimal with trailing zeroes, store the string since we need the user to be able to type the decimals.
-                // When the user eventually types the decimals or blurs out, the value is formatted anyway.
-                // Otherwise store the float value
-                // Check if the value ends with a decimal or a decimal with trailing zeroes
-                const isDecimal = v?.endsWith(decimalSeparator) || v?.endsWith(decimalSeparator + '0')
-                const newValue = isDecimal ? v : values?.float ?? ''
-                field.onChange(newValue)
+                /*
+                 * The number stored here is the library's own parsed float, never a re-read of the
+                 * displayed text: re-parsing a grouped string yielded `NaN`, and re-parsing a partially
+                 * typed one moved the decimal point, which is how 1.23 was inflated to 1,230,000,000.
+                 *
+                 * The text is echoed back instead - and only - while the entry cannot yet be represented
+                 * by its number: a lone minus, a bare separator, or a decimal in progress. A field
+                 * controlled by the number cannot be typed into past the separator, because `250.` parses
+                 * to 250 and echoing `250` back drops the keystroke, sending the next digit into the
+                 * units: that is how `-250.50` was stored as -25050. See `parseCurrencyInput`.
+                 */
+                const parsed = parseCurrencyInput({ text: v, float: values?.float, decimalSeparator })
+                field.onChange(parsed.keepText || parsed.isInvalid ? parsed.text : parsed.value)
             }}
             customInput={Input}
         />
@@ -345,13 +387,10 @@ export const CurrencyFormField = ({ name, rules, label, isRequired, formDescript
             <FormItem className='flex flex-col'>
                 <FormLabel className={hideLabel ? 'sr-only' : ''}>{label}{isRequired && <FormRequiredIndicator />}</FormLabel>
 
-                <FormControl>
-                    <InputGroup>
-                        {leftSlot && <InputGroupAddon>{leftSlot}</InputGroupAddon>}
-                        <CurrencyField field={field} />
-                    </InputGroup>
-
-                </FormControl>
+                <InputGroup>
+                    {leftSlot && <InputGroupAddon>{leftSlot}</InputGroupAddon>}
+                    <CurrencyField field={field} />
+                </InputGroup>
                 {formDescription && <FormDescription>{formDescription}</FormDescription>}
                 <FormMessage />
             </FormItem>
@@ -374,7 +413,7 @@ export const LinkFormField = ({ name, rules, label, isRequired, formDescription,
         render={({ field }) => (
             <FormItem className='flex flex-col'>
                 <FormLabel className={hideLabel ? 'sr-only' : ''}>{label}{isRequired && <FormRequiredIndicator />}</FormLabel>
-                <LinkFieldCombobox {...inputProps} value={field.value} onChange={field.onChange} useInForm disabled={disabled} readOnly={readOnly} />
+                <LinkFieldCombobox {...inputProps} value={field.value} onChange={field.onChange} useInForm disabled={disabled} readOnly={readOnly} isRequired={isRequired} />
                 {formDescription && <FormDescription>{formDescription}</FormDescription>}
                 <FormMessage />
             </FormItem>

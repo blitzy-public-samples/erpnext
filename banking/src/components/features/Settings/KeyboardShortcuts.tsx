@@ -1,10 +1,10 @@
 import { Badge } from '@/components/ui/badge'
 import { Kbd, KbdGroup } from '@/components/ui/kbd'
-import { KeyboardMetaKeyIcon } from '@/components/ui/keyboard-keys'
+import { KeyboardAltKeyIcon, KeyboardMetaKeyIcon, KeyboardShiftKeyIcon } from '@/components/ui/keyboard-keys'
 import { SettingsPanelDescription, SettingsPanelTitle, SettingsPanelHeader, SettingsPanelContent } from '@/components/ui/settings-dialog'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import _ from '@/lib/translate'
-import { ArrowRightLeftIcon, HistoryIcon, LandmarkIcon, OptionIcon, ReceiptIcon, SaveIcon, SettingsIcon, ZapIcon } from 'lucide-react'
+import { ArrowRightLeftIcon, HistoryIcon, LandmarkIcon, ReceiptIcon, SaveIcon, SettingsIcon, ZapIcon } from 'lucide-react'
 
 const Shortcuts = [
     {
@@ -32,7 +32,7 @@ const Shortcuts = [
         }
     },
     {
-        shortcut: <KbdGroup><Kbd><OptionIcon /></Kbd><Kbd>R</Kbd></KbdGroup>,
+        shortcut: <KbdGroup><Kbd><KeyboardAltKeyIcon /></Kbd><Kbd>R</Kbd></KbdGroup>,
         action: {
             icon: <ZapIcon />,
             label: _("Accept Matching Rule"),
@@ -56,7 +56,7 @@ const Shortcuts = [
         }
     },
     {
-        shortcut: <KbdGroup><Kbd><KeyboardMetaKeyIcon /></Kbd><Kbd>⇧</Kbd><Kbd>G</Kbd></KbdGroup>,
+        shortcut: <KbdGroup><Kbd><KeyboardMetaKeyIcon /></Kbd><Kbd><KeyboardShiftKeyIcon /></Kbd><Kbd>G</Kbd></KbdGroup>,
         action: {
             icon: <SettingsIcon />,
             label: _("Settings"),
@@ -89,7 +89,7 @@ const KeyboardShortcuts = () => {
                         </TableHeader>
                         <TableBody>
                             {Shortcuts.map((shortcut) => (
-                                <TableRow className='hover:bg-surface-gray-2'>
+                                <TableRow key={shortcut.action.label} className='hover:bg-surface-gray-2'>
                                     <TableCell>
                                         {shortcut.shortcut}
                                     </TableCell>

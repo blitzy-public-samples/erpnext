@@ -29,7 +29,6 @@ import { MemoryRouter } from 'react-router'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { Dialog, DialogContent } from '@/components/ui/dialog'
 import {
-	TEST_BANK_ACCOUNT,
 	createFrappeSDKMock,
 	frappeSDKMock,
 	makeUnreconciledTransaction
@@ -38,7 +37,7 @@ import {
 vi.mock('frappe-react-sdk', () => createFrappeSDKMock())
 
 import RecordPaymentModalContent from './RecordPaymentModalContent'
-import { bankRecSelectedTransactionAtom, selectedBankAccountAtom } from './bankRecAtoms'
+import { bankRecSelectedTransactionsAtom, selectedBankAccountAtom } from './bankRecAtoms'
 import { makePanelBank } from '@/test/renderPanel'
 
 const SINGLE_ENDPOINT =
@@ -54,7 +53,7 @@ interface Options {
 const renderModal = ({ selection = [], bank = makePanelBank() }: Options = {}) => {
 	const store = createStore()
 	store.set(selectedBankAccountAtom, bank)
-	store.set(bankRecSelectedTransactionAtom(bank?.name ?? ''), selection)
+	store.set(bankRecSelectedTransactionsAtom, selection)
 
 	return {
 		store,
@@ -220,12 +219,18 @@ describe('RecordPaymentModalContent', () => {
 	describe('QUIRK - the selection is scoped per bank account', () => {
 
 		it('sees nothing when the selection was made against a DIFFERENT account', () => {
-			// The atom is a family keyed on the account name, so switching accounts must not carry a
-			// selection across - reconciling one account's transaction from another's screen would be wrong.
+			// The selection is stamped with the account it was made under, so switching accounts must not
+			// carry it across - reconciling one account's transaction from another's screen would be wrong.
 			const store = createStore()
 			const bank = makePanelBank()
+			/*
+			 * The selection is made while ANOTHER account is picked, then the account is switched. That is
+			 * how a cross-scope selection actually arises, and it also pins the half that used to fail:
+			 * the selection is orphaned rather than parked, so switching back cannot replay it.
+			 */
+			store.set(selectedBankAccountAtom, makePanelBank({ name: 'Some Other Account' }))
+			store.set(bankRecSelectedTransactionsAtom, [deposit()])
 			store.set(selectedBankAccountAtom, bank)
-			store.set(bankRecSelectedTransactionAtom('Some Other Account'), [deposit()])
 
 			render(
 				<Provider store={store}>
@@ -247,7 +252,7 @@ describe('RecordPaymentModalContent', () => {
 		it('sees the selection made against the CURRENT account', () => {
 			const store = createStore()
 			store.set(selectedBankAccountAtom, makePanelBank())
-			store.set(bankRecSelectedTransactionAtom(TEST_BANK_ACCOUNT), [deposit()])
+			store.set(bankRecSelectedTransactionsAtom, [deposit()])
 
 			render(
 				<Provider store={store}>

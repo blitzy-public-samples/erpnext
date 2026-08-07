@@ -11,7 +11,8 @@
  *      what stops a re-fetch from moving the reviewer off the account they were working on.
  *   3. Conversely, if the persisted selection is ABSENT from the list it is replaced, because a selection
  *      the endpoint no longer returns cannot be reconciled against.
- *   4. It renders NOTHING while loading rather than a spinner, because the whole page is gated on it.
+ *   4. While loading it renders a skeleton strip and announces itself busy, so a page that is merely
+ *      waiting for data cannot be mistaken for a company with no bank accounts.
  *   5. Its empty state links out to the Desk with the company pre-filled, so the remedy is one click.
  */
 
@@ -92,16 +93,24 @@ describe('BankPicker', () => {
 		answerAccounts([bank()])
 	})
 
-	describe('QUIRK - while the accounts are loading', () => {
+	describe('while the accounts are loading', () => {
 
-		it('renders nothing at all rather than a placeholder', () => {
-			// The entire workbench is gated on the selection this makes, so a skeleton here would imply the
-			// page below it is merely waiting for data when in fact it cannot render at all yet.
+		it('says so, rather than rendering an empty page', async () => {
+			/*
+			 * The whole workbench is gated on the selection this strip makes, and the panels below withhold
+			 * their tabs until an account is chosen - so rendering nothing here made a page that was merely
+			 * waiting for data look like a company with no bank accounts at all. The busy state is
+			 * announced as well as drawn, because the visible difference is skeletons versus cards.
+			 */
 			answerAccounts(undefined, undefined, true)
 
-			const { container } = renderPicker()
+			renderPicker()
 
-			expect(container).toBeEmptyDOMElement()
+			expect(await screen.findByText('Loading bank accounts...')).toBeInTheDocument()
+			expect(document.querySelector('[aria-busy="true"]')).not.toBeNull()
+			// Still no cards and no empty state: nothing is asserted about the accounts yet.
+			expect(screen.queryByRole('button')).not.toBeInTheDocument()
+			expect(screen.queryByText('No bank accounts found')).not.toBeInTheDocument()
 		})
 	})
 
@@ -246,6 +255,123 @@ describe('BankPicker', () => {
 
 			await screen.findByText('A')
 			expect(screen.getAllByTitle(/^Select /)).toHaveLength(3)
+		})
+	})
+
+	describe('choosing an account by keyboard', () => {
+
+		/*
+		 * The cards advertise `role="button"` to assistive technology, but a `div` gets no implicit
+		 * keyboard activation from the browser: before this they carried no `tabIndex` and no key handler,
+		 * so the account - which gates the entire workbench - could not be changed by keyboard at all.
+		 */
+
+		it('places every card in the tab order', async () => {
+			answerAccounts([
+				bank({ name: 'Current', account_name: 'Current' }),
+				bank({ name: 'Savings', account_name: 'Savings' })
+			])
+
+			renderPicker()
+
+			const cards = await screen.findAllByTitle(/^Select /)
+			expect(cards).toHaveLength(2)
+			for (const card of cards) {
+				expect(card).toHaveAttribute('tabindex', '0')
+			}
+		})
+
+		it('selects on Enter', async () => {
+			const user = userEvent.setup()
+			answerAccounts([
+				bank({ name: 'Current', account_name: 'Current' }),
+				bank({ name: 'Savings', account_name: 'Savings' })
+			])
+
+			const { store } = renderPicker(bank({ name: 'Current', account_name: 'Current' }))
+
+			const savings = await screen.findByTitle('Select Savings')
+			savings.focus()
+			await user.keyboard('{Enter}')
+
+			await waitFor(() => {
+				expect(store.get(selectedBankAccountAtom)).toMatchObject({ name: 'Savings' })
+			})
+		})
+
+		it('selects on Space', async () => {
+			const user = userEvent.setup()
+			answerAccounts([
+				bank({ name: 'Current', account_name: 'Current' }),
+				bank({ name: 'Savings', account_name: 'Savings' })
+			])
+
+			const { store } = renderPicker(bank({ name: 'Current', account_name: 'Current' }))
+
+			const savings = await screen.findByTitle('Select Savings')
+			savings.focus()
+			await user.keyboard(' ')
+
+			await waitFor(() => {
+				expect(store.get(selectedBankAccountAtom)).toMatchObject({ name: 'Savings' })
+			})
+		})
+
+		it('ignores keys that are not activation keys', async () => {
+			const user = userEvent.setup()
+			answerAccounts([
+				bank({ name: 'Current', account_name: 'Current' }),
+				bank({ name: 'Savings', account_name: 'Savings' })
+			])
+
+			const { store } = renderPicker(bank({ name: 'Current', account_name: 'Current' }))
+
+			const savings = await screen.findByTitle('Select Savings')
+			savings.focus()
+			await user.keyboard('{Escape}')
+			await user.keyboard('a')
+
+			expect(store.get(selectedBankAccountAtom)).toMatchObject({ name: 'Current' })
+		})
+
+		it('exposes which card is selected, rather than relying on colour alone', async () => {
+			answerAccounts([
+				bank({ name: 'Current', account_name: 'Current' }),
+				bank({ name: 'Savings', account_name: 'Savings' })
+			])
+
+			renderPicker(bank({ name: 'Savings', account_name: 'Savings' }))
+
+			expect(await screen.findByTitle('Select Savings')).toHaveAttribute('aria-pressed', 'true')
+			expect(screen.getByTitle('Select Current')).toHaveAttribute('aria-pressed', 'false')
+		})
+
+		it('scrolls the selected card into view, because the strip starts at the far left', async () => {
+			/*
+			 * The selection is persisted, so a reload can restore an account sitting outside the strip's
+			 * visible scroll range - where it looked unselected.
+			 */
+			const scrollIntoView = vi.fn()
+			const original = HTMLElement.prototype.scrollIntoView
+			HTMLElement.prototype.scrollIntoView = scrollIntoView
+
+			try {
+				answerAccounts([
+					bank({ name: 'Current', account_name: 'Current' }),
+					bank({ name: 'Savings', account_name: 'Savings' })
+				])
+
+				renderPicker(bank({ name: 'Savings', account_name: 'Savings' }))
+
+				await screen.findByTitle('Select Savings')
+				await waitFor(() => {
+					expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest', inline: 'nearest' })
+				})
+				// Only the selected card asks to be revealed.
+				expect(scrollIntoView).toHaveBeenCalledTimes(1)
+			} finally {
+				HTMLElement.prototype.scrollIntoView = original
+			}
 		})
 	})
 

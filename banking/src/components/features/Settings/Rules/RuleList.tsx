@@ -259,39 +259,50 @@ const SortableRuleItem = ({
 
     return (
         <li ref={setNodeRef} style={style}>
-            <div className={cn("flex justify-between items-center py-2 my-0.5 h-full hover:bg-surface-gray-1 pe-2 rounded", isDropdownOpen && "bg-surface-gray-1")}>
-                <div className="flex items-center gap-2">
+            {/* A rule name and description are free text with no server-side length cap, so both are
+                treated here the same way the unreconciled-transaction row treats its variable-length
+                fields: the flex chain that carries them is cleared to `min-w-0` so it can shrink, each
+                variable string truncates through an INNER block span (both `Button` and `Badge` set
+                `whitespace-nowrap` on themselves, so the ellipsis has to be applied to a child), and
+                the full text stays available through `title`. Everything of fixed width — the drag
+                handle, the priority badge, the direction icon and the actions menu — is pinned with
+                `shrink-0` so it can never be squeezed away or overlapped by the text column. Without
+                this, a long rule name grew the row past the settings dialog and pushed the panel
+                header's "Run Rules" and "Add Rule" buttons outside the dialog's clipping box. */}
+            <div className={cn("flex justify-between items-center gap-2 py-2 my-0.5 h-full hover:bg-surface-gray-1 pe-2 rounded", isDropdownOpen && "bg-surface-gray-1")}>
+                <div className="flex items-center gap-2 min-w-0 flex-1">
                     <div
                         {...attributes}
                         {...listeners}
-                        className="cursor-grab active:cursor-grabbing p-1 rounded"
+                        className="cursor-grab active:cursor-grabbing p-1 rounded shrink-0"
                         title={_("Drag to reorder")}
                     >
                         <GripVertical className="w-4 h-4 text-ink-gray-5" />
                     </div>
-                    <Badge theme="gray" className="font-numeric tabular-nums">
+                    <Badge theme="gray" className="font-numeric tabular-nums shrink-0">
                         {rule.priority}
                     </Badge>
-                    <div className="flex flex-col gap-1">
-                        <div className="flex items-center gap-2">
+                    <div className="flex flex-col gap-1 min-w-0 flex-1">
+                        <div className="flex items-center gap-2 min-w-0">
                             <Button
                                 variant='link'
                                 size='sm'
-                                className="p-0 h-fit text-start cursor-pointer no-underline hover:underline"
+                                className="p-0 h-fit text-start cursor-pointer no-underline hover:underline min-w-0 shrink"
+                                title={rule.rule_name}
                                 onClick={() => setSelectedRule(rule.name)}>
-                                {rule.rule_name}
+                                <span className="truncate">{rule.rule_name}</span>
                             </Button>
-                            <div title={rule.transaction_type === "Any" ? _("Applies to withdrawals and deposits") : rule.transaction_type === "Withdrawal" ? _("Applies to withdrawals") : _("Applies to deposits")}>
+                            <div className="shrink-0" title={rule.transaction_type === "Any" ? _("Applies to withdrawals and deposits") : rule.transaction_type === "Withdrawal" ? _("Applies to withdrawals") : _("Applies to deposits")}>
                                 {rule.transaction_type === "Any" ? <ArrowDownUp className="text-ink-gray-5 w-4 h-4" /> : rule.transaction_type === "Withdrawal" ? <ArrowUpRight className="text-ink-red-3 w-5 h-5" /> : <ArrowDownRight className="text-ink-green-3 w-5 h-5" />}
                             </div>
                         </div>
-                        <span className="text-sm text-ink-gray-5">
+                        <span className="text-sm text-ink-gray-5 truncate" title={rule.rule_description}>
                             {rule.rule_description}
                         </span>
                     </div>
                 </div>
 
-                <div className="flex items-center gap-2 h-full justify-center">
+                <div className="flex items-center gap-2 h-full justify-center shrink-0">
                     <DropdownMenu open={isDropdownOpen} onOpenChange={setIsDropdownOpen}>
                         <DropdownMenuTrigger asChild>
                             <Button variant='ghost' isIconButton className="hover:bg-transparent">

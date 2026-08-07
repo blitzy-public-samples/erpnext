@@ -1,14 +1,14 @@
-import { ActionLog, bankRecActionLog, bankRecAmountFilter, bankRecDateAtom, bankRecErrorDialogAtom, bankRecMatchFilters, bankRecSearchText, bankRecSelectedTransactionAtom, bankRecTransactionTypeFilter, bankRecUnreconcileModalAtom, SelectedBank, selectedBankAccountAtom } from './bankRecAtoms'
+import { ActionLog, bankRecActionLog, bankRecAmountFilter, bankRecDateAtom, bankRecErrorDialogAtom, bankRecLastRefusalAtom, bankRecMatchFilters, bankRecSearchText, bankRecSelectedTransactionsAtom, bankRecTransactionTypeFilter, bankRecUnreconcileModalAtom, SelectedBank, selectedBankAccountAtom } from './bankRecAtoms'
 import { useAtom, useAtomValue, useSetAtom } from 'jotai'
-import { useMemo } from 'react'
-import { SWRConfiguration, useFrappeGetCall, useFrappeGetDoc, useFrappePostCall, useSWRConfig } from 'frappe-react-sdk'
-import type { FrappeError } from 'frappe-react-sdk'
+import { useContext, useMemo } from 'react'
+import { FrappeContext, SWRConfiguration, useFrappeGetCall, useFrappeGetDoc, useFrappePostCall, useSWRConfig } from 'frappe-react-sdk'
+import type { FrappeConfig, FrappeError } from 'frappe-react-sdk'
 import { BankTransaction } from '@/types/Accounts/BankTransaction'
 import { BankAccount } from '@/types/Accounts/BankAccount'
 import dayjs from 'dayjs'
 import { toast } from 'sonner'
 import { BANK_LOGOS } from './logos'
-import { getErrorMessage } from '@/lib/frappe'
+import { getErrorMessages } from '@/lib/frappe'
 import { useCurrentCompany } from '@/hooks/useCurrentCompany'
 import _ from '@/lib/translate'
 import { BankTransactionRule } from '@/types/Accounts/BankTransactionRule'
@@ -34,9 +34,19 @@ export const useGetAccountOpeningBalance = () => {
 
     }, [companyID, bankAccount?.name, dates.fromDate])
 
-    return useFrappeGetCall('erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.get_account_balance', args, undefined, {
-        revalidateOnFocus: false
-    })
+    /*
+     * Withheld until BOTH the account and the company are known. `get_account_balance` takes `company` as
+     * a required positional argument, so a call missing it is not an empty answer but an HTTP 500
+     * `TypeError`. Defence in depth: `selectedCompanyAtom` now hydrates on init, so the two should never
+     * disagree - but the cost of them disagreeing is a server error with a traceback, which is too high
+     * to leave resting on hydration order alone.
+     */
+    return useFrappeGetCall('erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.get_account_balance', args,
+        bankAccount?.name && companyID ? undefined : null,
+        {
+            revalidateOnFocus: false
+        }
+    )
 }
 
 export const useGetAccountClosingBalance = () => {
@@ -56,8 +66,14 @@ export const useGetAccountClosingBalance = () => {
 
     }, [companyID, bankAccount?.name, dates.toDate])
 
+    // Withheld on the same terms as the opening balance above, and for the same reason: `company` is a
+    // required positional argument of `get_account_balance`, so omitting it is an HTTP 500, not an
+    // empty result. The named cache key is retained for the case where the request IS made, because
+    // `useReconcileTransaction` revalidates this exact key after a successful post.
     return useFrappeGetCall('erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.get_account_balance', args,
-        `bank-reconciliation-account-closing-balance-${bankAccount?.name}-${dates.toDate}`,
+        bankAccount?.name && companyID
+            ? `bank-reconciliation-account-closing-balance-${bankAccount?.name}-${dates.toDate}`
+            : null,
         {
             revalidateOnFocus: false
         }
@@ -149,7 +165,7 @@ export const useRefreshUnreconciledTransactions = () => {
     const selectedBank = useAtomValue(selectedBankAccountAtom)
     const dates = useAtomValue(bankRecDateAtom)
     const matchFilters = useAtomValue(bankRecMatchFilters)
-    const setSelectedTransaction = useSetAtom(bankRecSelectedTransactionAtom(selectedBank?.name || ''))
+    const setSelectedTransaction = useSetAtom(bankRecSelectedTransactionsAtom)
 
     const { mutate } = useSWRConfig()
 
@@ -234,6 +250,67 @@ export const useRefreshUnreconciledTransactions = () => {
 export const isServerRefusal = (error: unknown): boolean =>
     typeof (error as FrappeError | null)?.httpStatus === 'number'
 
+/**
+ * One id per rejection surface, so a second failure REPLACES the first toast instead of stacking a
+ * second identical one beside it. Two same-tick attempts produced two indistinguishable toasts while
+ * the dialog, which is driven by one atom, correctly stayed single.
+ */
+const RECONCILE_REJECTION_TOAST_ID = 'bank-rec-reconcile-rejected'
+const RECONCILE_REFRESH_TOAST_ID = 'bank-rec-reconcile-refresh-failed'
+
+/**
+ * The plain-text rendering of a rejection, for a surface that cannot render markup.
+ *
+ * Frappe's messages legitimately carry inline HTML - `validate_currency` wraps all three of its values
+ * in `<strong>` - and the dialog renders that through the shared markdown path. A toast description is
+ * a plain string child, so the identical text arrived there with its tags visible AS CHARACTERS.
+ *
+ * `DOMParser` rather than an element's `innerHTML`: the document it returns is inert, so reading the
+ * text back neither executes nor fetches anything the server put in the message. The words are the
+ * server's own either way - only the markup the surface cannot honour is dropped.
+ */
+const getPlainTextErrorMessage = (error?: FrappeError | null): string =>
+    getErrorMessages(error)
+        .map((parsed) => new DOMParser()
+            .parseFromString(parsed.message ?? '', 'text/html')
+            .body.textContent?.trim() ?? '')
+        .filter(Boolean)
+        .join(' ')
+
+/**
+ * Everything - and only what - may be written to the browser console about a rejection.
+ *
+ * A Frappe rejection carries `exc`: the server's entire Python traceback, naming absolute filesystem
+ * paths inside both apps, alongside `exception` and the messages meant for the reviewer. Logging the
+ * object whole published all of that to anyone with the console open on a financial application, and
+ * none of it was needed to diagnose anything from a browser. What is left is what identifies the
+ * failure without describing the server: the transport status, the server's own exception class, and
+ * the same messages the dialog is already showing.
+ *
+ * A failure that never reached a server answer is not a Frappe payload at all but an ordinary `Error`,
+ * whose stack is this application's own code, so it is summarised rather than suppressed.
+ */
+const describeRejection = (scope: string, error: unknown) => {
+
+    const refusal = error as FrappeError | null
+
+    if (isServerRefusal(error) || refusal?._server_messages) {
+        return {
+            scope,
+            httpStatus: refusal?.httpStatus,
+            httpStatusText: refusal?.httpStatusText,
+            exc_type: refusal?.exc_type,
+            messages: getErrorMessages(refusal)
+        }
+    }
+
+    if (error instanceof Error) {
+        return { scope, name: error.name, message: error.message }
+    }
+
+    return { scope }
+}
+
 export const useReconcileTransaction = () => {
 
     const { call, loading } = useFrappePostCall<{ message: BankTransaction }>('erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.reconcile_vouchers')
@@ -245,11 +322,51 @@ export const useReconcileTransaction = () => {
     const addToActionLog = useUpdateActionLog()
 
     const setBankRecErrorDialog = useSetAtom(bankRecErrorDialogAtom)
+    const setLastRefusal = useSetAtom(bankRecLastRefusalAtom)
     const selectedBank = useAtomValue(selectedBankAccountAtom)
     const dates = useAtomValue(bankRecDateAtom)
     const matchFilters = useAtomValue(bankRecMatchFilters)
-    const setSelectedTransaction = useSetAtom(bankRecSelectedTransactionAtom(selectedBank?.name || ''))
+    const setSelectedTransaction = useSetAtom(bankRecSelectedTransactionsAtom)
     const { mutate } = useSWRConfig()
+    const { call: request } = useContext(FrappeContext) as FrappeConfig
+
+    /**
+     * Re-read the all-transactions list from the server and write the answer into its existing cache
+     * entry, whether or not that list is currently mounted.
+     *
+     * `mutate(key)` on its own only ASKS SWR to revalidate, and SWR revalidates a key by calling the
+     * revalidators its **mounted** subscribers registered; a key with no mounted subscriber keeps its
+     * stale entry and no request is made. That list is rendered only by the "Bank Transactions" tab,
+     * which is unmounted while the reviewer is on "Match and Reconcile" - so the revalidation issued
+     * from here silently did nothing and the tab still showed pre-attempt allocation figures.
+     *
+     * Handing `mutate` the fetch itself takes SWR's data path instead: the request is made here, the
+     * answer is written under the query hook's own cache key, and `revalidate: false` keeps it to
+     * exactly one request in the case where a subscriber IS mounted. The endpoint, the arguments and
+     * the key are the ones {@link useGetBankTransactions} already uses, so no new cache-key family is
+     * introduced and the entry this writes is the one that hook would have written itself.
+     */
+    const rereadBankTransactions = () => {
+        const key = `bank-reconciliation-bank-transactions-${selectedBank?.name}-${dates.fromDate}-${dates.toDate}`
+
+        if (!selectedBank?.name) {
+            // Without a bank account the query hook keys this list `null`, so there is nothing cached to
+            // correct and no account to read for. Asking SWR to revalidate stays harmless and keeps the
+            // call shape identical to the other two.
+            return mutate(key)
+        }
+
+        return mutate(
+            key,
+            request.get<{ message: BankTransaction[] }>('erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.get_bank_transactions', {
+                bank_account: selectedBank.name,
+                from_date: dates.fromDate,
+                to_date: dates.toDate,
+                all_transactions: true
+            }),
+            { revalidate: false }
+        )
+    }
 
     /**
      * Re-read the server after a post that did not succeed, and make the client agree with what came
@@ -261,10 +378,22 @@ export const useReconcileTransaction = () => {
      * already-reconciled check on Reconcile among them) would keep reading the stale copy.
      */
     const convergeWithServer = async (transaction: UnreconciledTransaction) => {
+        /*
+         * Every keyed read this account's workbench shows, not only the lists.
+         *
+         * The balance tiles were the gap: revalidating the two lists left the reviewer with a refreshed
+         * list beside figures computed before whatever the server had actually done, and the two
+         * disagreed on screen. The opening balance and the reconciled count are deliberately absent -
+         * the opening balance is the balance BEFORE the range and a reconciliation inside the range
+         * cannot move it, and the count is derived from the unreconciled list that is revalidated here,
+         * so both follow without a read of their own. No sixth cache-key family is introduced.
+         */
         const [unreconciled] = await Promise.allSettled([
             mutate(`bank-reconciliation-unreconciled-transactions-${selectedBank?.name}-${dates.fromDate}-${dates.toDate}`),
-            mutate(`bank-reconciliation-bank-transactions-${selectedBank?.name}-${dates.fromDate}-${dates.toDate}`),
+            rereadBankTransactions(),
             mutate(`bank-reconciliation-vouchers-${transaction.name}-${dates.fromDate}-${dates.toDate}-${matchFilters.join(',')}`),
+            mutate(`bank-reconciliation-account-closing-balance-${selectedBank?.name}-${dates.toDate}`),
+            mutate(`bank-reconciliation-account-closing-balance-as-per-statement-${selectedBank?.name}-${dates.toDate}`),
         ])
 
         if (unreconciled.status !== 'fulfilled') {
@@ -281,6 +410,13 @@ export const useReconcileTransaction = () => {
     }
 
     const reconcileTransaction = (transaction: UnreconciledTransaction, voucher: LinkedPayment) => {
+
+        /*
+         * Any explanation on screen belongs to the attempt just made, so the previous one goes now rather
+         * than when the next answer arrives - otherwise an in-flight attempt sits beneath the reason the
+         * LAST one failed.
+         */
+        setLastRefusal(null)
 
         /*
          * `then(onPosted, onNotPosted)` rather than `then(...).catch(...)`: a `catch` chained after the
@@ -314,6 +450,7 @@ export const useReconcileTransaction = () => {
                 ]
             })
             onReconcileTransaction(transaction, res.message)
+            setLastRefusal(null)
             toast.success(_("Reconciled"), {
                 duration: 4000,
                 closeButton: true,
@@ -326,7 +463,7 @@ export const useReconcileTransaction = () => {
                 }
             })
         }, (error) => {
-            console.error(error)
+            console.error(describeRejection('reconcile_vouchers rejected', error))
 
             /*
              * A readable server answer is a refusal, and only then may the client say nothing was
@@ -336,9 +473,10 @@ export const useReconcileTransaction = () => {
              */
             const refused = isServerRefusal(error)
             toast.error(refused ? _("Reconciliation refused") : _("Could not confirm the reconciliation"), {
+                id: RECONCILE_REJECTION_TOAST_ID,
                 duration: 5000,
                 description: refused
-                    ? getErrorMessage(error)
+                    ? getPlainTextErrorMessage(error)
                     : _("The server did not answer, so it is not yet known whether this reconciliation was recorded. The transaction has been re-read below.")
             })
 
@@ -349,6 +487,15 @@ export const useReconcileTransaction = () => {
              * verbatim. Nothing is mutated optimistically anywhere, before or after.
              */
             setBankRecErrorDialog(error)
+
+            /*
+             * The same rejection is also kept where dismissing the dialog cannot reach it. The pane below
+             * renders it until the reviewer clears it or tries again, because convergence may well have
+             * removed the row they were looking at - and a row vanishing with no reason left on screen is
+             * exactly what made the refusal look like a glitch.
+             */
+            setLastRefusal({ error, transactionName: transaction.name, refused })
+
             return convergeWithServer(transaction)
         }).catch((error) => {
             /*
@@ -356,8 +503,9 @@ export const useReconcileTransaction = () => {
              * already known. Presented outcome-neutrally and NOT routed to the error dialog, because
              * this is a client-side follow-up failure and not something the server said.
              */
-            console.error(error)
+            console.error(describeRejection('view refresh after a refused reconcile failed', error))
             toast.error(_("The view could not be refreshed"), {
+                id: RECONCILE_REFRESH_TOAST_ID,
                 duration: 5000,
                 description: _("Reload the page to see the current state of this bank account. The server remains the authority on what was recorded.")
             })
@@ -404,9 +552,19 @@ export const useGetBankAccounts = (onSuccess?: (data?: Omit<SelectedBank, 'logo'
 
     const company = useCurrentCompany()
 
+    /*
+     * The `null` key SUPPRESSES the request while no company is known, and that is load-bearing rather
+     * than tidy. `company` is a REQUIRED positional argument of `bank_account.get_list`, so a call made
+     * without one does not come back empty - it comes back as an unhandled HTTP 500
+     * (`get_list() missing 1 required positional argument: 'company'`) which every consumer of this hook
+     * then renders as a raw server traceback. `useCurrentCompany` is empty exactly when neither the
+     * persisted selection nor the signed-in user's own default company is set, which is an ordinary
+     * first-paint state and not an error worth showing anybody. Callers see `banks: []` until a company
+     * is chosen, and their own empty states cover that.
+     */
     const { data, isLoading, error } = useFrappeGetCall<{ message: BankAccountWithCurrency[] }>('erpnext.accounts.doctype.bank_account.bank_account.get_list', {
         company: company
-    }, undefined, {
+    }, company ? undefined : null, {
         revalidateOnFocus: false,
         revalidateIfStale: false,
         onSuccess: (data) => {
@@ -470,15 +628,38 @@ export const useSelectedBankAccountCurrency = (): string | undefined => {
     }, [banks, isLoading, selectedBank?.name])
 }
 
+/** Which way the money moved, including the case where the server says it moved neither way. */
+export type TransactionDirection = 'withdrawal' | 'deposit' | 'none'
+
 export const useIsTransactionWithdrawal = (transaction: UnreconciledTransaction) => {
     return useMemo(() => {
-        const isWithdrawal = transaction.withdrawal && transaction.withdrawal > 0
-        const isDeposit = transaction.deposit && transaction.deposit > 0
+        /*
+         * Two corrections here, and both were visible on screen.
+         *
+         * The flags are now genuine booleans. `transaction.withdrawal && transaction.withdrawal > 0`
+         * evaluates to the NUMBER 0 for a zero column and to `undefined` for an absent one, so a caller
+         * that guarded a render on the flag printed a bare `0` as a text node.
+         *
+         * And there are THREE directions, not two. A row with no positive amount in either column used to
+         * fall through to the deposit branch and be drawn with the green incoming arrow - money the bank
+         * never sent. `none` says what is true instead.
+         *
+         * `amount` is a plain number for the same reason: a zero-amount transaction HAS an amount, and it
+         * is zero. Reporting it as absent is what let the list render nothing where a figure belongs.
+         */
+        const withdrawal = transaction.withdrawal ?? 0
+        const deposit = transaction.deposit ?? 0
+
+        const isWithdrawal = withdrawal > 0
+        const isDeposit = deposit > 0
+
+        const direction: TransactionDirection = isWithdrawal ? 'withdrawal' : isDeposit ? 'deposit' : 'none'
 
         return {
-            amount: isWithdrawal ? transaction.withdrawal : transaction.deposit,
+            amount: isWithdrawal ? withdrawal : deposit,
             isWithdrawal,
-            isDeposit
+            isDeposit,
+            direction
         }
     }, [transaction])
 }

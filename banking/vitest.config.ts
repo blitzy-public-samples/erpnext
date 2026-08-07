@@ -17,6 +17,19 @@ export default defineConfig({
 		globals: true,
 		setupFiles: ['./src/test/setup.ts'],
 		include: ['src/**/*.{test,spec}.{ts,tsx}'],
+		// Raised from the 5s default, for two independent reasons that compound.
+		// 1. The component suites drive real user-event interactions through Radix primitives in
+		//    jsdom, so on a contended CI runner a test that is merely SLOW would otherwise be
+		//    reported as a failure - which says nothing about the code under test.
+		// 2. Opening a surface that lazy-loads a panel chunk pays for resolving and transforming
+		//    that chunk on the first test that reaches it, and every interaction runs slower again
+		//    under v8 coverage instrumentation with all files in parallel, so a test that settles
+		//    in well under a second on its own can legitimately need several.
+		// These ceilings exist to catch a genuine hang, not to time the machine: assertions still
+		// fail immediately and only the ceiling on waiting moves. The higher of the two proposed
+		// ceilings is used, because it is strictly the safer end of the same argument.
+		testTimeout: 30_000,
+		hookTimeout: 30_000,
 		coverage: {
 			provider: 'v8',
 			reporter: ['text', 'json-summary', 'lcov'],

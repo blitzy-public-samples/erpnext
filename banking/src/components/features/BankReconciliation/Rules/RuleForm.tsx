@@ -103,13 +103,23 @@ const TransactionTypeSelector = () => {
             name='transaction_type'
             render={({ field }) => (
                 <FormItem className="space-y-1">
-                    <FormLabel className="text-sm font-medium">
+                    {/* Deliberately a span rather than a `FormLabel`. `FormLabel` emits a
+                        <label for={formItemId}> and `FormControl` stamps that same id onto whatever it
+                        wraps - here the RadioGroup, which Radix renders as a <div role="radiogroup">. A
+                        <label> may only point at a labelable control (button, input, meter, output,
+                        progress, select, textarea), so pointing it at a div named nothing at all and was
+                        reported by the accessibility audit as "Incorrect use of <label for=FORM_ELEMENT>".
+                        Naming the radiogroup through `aria-labelledby` instead is valid for a grouping
+                        role and gives the three options the group name they were missing. This mirrors the
+                        plain-span group heading already used further down this same form. */}
+                    <span id={`${field.name}-label`} className="flex items-center gap-2 select-none text-ink-gray-5 text-sm font-medium">
                         {_("Transaction Type")}<span className="text-ink-red-3">*</span>
-                    </FormLabel>
+                    </span>
                     <FormControl>
                         <RadioGroup
                             onValueChange={field.onChange}
                             value={field.value}
+                            aria-labelledby={`${field.name}-label`}
                             className="grid grid-cols-3 gap-2 w-full"
                         >
                             <FormItem className="flex items-center">
