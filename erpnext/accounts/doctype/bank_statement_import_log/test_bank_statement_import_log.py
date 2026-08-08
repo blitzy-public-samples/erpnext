@@ -698,6 +698,204 @@ class TestBankStatementImportLog(ERPNextTestSuite, AccountsTestMixin):
 
 		self.assertIn("No rows could be read", str(refusal.exception))
 
+	# ------------------------------------------------------------------ #
+	# Unreadable files: a parser failure is a refusal, never a server error
+	# ------------------------------------------------------------------ #
+
+	def _import_log_for_bytes(self, file_name: str, content: bytes | str):
+		"""An import log over an arbitrary attachment, inserted so `before_insert` does the parsing."""
+		file_doc = frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": file_name,
+				"is_private": 1,
+				"content": content,
+			}
+		).insert(ignore_permissions=True)
+
+		return frappe.get_doc(
+			{
+				"doctype": "Bank Statement Import Log",
+				"bank_account": self.bank_account,
+				"file": file_doc.file_url,
+			}
+		)
+
+	def test_import_refuses_a_file_whose_contents_do_not_match_its_extension(self):
+		"""
+		Every reader this module reaches is third-party code being handed a file the uploader chose, and
+		each raised its own internal failure straight out to the HTTP layer: `zipfile.BadZipFile` for a
+		malformed .xlsx, `OSError("File contains no valid workbook part")` for one shaped like an archive
+		but not a workbook, and `pypdf.errors.PdfReadError` for a corrupt PDF. All answered HTTP 500,
+		naming an exception class the reviewer can do nothing with.
+
+		Each is now a validation error whose message says what to do about it, and - asserted here
+		explicitly - names no internal exception class, module path or file path.
+		"""
+		import io
+		import zipfile
+
+		# A ZIP that opens as an archive but is not a workbook, which is the second failure above.
+		archive_buffer = io.BytesIO()
+		with zipfile.ZipFile(archive_buffer, "w") as archive:
+			archive.writestr("not-a-workbook.txt", "nothing to see here")
+
+		cases = [
+			("malformed .xlsx", "broken.xlsx", b"this is definitely not a workbook"),
+			("archive that is not a workbook", "archive.xlsx", archive_buffer.getvalue()),
+			("malformed .xls", "broken.xls", b"not an excel 97 stream"),
+		]
+
+		for label, file_name, content in cases:
+			with self.subTest(case=label):
+				with self.assertRaises(frappe.ValidationError) as refusal:
+					self._import_log_for_bytes(file_name, content).insert()
+
+				message = str(refusal.exception)
+				for leak in (
+					"BadZipFile",
+					"OSError",
+					"Traceback",
+					"site-packages",
+					"openpyxl",
+					"xlrd",
+					"/apps/",
+				):
+					self.assertNotIn(leak, message, f"{label} disclosed {leak}")
+
+	def test_pdf_parser_failures_are_refusals_rather_than_server_errors(self):
+		"""
+		The PDF half of the same finding, exercised by making the PARSER fail rather than by uploading a
+		corrupt file: the framework's own File validation reads a PDF on insert and refuses a corrupt one
+		before any of this module's code runs, so a real broken file cannot reach the parser through an
+		upload at all. What CAN reach it is a file that opens as a PDF and then fails during extraction
+		or rasterisation, which is what these two stand in for - `pypdf` and `pdfplumber` are third-party
+		code and their failures used to escape as HTTP 500 naming their own exception classes.
+		"""
+		html = """
+		<html><body>
+		<table border="1"><tr><th>Date</th><th>Narration</th><th>Withdrawal</th><th>Deposit</th><th>Balance</th></tr>
+		<tr><td>01/04/2024</td><td>UPI PAYMENT</td><td>500.00</td><td></td><td>9500.00</td></tr>
+		<tr><td>03/04/2024</td><td>SALARY</td><td></td><td>20000.00</td><td>29500.00</td></tr></table>
+		</body></html>
+		"""
+
+		from pypdf.errors import PdfReadError
+
+		module = "erpnext.accounts.doctype.bank_statement_import_log.bank_statement_import_log"
+
+		with patch(f"{module}.extract_pdf_tables", side_effect=PdfReadError("EOF marker not found")):
+			with self.assertRaises(frappe.ValidationError) as refusal:
+				self._import_log_for_bytes("extract-fails.pdf", self._make_pdf(html)).insert()
+		self.assertIn("This PDF could not be read", str(refusal.exception))
+		self.assertNotIn("PdfReadError", str(refusal.exception))
+		self.assertNotIn("EOF marker", str(refusal.exception))
+
+		with patch(f"{module}.render_pdf_pages", side_effect=OSError("cannot identify image file")):
+			with self.assertRaises(frappe.ValidationError) as refusal:
+				self._import_log_for_bytes("render-fails.pdf", self._make_pdf(html)).insert()
+		self.assertIn("could not be rendered", str(refusal.exception))
+		self.assertNotIn("OSError", str(refusal.exception))
+
+		# Unpatched, the very same PDF still parses - so the two refusals above are about the failure,
+		# not about the file.
+		doc = self._import_log_for_bytes("works.pdf", self._make_pdf(html)).insert()
+		self.assertTrue(doc.get_pdf_tables())
+
+	def test_import_refuses_an_attachment_whose_bytes_are_gone(self):
+		"""
+		A File row can outlive the bytes it points at - the row is what this code resolves, and the read
+		then raised `OSError("File does not exist")` as HTTP 500. The row is left in place here and only
+		its content removed, which is exactly that situation.
+		"""
+		import os
+
+		csv_text = "Date,Narration,Amount\n01/04/2024,UPI PAYMENT,500.00\n"
+		file_doc = frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": f"test-vanishing-{frappe.generate_hash(length=8)}.csv",
+				"is_private": 1,
+				"content": csv_text,
+			}
+		).insert(ignore_permissions=True)
+
+		os.remove(file_doc.get_full_path())
+
+		with self.assertRaises(frappe.ValidationError) as refusal:
+			frappe.get_doc(
+				{
+					"doctype": "Bank Statement Import Log",
+					"bank_account": self.bank_account,
+					"file": file_doc.file_url,
+				}
+			).insert()
+
+		self.assertIn("could not be read", str(refusal.exception))
+		self.assertNotIn("OSError", str(refusal.exception))
+
+	def test_import_still_accepts_a_well_formed_statement(self):
+		# Every refusal above is only meaningful if an ordinary statement still parses.
+		doc = self._create_csv_import_log(
+			"Date,Narration,Amount\n01/04/2024,UPI PAYMENT,500.00\n03/04/2024,SALARY,20000.00\n"
+		)
+
+		self.assertEqual(doc.number_of_transactions, 2)
+		self.assertEqual(doc.status, "Not Started")
+
+	def test_import_keeps_its_own_refusals_intact(self):
+		"""
+		The wrapper catches broadly, so it has to be proved NOT to swallow this module's own guards.
+		Every Frappe exception carries `http_status_code`, which is what the wrapper re-raises on, so
+		each of these keeps its exact wording rather than being flattened into "could not be read".
+		"""
+		with self.assertRaises(frappe.ValidationError) as wrong_type:
+			self._import_log_for_bytes("statement.txt", "Date,Narration,Amount\n").insert()
+		self.assertIn("Import template should be of type", str(wrong_type.exception))
+
+		html = "<html><body><p>Just some prose with no tabular data at all.</p></body></html>"
+		with self.assertRaises(frappe.ValidationError) as no_tables:
+			self._import_log_for_bytes("prose.pdf", self._make_pdf(html)).insert()
+		self.assertIn("Could not detect any tables", str(no_tables.exception))
+
+	def test_update_column_mapping_refuses_a_malformed_mapping(self):
+		"""
+		`column_mapping` arrived straight from the client and its shape was taken on trust, so a list
+		that was not a list of objects, an object with no `index`, or one whose `index` was not a whole
+		number escaped as `TypeError` or `KeyError: 'index'` - HTTP 500.
+		"""
+		csv_text = "Date,Narration,Amount\n01/04/2024,UPI PAYMENT,500.00\n"
+		doc = self._create_csv_import_log(csv_text)
+		before = [(c.index, c.maps_to) for c in doc.column_mapping]
+		self.assertTrue(before)
+
+		for label, mapping in (
+			("object with no index", [{"bogus": 1}]),
+			("index that is not a number", [{"index": "one"}]),
+			("index that is a boolean", [{"index": True}]),
+			("index that is a float", [{"index": 1.5}]),
+			("a bare string instead of an object", ["Date"]),
+			# Sent as a JSON STRING, which is the shape that reaches the guard: the endpoint's own
+			# `list | str` annotation refuses a bare object with a clean 417 before the body runs, but a
+			# string is accepted and parsed, so an object spelled as JSON arrives here as a dict.
+			("an object spelled as JSON", '{"index": 0}'),
+		):
+			with self.subTest(case=label):
+				with self.assertRaises(frappe.ValidationError) as refusal:
+					update_column_mapping(doc.name, mapping)
+				self.assertNotIn("KeyError", str(refusal.exception))
+				self.assertNotIn("TypeError", str(refusal.exception))
+
+		# Refused before the child table was cleared, so the existing mapping is intact.
+		doc.reload()
+		self.assertEqual([(c.index, c.maps_to) for c in doc.column_mapping], before)
+
+		# And a well-formed mapping is still applied.
+		mapping = [{"index": c.index, "maps_to": c.maps_to} for c in doc.column_mapping]
+		update_column_mapping(doc.name, mapping)
+		doc.reload()
+		self.assertEqual([(c.index, c.maps_to) for c in doc.column_mapping], before)
+
 
 test_hdfc_sample_statement_data = [
 	["HDFC BANK Ltd.  Page No .: 1  Statement of accounts", "", "", "", "", "", ""],

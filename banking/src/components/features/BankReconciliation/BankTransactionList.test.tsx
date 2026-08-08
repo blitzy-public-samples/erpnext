@@ -36,6 +36,7 @@ import { bankRecUnreconcileModalAtom } from './bankRecAtoms'
 import {
 	PANEL_FROM_DATE,
 	PANEL_TO_DATE,
+	makePanelBank,
 	renderPanel,
 	stubViewportMeasurement
 } from '@/test/renderPanel'
@@ -459,6 +460,56 @@ describe('BankTransactionList', () => {
 			await waitFor(() => {
 				expect(screen.getByText('Insufficient Permission for Bank Transaction')).toBeInTheDocument()
 			})
+		})
+	})
+
+	describe('the intro sentence, which interpolates the account name into markdown', () => {
+
+		/*
+		 * This tab's intro sentence is built by interpolating `account_name` into a translated string as
+		 * raw `<strong>…</strong>` and rendering the result through the shared `MarkdownRenderer`, which
+		 * has `rehypeRaw` registered. The account name is data any Accounts user can write, and Frappe's
+		 * name validation blocks `<` and `>` but NOT markdown link syntax - `[text](url)` contains
+		 * neither - so an account can be named a link. Rendered unsanitised that became a live,
+		 * camouflaged off-site anchor inside an authenticated page: styled identically to the legitimate
+		 * bold dates beside it, with no `rel`, no `target` and nothing revealed on hover.
+		 *
+		 * The renderer is where that is stopped (see `ui/markdown.test.tsx` for the boundary itself);
+		 * this pins the consequence at the real injection site, so the two cannot drift apart.
+		 */
+		const PHISHING_ACCOUNT_NAME = '[Sign in to verify your account](https://evil.example.com/login)'
+
+		it('renders a link-shaped account name as inert text, with no off-site anchor', async () => {
+			answerWith([transaction()])
+
+			renderPanel(<BankTransactions />, {
+				bank: makePanelBank({ account_name: PHISHING_ACCOUNT_NAME })
+			})
+
+			await screen.findByText('Not Reconciled')
+
+			// Swept document-wide by attribute VALUE, so it does not matter which element a stray
+			// destination lands on: nothing rendered here may name that host.
+			document.querySelectorAll('[href], [src]').forEach((element) => {
+				for (const attribute of Array.from(element.attributes)) {
+					expect(attribute.value).not.toContain('evil.example.com')
+				}
+			})
+			// The reader still sees the whole payload - nothing is hidden, it is simply not clickable.
+			expect(document.body.textContent).toContain('Sign in to verify your account')
+		})
+
+		it('still renders the account name and the date range in bold, so nothing legitimate is lost', async () => {
+			answerWith([transaction()])
+
+			const { container } = renderPanel(<BankTransactions />)
+
+			await screen.findByText('Not Reconciled')
+
+			// The account name plus the two date boundaries - the three interpolations the sentence makes.
+			const emphasised = Array.from(container.querySelectorAll('p strong')).map((node) => node.textContent)
+			expect(emphasised).toContain('Setup Checking')
+			expect(emphasised).toHaveLength(3)
 		})
 	})
 })

@@ -11,7 +11,7 @@ from frappe.contacts.address_and_contact import (
 	load_address_and_contact,
 )
 from frappe.model.document import Document
-from frappe.utils import comma_and, get_link_to_form
+from frappe.utils import comma_and, get_link_to_form, getdate
 
 
 class BankAccount(Document):
@@ -200,6 +200,82 @@ def get_closing_balance_as_per_statement(bank_account: str, date: str):
 def set_closing_balance_as_per_statement(bank_account: str, date: str | datetime.date, balance: float):
 	"""
 	Set the closing balance as per statement for a bank account and date
+
+	This is the client-facing entry point: it authorizes the caller against the *specific* Bank
+	Account named in the request and then delegates the write to
+	`_set_closing_balance_as_per_statement`.
+
+	Why the authorization lives in this wrapper rather than in the shared body: `Bank Statement
+	Import Log` is granted to System Manager only, and that role holds no `Bank Account` permission
+	row at all, so a System Manager legitimately running a statement import would be refused
+	outright by a check placed in the shared body. The importer therefore calls the internal helper
+	directly and is authorized by its own `Bank Statement Import Log` gate, while every request that
+	arrives from a client passes through the check below first.
+	"""
+
+	if not isinstance(bank_account, str):
+		frappe.throw(
+			_("Bank Account must be a name, not {0}").format(type(bank_account).__name__),
+			title=_("Invalid Bank Account"),
+		)
+
+	# Document-scoped rather than role-only, so a User Permission - on Company, or on the Bank
+	# Account itself - is honoured. `read` is the right level here because writing a statement
+	# balance does not modify the Bank Account document; permission to create the balance row itself
+	# is evaluated separately by `Bank Account Balance` in the helper below. This mirrors the scoping
+	# this app already applies to a Bank Account in `get_bank_account_details` and in the bank
+	# reconciliation tool.
+	frappe.has_permission("Bank Account", ptype="read", doc=bank_account, throw=True)
+
+	if not frappe.db.exists("Bank Account", bank_account):
+		# `has_permission` returns True for a name that does not exist when the caller is a System
+		# user, so without this an unknown Bank Account would fall through and create an orphan
+		# balance row pointing at nothing. Every other caller is answered 404 by the framework's own
+		# document load inside the check above, which this backstops rather than duplicates. Kept
+		# *after* the permission call so the ordering never depends on which of the two answers a
+		# given caller would receive.
+		frappe.throw(
+			_("Bank Account {0} does not exist").format(frappe.bold(bank_account)),
+			frappe.DoesNotExistError,
+			title=_("Not Found"),
+		)
+
+	# `date` reaches a filter and then a Date column, so an unreadable one used to arrive at the
+	# database verbatim and come back as an HTTP 500 OperationalError carrying the database name,
+	# table and column - the same defect, on the same kind of argument, that the bank reconciliation
+	# tool's `parse_date_argument` exists to answer. `getdate` is deliberately not called bare here:
+	# it is not total. It raises an uncaught OverflowError for a numeric string too large for a C int
+	# (measured: 9 digits is refused cleanly, 15 is not), answers None for a shape it cannot read at
+	# all, and answers TODAY for a blank one - which would silently write a balance against today
+	# rather than refusing. So a falsy result is rejected too, and this either yields a real date or
+	# throws. Deliberately kept after the permission call, so an unauthorised caller is answered 403
+	# on the strength of who they are rather than on the shape of their arguments.
+	if isinstance(date, str):
+		date = date.strip()
+
+	normalised = None
+	if isinstance(date, str | datetime.date) and date:
+		try:
+			normalised = getdate(date)
+		except (ValueError, TypeError, OverflowError):
+			normalised = None
+
+	if not normalised:
+		frappe.throw(
+			_("{0} is not a valid date").format(frappe.bold(date)),
+			title=_("Invalid Date"),
+		)
+
+	_set_closing_balance_as_per_statement(bank_account, normalised, balance)
+
+
+def _set_closing_balance_as_per_statement(bank_account: str, date: str | datetime.date, balance: float):
+	"""
+	Write the closing balance as per statement for a bank account and date.
+
+	Internal: the caller is responsible for authorizing access to `bank_account`. Reached from the
+	whitelisted wrapper above, which performs that check, and from the statement importer, which is
+	authorized by its own `Bank Statement Import Log` permission gate.
 	"""
 
 	existing = frappe.db.exists("Bank Account Balance", {"bank_account": bank_account, "date": date})
@@ -213,4 +289,10 @@ def set_closing_balance_as_per_statement(bank_account: str, date: str | datetime
 		doc.bank_account = bank_account
 		doc.date = date
 		doc.balance = balance
+		# `company` is a read-only `fetch_from` field, which the framework would otherwise only
+		# populate during validation - that is, *after* `insert()` has already run its create
+		# permission check against a document whose company is still blank. Setting it up front is
+		# what makes that check see the same data the update branch above sees, so a User Permission
+		# on Company restricts a brand-new row exactly as it already restricts an existing one.
+		doc.company = frappe.db.get_value("Bank Account", bank_account, "company")
 		doc.save()

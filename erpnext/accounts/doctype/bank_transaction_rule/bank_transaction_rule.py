@@ -339,6 +339,8 @@ def _run_rule_evaluation(force_evaluate=False, companies: list[str] | None = Non
 		rule_docs.append(rule_doc)
 
 	# Run evaluation for each transaction
+	contended = []
+
 	for transaction in unreconciled_transactions:
 		matched_rule = None
 
@@ -347,8 +349,40 @@ def _run_rule_evaluation(force_evaluate=False, companies: list[str] | None = Non
 				matched_rule = rule
 				break
 
-		frappe.db.set_value(
-			"Bank Transaction",
-			transaction.name,
-			{"is_rule_evaluated": 1, "matched_transaction_rule": matched_rule.name if matched_rule else None},
+		try:
+			frappe.db.set_value(
+				"Bank Transaction",
+				transaction.name,
+				{
+					"is_rule_evaluated": 1,
+					"matched_transaction_rule": matched_rule.name if matched_rule else None,
+				},
+			)
+		except frappe.QueryDeadlockError:
+			# This pass shares `tabBank Transaction` with the foreground reconcile path, which takes an
+			# exclusive row lock before posting. When the two meet on the same row the engine refuses
+			# this write - MariaDB with error 1020, PostgreSQL with a serialisation failure, both mapped
+			# onto `QueryDeadlockError` - and, left alone, that single contended row aborted the ENTIRE
+			# pass: the job went to the failed registry and every transaction after this one went
+			# unevaluated, with nothing in the UI to say so.
+			#
+			# Degrading per row instead is correct rather than merely tolerant, because of WHAT this
+			# write is: advisory match metadata, never financial state. `is_rule_evaluated` therefore
+			# stays 0 for the contended row, which is precisely the filter this pass selects on, so the
+			# next scheduled pass re-picks it and the suggestion arrives a cycle later. Nothing is lost
+			# and nothing is half-written.
+			#
+			# The row that beat us is one being reconciled right now, so a suggested match for it is
+			# about to be moot anyway - which is why a retry loop here would be effort spent on the one
+			# row least likely to need the answer. The foreground path maps the same exception to a
+			# "Refresh Required" refusal; this is the same decision taken from the other side.
+			contended.append(transaction.name)
+			continue
+
+	if contended:
+		# Logged once per pass rather than once per row: a burst of reconciliations can contend on many
+		# rows at once, and a log line each would bury the fact that the pass itself completed.
+		frappe.logger("bank_transaction_rule").info(
+			f"Rule evaluation skipped {len(contended)} transaction(s) locked by a concurrent"
+			f" reconciliation; they stay unevaluated for the next pass: {', '.join(contended[:20])}"
 		)

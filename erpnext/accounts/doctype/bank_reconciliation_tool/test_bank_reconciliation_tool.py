@@ -20,10 +20,12 @@ from erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool 
 	get_bank_transactions,
 	get_linked_payments,
 	get_older_unreconciled_transactions,
+	parse_date_argument,
 	reconcile_vouchers,
 	search_for_transfer_transaction,
 	update_clearance_date,
 	validate_reconciliation_voucher_type,
+	validate_vouchers_to_reconcile,
 )
 from erpnext.accounts.doctype.bank_transaction.bank_transaction import unreconcile_transaction
 from erpnext.accounts.doctype.payment_entry.test_payment_entry import create_payment_entry
@@ -730,3 +732,319 @@ class TestBankReconciliationTool(ERPNextTestSuite, AccountsTestMixin):
 		empty = get_older_unreconciled_transactions(self.bank_account, add_days(today(), -30))
 		self.assertEqual(empty["count"], 0)
 		self.assertIsNone(empty["oldest_date"])
+
+	# --- Date arguments: every unreadable value is a validation error, never a server error ---
+
+	def test_parse_date_argument_refuses_a_number_too_large_for_the_platform(self):
+		"""
+		`getdate` is not total. It raises its own clean ValidationError for an unreadable string, but an
+		uncaught `OverflowError("Python int too large to convert to C int")` for a number too large for a
+		C int - so a 9-digit value was refused with HTTP 417 while a 15-digit one answered HTTP 500,
+		disclosing `exc_type`, a traceback and on-disk repository and site-packages paths. The boundary
+		is measured here directly, so the split between the two behaviours cannot come back.
+		"""
+		self.assertEqual(parse_date_argument("2026-08-03"), getdate("2026-08-03"))
+		self.assertEqual(parse_date_argument(getdate(today())), getdate(today()))
+
+		for overflowing in ("999999999999999", "99999999999999999999"):
+			with self.subTest(value=overflowing):
+				self.assertRaises(frappe.ValidationError, parse_date_argument, overflowing)
+
+		# Still refused, and still as a validation error, for every other unreadable shape. The last four
+		# matter because `getdate` does not RAISE on any of them: handed a non-date it answers None, and
+		# handed a blank string it answers TODAY - so without the guards each would have become "no date"
+		# or "now" inside a filter instead of a refusal.
+		for unreadable in ("not-a-date", "2026-13-45", "999999999", "1e400", [], {}, 10**18, "", "   "):
+			with self.subTest(value=unreadable):
+				self.assertRaises(frappe.ValidationError, parse_date_argument, unreadable)
+
+	def test_get_bank_transactions_refuses_an_overflowing_date(self):
+		self.make_bank_transaction(date=today())
+
+		for boundary in ("from_date", "to_date"):
+			with self.subTest(boundary=boundary):
+				self.assertRaises(
+					frappe.ValidationError,
+					get_bank_transactions,
+					self.bank_account,
+					**{boundary: "999999999999999"},
+				)
+
+		# The endpoint still answers the ordinary request, so the guard costs no behaviour.
+		self.assertEqual(len(get_bank_transactions(self.bank_account, to_date=today())), 1)
+
+	def test_get_account_balance_refuses_an_unreadable_till_date(self):
+		"""
+		`till_date` reached the report queries and `get_balance_on` raw, so an unreadable value surfaced
+		from deep inside them and an overflowing one as an unhandled OverflowError - HTTP 500 from an
+		endpoint that already answers every other bad argument as a validation error.
+		"""
+		for bad_date in ("not-a-date", "2026-13-45", "999999999999999"):
+			with self.subTest(till_date=bad_date):
+				self.assertRaises(
+					frappe.ValidationError, get_account_balance, self.bank_account, bad_date, self.company
+				)
+
+		# A readable date still answers, so the balance path itself is untouched.
+		self.assertIsNotNone(get_account_balance(self.bank_account, today(), self.company))
+
+	def test_older_unreconciled_transactions_refuses_an_unreadable_boundary(self):
+		# The boundary reached the database raw, and a comparison the engine could not read was DISCARDED
+		# rather than failed - so a corrupt boundary answered a count taken over no window at all.
+		self.make_bank_transaction(date=add_days(today(), -3))
+
+		for bad_date in ("not-a-date", "999999999999999"):
+			with self.subTest(from_date=bad_date):
+				self.assertRaises(
+					frappe.ValidationError, get_older_unreconciled_transactions, self.bank_account, bad_date
+				)
+
+		self.assertEqual(get_older_unreconciled_transactions(self.bank_account, today())["count"], 1)
+
+	def test_update_clearance_date_refuses_a_clearance_date_that_is_not_a_date(self):
+		"""
+		The value went straight into `frappe.db.set_value`, so it was the DATABASE that refused it - and
+		the engine's own message disclosed the database name, the table and the column.
+		"""
+		payment = self._submitted_payment("clearance-bad-date")
+
+		for bad_date in ("not-a-date", "2026-13-45", "999999999999999"):
+			with self.subTest(clearance_date=bad_date):
+				self.assertRaises(
+					frappe.ValidationError,
+					update_clearance_date,
+					payment_document="Payment Entry",
+					payment_entry=payment.name,
+					account=self.bank,
+					clearance_date=bad_date,
+				)
+
+		# Nothing was written by any of them, and the ordinary path still writes.
+		self.assertIsNone(frappe.db.get_value("Payment Entry", payment.name, "clearance_date"))
+		update_clearance_date("Payment Entry", payment.name, self.bank, today())
+		self.assertEqual(
+			frappe.db.get_value("Payment Entry", payment.name, "clearance_date"), getdate(today())
+		)
+
+		# An empty clearance date still means "clear it" rather than "today".
+		update_clearance_date("Payment Entry", payment.name, self.bank, None)
+		self.assertIsNone(frappe.db.get_value("Payment Entry", payment.name, "clearance_date"))
+
+	# --- Clearance date: authorization of the VOUCHER, not just a role on another DocType ---
+
+	def test_update_clearance_date_refuses_a_voucher_outside_the_callers_scope(self):
+		"""
+		The only check was `has_permission("Bank Clearance", ptype="write")` - a ROLE check, and against
+		a DIFFERENT DocType than the one being written. A role check says nothing about WHICH records a
+		user may touch, and `frappe.db.set_value` never consults document permissions, so User
+		Permissions were bypassed entirely: a caller restricted to one company could stamp a clearance
+		date onto another company's Payment Entry, be answered HTTP 200, and be recorded as the author.
+		"""
+		payment = self._submitted_payment("clearance-cross-company")
+
+		self._as_user(
+			self._make_user(roles=["Accounts User", "Accounts Manager"], companies=["_Test Company 2"])
+		)
+		# The caller holds the role the endpoint used to check, which is what makes the refusal below a
+		# statement about the DOCUMENT rather than about the role.
+		self.assertTrue(frappe.has_permission("Bank Clearance", ptype="write"))
+
+		self.assertRaises(
+			frappe.PermissionError,
+			update_clearance_date,
+			payment_document="Payment Entry",
+			payment_entry=payment.name,
+			account=self.bank,
+			clearance_date=today(),
+		)
+
+		frappe.set_user("Administrator")
+		# Refused ahead of the write, so the voucher is byte-identical.
+		self.assertIsNone(frappe.db.get_value("Payment Entry", payment.name, "clearance_date"))
+
+	def test_update_clearance_date_still_writes_for_an_unrestricted_accounts_manager(self):
+		# The refusal above is only meaningful if an ordinary, unrestricted accountant still succeeds.
+		payment = self._submitted_payment("clearance-permitted")
+
+		self._as_user(self._make_user(roles=["Accounts User", "Accounts Manager"]))
+		update_clearance_date("Payment Entry", payment.name, self.bank, today())
+
+		frappe.set_user("Administrator")
+		self.assertEqual(
+			frappe.db.get_value("Payment Entry", payment.name, "clearance_date"), getdate(today())
+		)
+
+	def test_update_clearance_date_refuses_a_sales_invoice_that_does_not_exist(self):
+		# The Sales Invoice branch resolved its payment row first, so a missing invoice was reported as
+		# "nothing to clear" - which describes a different situation than the one the caller is in.
+		self.assertRaises(
+			frappe.DoesNotExistError,
+			update_clearance_date,
+			payment_document="Sales Invoice",
+			payment_entry="ACC-SINV-does-not-exist",
+			account=self.bank,
+			clearance_date=today(),
+		)
+
+	# --- Reconcile: the WRITE path authorises the vouchers the client named ---
+
+	def test_reconcile_vouchers_refuses_a_voucher_the_caller_cannot_read(self):
+		"""
+		The candidate list the UI offers is permission-filtered, but nothing obliged a caller to choose
+		from it: naming a voucher directly bypassed the filter completely. So a restricted user could
+		allocate a bank transaction against a voucher they cannot even read, be answered HTTP 200, and
+		leave a child row linking that document.
+
+		The restriction used here is a Company User Permission, which is what makes the voucher
+		unreadable to this caller while leaving the role intact.
+		"""
+		bank_transaction = self.make_bank_transaction(date=today())
+		payment = self._submitted_payment("reconcile-unreadable")
+
+		self._as_user(
+			self._make_user(roles=["Accounts User", "Accounts Manager"], companies=["_Test Company 2"])
+		)
+		# The role is present and the document is unreadable - the two facts that together make this a
+		# document-level refusal rather than a role-level one.
+		self.assertTrue(frappe.has_permission("Payment Entry", ptype="read"))
+		self.assertFalse(frappe.has_permission("Payment Entry", ptype="read", doc=payment.name))
+
+		self.assertRaises(
+			frappe.PermissionError,
+			reconcile_vouchers,
+			bank_transaction_name=bank_transaction.name,
+			vouchers=json.dumps(
+				[{"payment_doctype": "Payment Entry", "payment_name": payment.name, "amount": 100}]
+			),
+		)
+
+		frappe.set_user("Administrator")
+		# Refused before `add_payment_entries`, so NOTHING was appended, allocated or saved.
+		bank_transaction.reload()
+		self.assertEqual(bank_transaction.payment_entries, [])
+		self.assertEqual(bank_transaction.status, "Unreconciled")
+		self.assertEqual(bank_transaction.allocated_amount, 0)
+		self.assertIsNone(frappe.db.get_value("Payment Entry", payment.name, "clearance_date"))
+
+	def test_reconcile_vouchers_refuses_the_whole_request_when_one_voucher_is_unpermitted(self):
+		"""
+		A partially permitted selection must not post its permitted half: the reviewer asked for one
+		reconciliation, and half of one is a different - and silently wrong - outcome.
+
+		The restriction is a User Permission on Payment Entry itself, which is what makes ONE of two
+		otherwise identical vouchers readable and the other not, so the refusal cannot be explained by
+		the request being malformed or the other voucher being absent.
+		"""
+		bank_transaction = self.make_bank_transaction(date=today(), deposit=200)
+		readable = self._submitted_payment("reconcile-mixed-readable")
+		unreadable = self._submitted_payment("reconcile-mixed-unreadable")
+
+		user = self._make_user(roles=["Accounts User", "Accounts Manager"])
+		add_user_permission("Payment Entry", readable.name, user)
+		self.addCleanup(remove_user_permission, "Payment Entry", readable.name, user)
+		self._as_user(user)
+
+		# Exactly one of the two is readable, which is what makes this a MIXED selection.
+		self.assertTrue(frappe.has_permission("Payment Entry", ptype="read", doc=readable.name))
+		self.assertFalse(frappe.has_permission("Payment Entry", ptype="read", doc=unreadable.name))
+
+		self.assertRaises(
+			frappe.PermissionError,
+			reconcile_vouchers,
+			bank_transaction_name=bank_transaction.name,
+			vouchers=json.dumps(
+				[
+					{"payment_doctype": "Payment Entry", "payment_name": readable.name, "amount": 100},
+					{"payment_doctype": "Payment Entry", "payment_name": unreadable.name, "amount": 100},
+				]
+			),
+		)
+
+		frappe.set_user("Administrator")
+		# Not even the permitted half was posted.
+		bank_transaction.reload()
+		self.assertEqual(bank_transaction.payment_entries, [])
+		self.assertEqual(bank_transaction.status, "Unreconciled")
+		self.assertIsNone(frappe.db.get_value("Payment Entry", readable.name, "clearance_date"))
+
+	def test_reconcile_vouchers_refuses_a_voucher_type_it_does_not_deal_in(self):
+		# `payment_document` is a Link to DocType on the child table, so any DocType on the site could be
+		# named. The permitted set is the same `bank_reconciliation_doctypes` hook the clearance-date
+		# endpoints validate against, so the two can never drift apart.
+		bank_transaction = self.make_bank_transaction(date=today())
+
+		for voucher_type in ("Bogus DocType", "User", "Bank Transaction"):
+			with self.subTest(voucher_type=voucher_type):
+				self.assertRaises(
+					frappe.ValidationError,
+					reconcile_vouchers,
+					bank_transaction_name=bank_transaction.name,
+					vouchers=json.dumps(
+						[{"payment_doctype": voucher_type, "payment_name": "whatever", "amount": 100}]
+					),
+				)
+
+		bank_transaction.reload()
+		self.assertEqual(bank_transaction.payment_entries, [])
+
+	def test_reconcile_vouchers_refuses_a_voucher_that_does_not_exist(self):
+		# Reported as "not found" rather than as a permission refusal, because the permission filter
+		# cannot tell an absent record from an unreadable one and answering 403 would mis-describe it.
+		bank_transaction = self.make_bank_transaction(date=today())
+
+		self.assertRaises(
+			frappe.DoesNotExistError,
+			reconcile_vouchers,
+			bank_transaction_name=bank_transaction.name,
+			vouchers=json.dumps(
+				[
+					{
+						"payment_doctype": "Payment Entry",
+						"payment_name": "ACC-PAY-does-not-exist",
+						"amount": 100,
+					}
+				]
+			),
+		)
+
+	def test_reconcile_vouchers_refuses_a_hostile_identifier_type(self):
+		"""
+		Testing truthiness alone let a JSON object or array through as an identifier, and each then
+		reached a different layer as an unhandled TypeError - `payment_name` as a dict became an
+		unhashable member of the tuple `validate_duplicate_references` puts into a set. Both answered
+		HTTP 500 from the very function whose purpose is to stop a malformed payload doing exactly that.
+
+		All six shapes the finding measured are covered, so the four that used to crash and the two that
+		were already refused are pinned to the same answer.
+		"""
+		bank_transaction = self.make_bank_transaction(date=today())
+
+		for hostile in (
+			{"payment_doctype": "Payment Entry", "payment_name": {"a": 1}, "amount": 1},
+			{"payment_doctype": "Payment Entry", "payment_name": ["a"], "amount": 1},
+			{"payment_doctype": {"a": 1}, "payment_name": "ACC-PAY-2026-00001", "amount": 1},
+			{"payment_doctype": ["Payment Entry"], "payment_name": "ACC-PAY-2026-00001", "amount": 1},
+			{"payment_doctype": "Payment Entry", "payment_name": 12345, "amount": 1},
+			{"payment_doctype": "Payment Entry", "payment_name": True, "amount": 1},
+		):
+			with self.subTest(voucher=str(hostile)):
+				self.assertRaises(
+					frappe.ValidationError,
+					reconcile_vouchers,
+					bank_transaction_name=bank_transaction.name,
+					vouchers=json.dumps([hostile]),
+				)
+
+		bank_transaction.reload()
+		self.assertEqual(bank_transaction.payment_entries, [])
+		self.assertEqual(bank_transaction.status, "Unreconciled")
+		self.assertEqual(bank_transaction.unallocated_amount, 100)
+
+	def test_validate_vouchers_to_reconcile_accepts_a_permitted_voucher(self):
+		# Every refusal above is only meaningful if the validator passes the ordinary case, so this
+		# asserts the permitted path directly rather than only through the endpoint.
+		payment = self._submitted_payment("validator-happy")
+
+		validate_vouchers_to_reconcile(
+			[{"payment_doctype": "Payment Entry", "payment_name": payment.name, "amount": 100}]
+		)

@@ -257,6 +257,52 @@ describe('BankRecErrorDialog', () => {
 			expect(banner).toHaveTextContent('Transaction currency: USD cannot be different')
 			expect(banner.textContent).not.toContain('<b>')
 		})
+
+		/*
+		 * `_server_messages` reach this dialog as RAW HTML through the shared `MarkdownRenderer`, which
+		 * has `rehypeRaw` registered - and Frappe's own `sanitize_html` is no defence here, because it
+		 * KEEPS an absolute off-site anchor in a server message and merely adds `rel`. So a rejection
+		 * whose message interpolates a record name an Accounts user chose, or that the server itself
+		 * wrote as a link, could hand the reviewer a live off-site destination inside the very dialog
+		 * reporting a failure - the most trusted moment on the screen.
+		 *
+		 * The boundary itself is specified in `ui/markdown.test.tsx`. These two pin the consequence at
+		 * this call site, so the dialog cannot quietly regain a phishing surface if the renderer changes.
+		 */
+		describe('a destination inside a server message', () => {
+			it('renders no off-site anchor, while keeping every word the server wrote', () => {
+				renderDialog(
+					makeServerMessagesError(
+						'Bank Transaction <strong><a href="https://evil.example.com/login">Sign in to verify your account</a></strong> does not exist'
+					)
+				)
+
+				const dialog = getDialogContent()
+
+				expect(dialog.querySelectorAll('a')).toHaveLength(0)
+				document.querySelectorAll('[href], [src]').forEach((element) => {
+					for (const attribute of Array.from(element.attributes)) {
+						expect(attribute.value).not.toContain('evil.example.com')
+					}
+				})
+				// Verbatim, as the AAP requires - the refusal is not paraphrased, only defanged.
+				expect(dialog.textContent).toContain('Sign in to verify your account')
+				expect(dialog.textContent).toContain('does not exist')
+			})
+
+			it("still renders Frappe's own /app document link, so the reviewer can reach the record", () => {
+				renderDialog(
+					makeServerMessagesError(
+						'Refused. Open <a href="/app/bank-transaction/ACC-BTN-2026-00001">ACC-BTN-2026-00001</a> to review it.'
+					)
+				)
+
+				const anchor = getDialogContent().querySelector('a')
+
+				expect(anchor).toHaveAttribute('href', '/app/bank-transaction/ACC-BTN-2026-00001')
+				expect(anchor).toHaveAttribute('rel', 'noreferrer noopener')
+			})
+		})
 	})
 
 	describe("severity follows the server's own indicator", () => {

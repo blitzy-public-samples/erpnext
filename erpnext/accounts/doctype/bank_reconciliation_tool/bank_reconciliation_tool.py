@@ -46,6 +46,51 @@ class BankReconciliationTool(Document):
 	pass
 
 
+def parse_date_argument(value: str | date) -> date:
+	"""
+	Normalise a client-supplied date, answering a validation error for everything unreadable.
+
+	`getdate` is the right normaliser but it is NOT total: it raises its own clean ValidationError for
+	an unreadable string, and an uncaught `OverflowError("Python int too large to convert to C int")`
+	for a numeric one too large for a C int - measured, a 9-digit value is refused cleanly while a
+	15-digit one is not. That difference reached the caller as HTTP 500 carrying `exc_type`, a full
+	traceback and on-disk repository and site-packages paths, from an endpoint whose whole purpose in
+	normalising was to answer 417 instead. `TypeError` is caught alongside it for the argument shapes a
+	whitelisted endpoint can be handed but never declares - a list or an object rather than a scalar.
+
+	Nor does `getdate` always RAISE on input it cannot read: handed a value that is not a string or a
+	date at all it answers `None`, and handed a blank one it answers TODAY - so an argument list or an
+	empty boundary would have silently become "no date" or "now" inside a filter rather than a refusal.
+	Both are rejected up front, so this helper either returns a real date or throws.
+
+	The refusal names the offending value so the reviewer can see which boundary was rejected, and is
+	deliberately the same sentence for every unreadable input: which internal failure a value happened
+	to provoke is not something a caller can act on.
+	"""
+	if isinstance(value, str):
+		value = value.strip()
+
+	# `datetime` is a subclass of `date`, so both already-normalised shapes are covered here.
+	if not isinstance(value, str | date) or not value:
+		frappe.throw(
+			_("{0} is not a valid date").format(frappe.bold(value)),
+			title=_("Invalid Date"),
+		)
+
+	try:
+		parsed = getdate(value)
+	except (ValueError, TypeError, OverflowError):
+		parsed = None
+
+	if not parsed:
+		frappe.throw(
+			_("{0} is not a valid date").format(frappe.bold(value)),
+			title=_("Invalid Date"),
+		)
+
+	return parsed
+
+
 @frappe.whitelist()
 def get_bank_transactions(
 	bank_account: str,
@@ -59,15 +104,17 @@ def get_bank_transactions(
 	filters.append(["docstatus", "=", 1])
 	if not all_transactions:
 		filters.append(["unallocated_amount", ">", 0.0])
-	# `getdate` normalises the boundaries and rejects anything that is not a date. Passed through raw,
-	# a value like "not-a-date" or an impossible "2026-13-45" reached the database, which discarded the
-	# comparison instead of failing it - so the request answered HTTP 200 with EVERY transaction on the
-	# account, silently ignoring the window the caller asked for. Only truthy values are normalised, so
-	# an omitted or blank boundary still means "no bound" rather than `getdate`'s today.
+	# `parse_date_argument` normalises the boundaries and rejects anything that is not a date. Passed
+	# through raw, a value like "not-a-date" or an impossible "2026-13-45" reached the database, which
+	# discarded the comparison instead of failing it - so the request answered HTTP 200 with EVERY
+	# transaction on the account, silently ignoring the window the caller asked for. Only truthy values
+	# are normalised, so an omitted or blank boundary still means "no bound" rather than `getdate`'s
+	# today. It is the guarded helper rather than `getdate` itself because `getdate` refuses most
+	# unreadable input cleanly but raises an unhandled OverflowError for a very large number.
 	if to_date:
-		filters.append(["date", "<=", getdate(to_date)])
+		filters.append(["date", "<=", parse_date_argument(to_date)])
 	if from_date:
-		filters.append(["date", ">=", getdate(from_date)])
+		filters.append(["date", ">=", parse_date_argument(from_date)])
 	transactions = frappe.get_list(
 		"Bank Transaction",
 		fields=[
@@ -126,10 +173,15 @@ def get_account_balance(bank_account: str, till_date: str | date, company: str):
 			title=_("Company Mismatch"),
 		)
 
+	# Normalised here rather than trusted, for the same reason the transaction window is: `till_date`
+	# reaches the report queries and `get_balance_on` untouched, so an unreadable value surfaced deep
+	# inside them - and a very large number surfaced as an unhandled OverflowError, HTTP 500 with a
+	# traceback and on-disk paths, rather than as the validation error this endpoint already answers for
+	# every other bad argument.
 	filters = frappe._dict(
 		{
 			"account": account,
-			"report_date": till_date,
+			"report_date": parse_date_argument(till_date),
 			"include_pos_transactions": 1,
 			"company": account_company,
 		}
@@ -424,7 +476,10 @@ def get_older_unreconciled_transactions(bank_account: str, from_date: str):
 	"""
 	filters = {
 		"bank_account": bank_account,
-		"date": ["<", from_date],
+		# Normalised for the same reason the transaction window is: the boundary reached the database
+		# raw, and a comparison the engine could not read was DISCARDED rather than failed - so a
+		# corrupt boundary answered HTTP 200 with a backlog count taken over no window at all.
+		"date": ["<", parse_date_argument(from_date)],
 		"docstatus": 1,
 		"unallocated_amount": [">", 0.0],
 	}
@@ -469,6 +524,29 @@ def validate_reconciliation_voucher_type(payment_document: str) -> None:
 		)
 
 
+def validate_clearance_write_permission(payment_document: str, payment_entry: str) -> None:
+	"""
+	Confirm the session user may write the VOUCHER whose clearance date is about to change.
+
+	The only check this endpoint used to make was `has_permission("Bank Clearance", ptype="write")` -
+	a ROLE check, and against a different DocType than the one being written. Role checks say nothing
+	about WHICH records a user may touch, and `frappe.db.set_value` goes straight to the database
+	without consulting document permissions at all, so User Permissions were bypassed entirely: a
+	caller restricted to one company could stamp a clearance date onto another company's Payment
+	Entry and be answered HTTP 200, with the row's `modified_by` recording them as the author.
+
+	`doc=` is the whole point of the check below - it is what makes Frappe evaluate the User
+	Permissions attached to the session user against this specific document, rather than only the
+	role's blanket permission on the DocType. The role check above is deliberately left in place: it
+	is the surface's own gate and this is an additional, narrower one, not a replacement.
+
+	`write` rather than `read` because a clearance date IS a write to the voucher, and it mirrors the
+	`check_permission("write")` the sibling `clear_clearing_date` already performs before undoing it -
+	so setting and clearing a clearance date now demand the same authority.
+	"""
+	frappe.has_permission(payment_document, ptype="write", doc=payment_entry, throw=True)
+
+
 @frappe.whitelist(methods=["POST"])
 def update_clearance_date(
 	payment_document: str, payment_entry: str, account: str, clearance_date: str | None
@@ -477,8 +555,11 @@ def update_clearance_date(
 	Update the clearance date of a voucher
 	"""
 
-	if not clearance_date:
-		clearance_date = None
+	# Normalised rather than written through. `clearance_date` went straight into `frappe.db.set_value`,
+	# so an unreadable value was refused by the DATABASE - answering HTTP 500 with the engine's own
+	# message, which disclosed the database name, the table and the column. It is the same class of
+	# input as the transaction window's boundaries and is now refused the same way, ahead of any write.
+	clearance_date = parse_date_argument(clearance_date) if clearance_date else None
 
 	# Check for permissions
 	frappe.has_permission("Bank Clearance", ptype="write", throw=True)
@@ -486,6 +567,17 @@ def update_clearance_date(
 	validate_reconciliation_voucher_type(payment_document)
 
 	if payment_document == "Sales Invoice":
+		# Existence before permission, so a name that simply is not there is still answered as "not
+		# found" rather than as a load failure from inside the permission check below.
+		if not frappe.db.exists("Sales Invoice", payment_entry):
+			frappe.throw(
+				_("{0} {1} does not exist").format(payment_document, frappe.bold(payment_entry)),
+				frappe.DoesNotExistError,
+				title=_("Not Found"),
+			)
+
+		validate_clearance_write_permission(payment_document, payment_entry)
+
 		# A Sales Invoice carries its clearance date on the payment row, not on itself, so the target is
 		# identified by parent + account rather than by name - and a filter that matches nothing writes
 		# nothing while still answering HTTP 200. Resolved first so "no such row" is said out loud.
@@ -513,6 +605,8 @@ def update_clearance_date(
 				frappe.DoesNotExistError,
 				title=_("Not Found"),
 			)
+
+		validate_clearance_write_permission(payment_document, payment_entry)
 
 		frappe.db.set_value(payment_document, payment_entry, "clearance_date", clearance_date)
 
@@ -1212,8 +1306,19 @@ def parse_vouchers_to_reconcile(vouchers: str | list) -> list[dict]:
 		frappe.throw(_("Select at least one voucher to reconcile."), title=_("Nothing to Reconcile"))
 
 	for voucher in vouchers:
+		# Both identifiers must be STRINGS, not merely truthy. Testing truthiness alone let a JSON
+		# object or array through as an identifier, and each then reached a different layer as an
+		# unhandled TypeError: `payment_name` as a dict became an unhashable member of the tuple
+		# `validate_duplicate_references` puts into a set, and `payment_doctype` as a dict became an
+		# unhashable operand of the voucher-type check below. Both answered HTTP 500 - from the very
+		# function whose purpose is to stop a malformed payload surfacing as one. Requiring `str` is
+		# the field contract rather than a tightening: `payment_document` is a Link to DocType and
+		# `payment_entry` a Dynamic Link, both string columns, and every internal caller passes a
+		# document's own `name`.
 		if (
 			not isinstance(voucher, dict)
+			or not isinstance(voucher.get("payment_doctype"), str)
+			or not isinstance(voucher.get("payment_name"), str)
 			or not voucher.get("payment_doctype")
 			or not voucher.get("payment_name")
 		):
@@ -1296,11 +1401,79 @@ def load_bank_transaction_for_reconciliation(bank_transaction_name: str | int) -
 	return transaction
 
 
+def validate_vouchers_to_reconcile(vouchers: list[dict]) -> None:
+	"""
+	Confirm every voucher NAMED BY THE CLIENT is one this surface deals in, exists, and is one the
+	session user is permitted to see - before a single child row is appended.
+
+	`vouchers` arrives straight from the request, and the reconcile path took it on trust. The
+	candidate list the UI offers is permission-filtered (`get_linked_payments` re-asserts its
+	candidates through `filter_permitted_vouchers`), but nothing obliged a caller to choose from it:
+	naming a voucher directly bypassed that filter completely. So a user restricted by a User
+	Permission - measured with a Mode of Payment restriction, where `GET` on the Payment Entry itself
+	answered 403 - could still allocate a bank transaction against that voucher and be answered HTTP
+	200, leaving a child row linking a document they cannot read and stamping its clearance date.
+
+	Three checks, in this order, because each earns its own answer:
+
+	1. the voucher TYPE, through the same `bank_reconciliation_doctypes` hook the rest of this module
+	   validates against, so a DocType this surface does not deal in is a validation error rather than
+	   an obscure link failure much later - and so the permission check below is never handed a name
+	   that is not a DocType at all;
+	2. EXISTENCE, so a name that is simply absent is still answered "not found". Without this the
+	   permission filter would drop it and report a refusal, which would both mis-describe the request
+	   and turn the existing 404 into a 403;
+	3. PERMISSION, through this module's own `filter_permitted_vouchers` - reused deliberately rather
+	   than reimplemented, so the read path and the write path can never disagree about who may see
+	   what. It applies DocType permissions AND User Permissions, because `frappe.get_list` runs the
+	   permission query.
+
+	Called from `reconcile_vouchers` AFTER the transaction is loaded and BEFORE `add_payment_entries`:
+	after, so a request naming a transaction that does not exist keeps answering "not found"; before,
+	so a refusal happens with nothing appended, nothing allocated and nothing saved.
+
+	`is_new_voucher` deliberately grants no exemption. It is a parameter of the whitelisted endpoint,
+	so any caller can set it, and an exemption keyed on it would be a hole rather than a shortcut. The
+	internal creators that pass it are unaffected regardless: `insert()`/`submit()` already enforce the
+	creating user's own User Permissions, so a voucher they just created is necessarily one they can
+	read back.
+	"""
+	for voucher in vouchers:
+		validate_reconciliation_voucher_type(voucher["payment_doctype"])
+
+		if not frappe.db.exists(voucher["payment_doctype"], voucher["payment_name"]):
+			frappe.throw(
+				_("{0} {1} does not exist").format(
+					voucher["payment_doctype"], frappe.bold(voucher["payment_name"])
+				),
+				frappe.DoesNotExistError,
+				title=_("Not Found"),
+			)
+
+	permitted = {
+		(candidate["doctype"], candidate["name"])
+		for candidate in filter_permitted_vouchers(
+			[{"doctype": voucher["payment_doctype"], "name": voucher["payment_name"]} for voucher in vouchers]
+		)
+	}
+
+	for voucher in vouchers:
+		if (voucher["payment_doctype"], voucher["payment_name"]) not in permitted:
+			frappe.throw(
+				_("You are not permitted to reconcile against {0} {1}").format(
+					voucher["payment_doctype"], frappe.bold(voucher["payment_name"])
+				),
+				frappe.PermissionError,
+				title=_("Not Permitted"),
+			)
+
+
 @frappe.whitelist(methods=["POST"])
 def reconcile_vouchers(bank_transaction_name: str | int, vouchers: str | list, is_new_voucher: bool = False):
 	# updated clear date of all the vouchers based on the bank transaction
 	vouchers = parse_vouchers_to_reconcile(vouchers)
 	transaction = load_bank_transaction_for_reconciliation(bank_transaction_name)
+	validate_vouchers_to_reconcile(vouchers)
 	transaction.add_payment_entries(vouchers, is_new_voucher)
 	transaction.validate_duplicate_references()
 	transaction.allocate_payment_entries()

@@ -554,3 +554,97 @@ class TestBankTransactionRule(ERPNextTestSuite, AccountsTestMixin):
 		)
 		self.assertIsNotNone(stamped.matched_transaction_rule)
 		self.assertEqual(stamped.is_rule_evaluated, 1)
+
+	# --- _run_rule_evaluation: a contended row must not take the whole pass down ---
+
+	def _submitted_transaction_for_rule(self, token: str, deposit: float = 250.0):
+		"""A submitted, unreconciled, not-yet-evaluated transaction this token's rule will match."""
+		transaction = frappe.get_doc(
+			{
+				"doctype": "Bank Transaction",
+				"date": "2026-01-15",
+				"description": f"NEFT CR REF {token} settled",
+				"deposit": deposit,
+				"currency": frappe.get_cached_value("Account", self.bank, "account_currency"),
+				"bank_account": self.bank_account,
+			}
+		).insert()
+		transaction.submit()
+
+		self.assertEqual(transaction.status, "Unreconciled")
+		self.assertEqual(transaction.is_rule_evaluated, 0)
+		return transaction
+
+	@staticmethod
+	def _stamp_of(name: str) -> dict:
+		return frappe.db.get_value(
+			"Bank Transaction", name, ["matched_transaction_rule", "is_rule_evaluated"], as_dict=True
+		)
+
+	def test_run_rule_evaluation_survives_a_row_locked_by_a_concurrent_reconciliation(self):
+		"""
+		This pass shares `tabBank Transaction` with the foreground reconcile path, which takes an
+		exclusive row lock before posting. When the two meet on the same row the engine refuses this
+		write - MariaDB with error 1020, PostgreSQL with a serialisation failure, both mapped onto
+		`QueryDeadlockError` - and a single contended row used to abort the ENTIRE pass: the job went to
+		the failed registry and every transaction after it went unevaluated, with nothing in the UI to
+		say so.
+
+		The lock is simulated rather than raced, because a race cannot be relied on to land on a chosen
+		row inside a synchronous test - and what has to be specified is the HANDLING, not the timing.
+
+		Two things are asserted, and the second is what makes the first meaningful: the pass completes
+		AND it keeps stamping the rows it can reach. The contended row is left with
+		`is_rule_evaluated = 0`, which is exactly the filter this pass selects on, so the next pass
+		re-picks it - the degradation is a deferral, not a loss.
+		"""
+		token = f"btr-deadlock-{frappe.generate_hash(length=8)}"
+		self._rule("deadlock", [{"check": "Contains", "value": token}], priority=12).insert()
+
+		contended = self._submitted_transaction_for_rule(token, deposit=250)
+		survivor = self._submitted_transaction_for_rule(token, deposit=260)
+
+		real_set_value = frappe.db.set_value
+
+		def refuse_the_contended_row(doctype, name, *args, **kwargs):
+			if doctype == "Bank Transaction" and name == contended.name:
+				raise frappe.QueryDeadlockError(
+					"Record has changed since last read in table 'tabBank Transaction'"
+				)
+			return real_set_value(doctype, name, *args, **kwargs)
+
+		with patch("frappe.db.set_value", side_effect=refuse_the_contended_row):
+			# No exception escapes: before this fix the call itself raised.
+			_run_rule_evaluation()
+
+		blocked = self._stamp_of(contended.name)
+		self.assertEqual(blocked.is_rule_evaluated, 0)
+		self.assertIsNone(blocked.matched_transaction_rule)
+
+		# The pass carried on past the refusal, which is the whole point.
+		stamped = self._stamp_of(survivor.name)
+		self.assertEqual(stamped.is_rule_evaluated, 1)
+		self.assertIsNotNone(stamped.matched_transaction_rule)
+
+		# And the deferred row is picked up by the next pass, once the contention is gone.
+		_run_rule_evaluation()
+		recovered = self._stamp_of(contended.name)
+		self.assertEqual(recovered.is_rule_evaluated, 1)
+		self.assertIsNotNone(recovered.matched_transaction_rule)
+
+	def test_run_rule_evaluation_completes_when_every_row_is_locked(self):
+		# The degenerate case: a burst of reconciliations can contend on every row the pass selected.
+		# It must still finish rather than raise, and must write nothing.
+		token = f"btr-alllocked-{frappe.generate_hash(length=8)}"
+		self._rule("alllocked", [{"check": "Contains", "value": token}], priority=13).insert()
+		transaction = self._submitted_transaction_for_rule(token, deposit=270)
+
+		with patch(
+			"frappe.db.set_value",
+			side_effect=frappe.QueryDeadlockError("Record has changed since last read"),
+		):
+			_run_rule_evaluation()
+
+		blocked = self._stamp_of(transaction.name)
+		self.assertEqual(blocked.is_rule_evaluated, 0)
+		self.assertIsNone(blocked.matched_transaction_rule)

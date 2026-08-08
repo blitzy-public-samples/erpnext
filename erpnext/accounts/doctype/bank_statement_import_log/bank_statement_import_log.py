@@ -16,7 +16,55 @@ from frappe.utils.xlsxutils import (
 	read_xlsx_file_from_attached_file,
 )
 
-from erpnext.accounts.doctype.bank_account.bank_account import set_closing_balance_as_per_statement
+# The private helper, not the whitelisted wrapper: the wrapper authorizes the caller against the
+# specific Bank Account, and `Bank Statement Import Log` is granted to System Manager only - a role
+# that holds no `Bank Account` permission row - so an import run by a System Manager would be
+# refused. This code path is authorized by this DocType's own permission gate instead.
+from erpnext.accounts.doctype.bank_account.bank_account import (
+	_set_closing_balance_as_per_statement,
+)
+
+
+def read_statement_or_throw(read, message: str, title: str):
+	"""
+	Run one file-reading or parsing step and translate ANY failure it raises into a readable
+	validation error, preserving the traceback for the operator rather than for the caller.
+
+	Every parser this module reaches is third-party code (openpyxl, xlrd, pypdf, pdfplumber, pdfminer,
+	Pillow, the csv module) being handed a file the uploader chose, and each raised its own internal
+	failure straight out to the HTTP layer: `zipfile.BadZipFile` for a malformed .xlsx,
+	`OSError("File contains no valid workbook part")` for one shaped like an archive but not a
+	workbook, `pypdf.errors.PdfReadError` for a corrupt PDF, and `OSError("File does not exist")` when
+	the attachment row outlived its bytes on disk. All of them answered HTTP 500, naming an internal
+	exception class the reviewer can do nothing with - and, in a development configuration, carrying a
+	traceback with on-disk repository and site-packages paths.
+
+	The catch is deliberately broad rather than an enumeration of exception types. Enumerating them
+	would be a guess about libraries this module does not own, and a guess of exactly the shape that
+	produced this defect: a guard that converts MOST bad input into a clean refusal and leaves one
+	family to escape as a server error. Anything Frappe's HTTP layer already knows how to answer is
+	re-raised untouched - every framework exception carries `http_status_code`, so a permission
+	refusal, a missing document, and this module's OWN `frappe.throw` guards ("Invalid File Type",
+	"Empty Statement", "Password Required", "No Tables Detected", "Missing Dependency") all keep their
+	status and their exact wording.
+
+	`defer_insert` is what makes the Error Log survive: `frappe.throw` rolls the request back, which
+	would discard an ordinary insert, so the traceback is queued out-of-band instead. Diagnosability
+	is therefore not the price of a clean refusal - it moves from the response to the Error Log, which
+	is where it belongs.
+	"""
+	try:
+		return read()
+	except Exception as exception:
+		if hasattr(exception, "http_status_code"):
+			raise
+
+		frappe.log_error(
+			title="Bank Statement Import: unreadable statement file",
+			message=frappe.get_traceback(with_context=True),
+			defer_insert=True,
+		)
+		frappe.throw(message, title=title)
 
 
 class BankStatementImportLog(Document):
@@ -199,7 +247,13 @@ class BankStatementImportLog(Document):
 		file_doc = self.get_file_doc()
 
 		extension = self.get_file_extension()
-		content = file_doc.get_content()
+		# An attachment row can outlive the bytes it points at, in which case this raised
+		# `OSError("File does not exist")` - HTTP 500 for a situation the reviewer can act on.
+		content = read_statement_or_throw(
+			file_doc.get_content,
+			_("The uploaded file could not be read. Please upload it again."),
+			_("File Unreadable"),
+		)
 
 		if extension not in (".csv", ".xlsx", ".xls"):
 			frappe.throw(
@@ -207,12 +261,30 @@ class BankStatementImportLog(Document):
 				title=_("Invalid File Type"),
 			)
 
+		# Each reader is third-party code handed a file the uploader chose, and each raised its own
+		# internal failure straight to the HTTP layer for a file that merely carries the right
+		# extension - `zipfile.BadZipFile` and `OSError("File contains no valid workbook part")` being
+		# the two measured. Refused as a validation error instead, with the traceback kept in the Error
+		# Log for whoever has to diagnose it.
+		unreadable = _(
+			"This file could not be read as a {0} statement. Please check that it is not corrupt and"
+			" that its contents match its file extension."
+		).format(extension)
+
 		if extension == ".csv":
-			data = read_csv_content(content)
+			data = read_statement_or_throw(
+				lambda: read_csv_content(content), unreadable, _("Unreadable Statement")
+			)
 		elif extension == ".xlsx":
-			data = read_xlsx_file_from_attached_file(fcontent=content)
+			data = read_statement_or_throw(
+				lambda: read_xlsx_file_from_attached_file(fcontent=content),
+				unreadable,
+				_("Unreadable Statement"),
+			)
 		elif extension == ".xls":
-			data = read_xls_file_from_attached_file(content)
+			data = read_statement_or_throw(
+				lambda: read_xls_file_from_attached_file(content), unreadable, _("Unreadable Statement")
+			)
 
 		if not data:
 			# A file that parses to no rows at all has nothing to detect a header or a column mapping
@@ -242,7 +314,30 @@ class BankStatementImportLog(Document):
 		self.set_column_mapping_from_columns(detect_column_mapping(data[self.detected_header_index]))
 
 	def set_column_mapping_from_columns(self, columns: list[dict]):
-		"""Replace the column_mapping child table from a list of column dicts."""
+		"""
+		Replace the column_mapping child table from a list of column dicts.
+
+		`columns` reaches here straight from the client through `update_column_mapping`, and the shape
+		was taken on trust: a list that was not a list of objects, or an object without an `index`, or
+		one whose `index` was not a whole number, escaped as `TypeError` or `KeyError: 'index'` - HTTP
+		500 naming an internal failure. Validated first, so a malformed mapping is a refusal the
+		reviewer can act on and NOTHING is written: the child table is only cleared once every row has
+		been accepted, so a bad request cannot leave a half-replaced mapping behind either.
+		"""
+		if not isinstance(columns, list | tuple):
+			frappe.throw(_("The column mapping must be a list."), title=_("Invalid Column Mapping"))
+
+		for col in columns:
+			if (
+				not isinstance(col, dict)
+				or not isinstance(col.get("index"), int)
+				or isinstance(col.get("index"), bool)
+			):
+				frappe.throw(
+					_("Each mapped column must name a whole-number {0}.").format(frappe.bold("index")),
+					title=_("Invalid Column Mapping"),
+				)
+
 		self.column_mapping = []
 
 		for col in columns:
@@ -364,14 +459,31 @@ class BankStatementImportLog(Document):
 		The rendered page images are stashed on the instance and only saved as File docs
 		in `after_insert` (see `attach_pdf_page_images`), once the final docname exists.
 		"""
-		content = self.get_file_doc().get_content()
+		content = read_statement_or_throw(
+			self.get_file_doc().get_content,
+			_("The uploaded file could not be read. Please upload it again."),
+			_("File Unreadable"),
+		)
 		password = self.get_statement_password()
 
-		tables = extract_pdf_tables(content, password)
+		# `pypdf.errors.PdfReadError` for a corrupt PDF, and whatever pdfplumber/pdfminer raise for a
+		# structurally broken one, used to reach the caller as HTTP 500. The recognisable refusals
+		# `extract_pdf_tables` raises itself - "Password Required", "No Tables Detected", "Missing
+		# Dependency" - carry `http_status_code` and so pass through this wrapper unchanged.
+		unreadable_pdf = _(
+			"This PDF could not be read. Please check that it is not corrupt and try uploading it again."
+		)
+		tables = read_statement_or_throw(
+			lambda: extract_pdf_tables(content, password), unreadable_pdf, _("Unreadable Statement")
+		)
 
 		# Rasterize only the pages that actually produced tables, once each.
 		pages = {table["page"] for table in tables}
-		page_images = render_pdf_pages(content, password, pages)
+		page_images = read_statement_or_throw(
+			lambda: render_pdf_pages(content, password, pages),
+			_("The pages of this PDF could not be rendered for preview."),
+			_("Preview Unavailable"),
+		)
 
 		self.flags._pending_page_images = {page: png for page, (png, _scale) in page_images.items()}
 		page_scales = {page: scale for page, (_png, scale) in page_images.items()}
@@ -589,7 +701,7 @@ class BankStatementImportLog(Document):
 		)
 
 		if self.closing_balance is not None and self.end_date:
-			set_closing_balance_as_per_statement(
+			_set_closing_balance_as_per_statement(
 				self.bank_account, frappe.utils.getdate(self.end_date), self.closing_balance
 			)
 
