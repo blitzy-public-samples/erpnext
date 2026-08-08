@@ -1670,6 +1670,21 @@ def get_pe_matching_query(
 		.where(amount_condition)
 		.where(filter_by_date)
 		.orderby(pe.reference_date if cint(filter_by_reference_date) else pe.posting_date)
+		# A DATE is not a unique key, so ordering by one alone leaves candidates posted on the same day
+		# in whatever order the engine happens to return them - which is genuinely arbitrary, and differs
+		# between MariaDB and PostgreSQL for the same rows. `check_matching` then sorts by rank with a
+		# STABLE sort, so it faithfully preserves that arbitrary order inside each rank group, and two
+		# candidates of equal rank and equal date can swap places between one call and the next.
+		#
+		# That is not merely untidy. `test_linked_payments` asserts which of two same-day, same-rank,
+		# same-amount payments comes first and failed roughly one run in four on PostgreSQL; and the
+		# reconciliation UI marks the FIRST candidate as the suggested match, so a tie could silently
+		# move the suggestion between reloads.
+		#
+		# Appending the document name makes the ordering total: names are unique, so the sequence is now
+		# fully determined and identical on both engines. Date remains the primary key, so the ordering
+		# reviewers see is unchanged wherever it was already well defined.
+		.orderby(pe.name)
 	)
 
 	if frappe.flags.auto_reconcile_vouchers is True:

@@ -856,6 +856,67 @@ describe('BankStatementImporter', () => {
 				expect(JSON.stringify(stored[FAILED_LOG.name])).toContain(FAILED_LOG_MESSAGE)
 			})
 
+			it('leaves the server traceback out of storage, and keeps everything the reviewer reads', () => {
+				/*
+				 * A site running with `developer_mode` on returns its whole Python traceback on `exc` -
+				 * stack frames, module paths, absolute filesystem paths. Nothing renders it: the shared
+				 * parser reads `_server_messages`, `_error_message`, `exception`, `httpStatus` and
+				 * `message`, so persisting `exc` put a traceback into browser storage for no reader.
+				 * What the reviewer actually sees has to survive the round trip unchanged, which is the
+				 * second half of this assertion and the reason the field is dropped rather than the
+				 * record being reduced to a flag.
+				 */
+				const TRACEBACK = [
+					'Traceback (most recent call last):',
+					'  File "apps/frappe/frappe/app.py", line 114, in application',
+					'  File "apps/erpnext/erpnext/accounts/doctype/bank_statement_import_log/bank_statement_import_log.py", line 489'
+				].join('\n')
+
+				renderImporter({
+					logs: ALL_LOGS,
+					markers: {
+						[FAILED_LOG.name]: makeServerMessagesError(FAILED_LOG_MESSAGE, { exc: TRACEBACK })
+					}
+				})
+
+				const raw = sessionStorage.getItem(STORAGE_KEY) ?? ''
+
+				expect(raw).not.toContain('Traceback')
+				expect(raw).not.toContain('apps/frappe')
+				expect(raw).not.toContain('apps/erpnext')
+				expect(JSON.parse(raw)[FAILED_LOG.name]).not.toHaveProperty('exc')
+
+				// The reviewer-facing half, unchanged: the server's own sentence, its severity, and the
+				// status the marker is keyed to.
+				expect(raw).toContain(FAILED_LOG_MESSAGE)
+				expect(JSON.parse(raw)[FAILED_LOG.name]).toMatchObject({
+					httpStatus: 417,
+					exc_type: 'ValidationError'
+				})
+				expect(statusBadgeIn(rowFor(FAILED_LOG))).toHaveTextContent('Failed')
+			})
+
+			it('does not confuse an import log NAMED exc with a traceback', () => {
+				// The map's own keys are import-log names, and the log names are server-generated hashes,
+				// so `exc` is a name a log can have. Dropping the field by key alone would take that whole
+				// marker with it; only the string field is a traceback.
+				const oddlyNamedLog = makeBankStatementImportLog({
+					name: 'exc',
+					file: '/files/oddly-named.csv',
+					status: 'Not Started',
+					number_of_transactions: 0,
+					closing_balance: 0
+				})
+
+				renderImporter({
+					logs: [...ALL_LOGS, oddlyNamedLog],
+					markers: makeImportFailures(oddlyNamedLog, FAILED_LOG_MESSAGE)
+				})
+
+				expect(JSON.parse(sessionStorage.getItem(STORAGE_KEY) ?? '{}')).toHaveProperty('exc')
+				expect(statusBadgeIn(rowFor(oddlyNamedLog))).toHaveTextContent('Failed')
+			})
+
 			it('does not outlive the sitting - nothing is written to local storage', () => {
 				renderImporter({
 					logs: ALL_LOGS,

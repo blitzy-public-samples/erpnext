@@ -902,8 +902,16 @@ const GetUnpaidInvoicesButton = ({ currency }: { currency: string }) => {
      * `party_name` is only populated when the party-details fetch succeeds, and is reset to an empty
      * string when it does not - so interpolating it raw produced "Unpaid invoices from  for x", a
      * sentence with a hole in it. Falling back to the party ID mirrors what the party fields on this
-     * same form already do (`party_name !== party ? party_name : undefined`): the ID is always
-     * present, so the sentence always names somebody.
+     * same form already do (`party_name !== party ? party_name : undefined`), and names the party on
+     * every path that HAS one - including the rule-driven path, which opens this dialog with
+     * `party_name` unset.
+     *
+     * It is not a guarantee, and should not be read as one. The dialog can also be opened from the GL
+     * account picker, whose change handler opens it without checking for a party at all (unlike the
+     * trigger button, which is party-gated), and `party` is an empty string until a party is chosen -
+     * so on that path the sentence still has its hole, exactly as it did before this fallback existed.
+     * Closing it would mean changing when that dialog may open, which belongs to the voucher-creation
+     * flow rather than here.
      */
     const partyLabel = partyName || party
 

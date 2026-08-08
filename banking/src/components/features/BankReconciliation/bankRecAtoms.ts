@@ -159,7 +159,27 @@ export const bankRecActionLog = atomWithStorage<ActionLog[]>('bank-rec-action-lo
 /** The rejection the shared dismissible `BankRecErrorDialog` is reporting; `null` closes it. */
 export const bankRecErrorDialogAtom = atom<FrappeError | null>(null)
 
-const importFailureStorage = createJSONStorage<Record<string, FrappeError>>(() => sessionStorage)
+const importFailureStorage = createJSONStorage<Record<string, FrappeError>>(() => sessionStorage, {
+    /*
+     * The traceback is not written out.
+     *
+     * `FrappeError.exc` carries the server's full Python traceback whenever the site runs with
+     * `developer_mode` on - stack frames, module paths, absolute filesystem paths. Nothing renders it:
+     * `getErrorMessages` reads `_server_messages`, `_error_message`, `exception`, `httpStatus` and
+     * `message`, and the banner renders only what that returns. So persisting it put a traceback into
+     * browser storage to be read by nobody, which is the sort of thing that is nobody's problem until
+     * it is. Everything the reviewer actually sees is kept, verbatim, including the server's own title
+     * and severity - a marker restored from storage renders exactly as the live rejection did.
+     *
+     * Narrowed at the write boundary rather than at the one call site that records a failure, so the
+     * guarantee belongs to the store and holds for anything that ever writes to it.
+     *
+     * The `typeof` test is what makes the key safe: the map's own keys are `Bank Statement Import Log`
+     * names, so a log named `exc` would otherwise have its whole marker dropped. A marker is an object;
+     * only the string field is the traceback.
+     */
+    replacer: (key, value) => (key === 'exc' && typeof value === 'string' ? undefined : value)
+})
 
 /**
  * Import failures observed in this session, keyed by `Bank Statement Import Log` name. The DocType has
@@ -179,9 +199,9 @@ const importFailureStorage = createJSONStorage<Record<string, FrappeError>>(() =
  * it. Surviving a reload and a navigation is the requirement; surviving a browser restart, days later,
  * would be asserting something about a file nobody remembers uploading.
  *
- * Holds the raw `FrappeError`, which the SDK produces as a plain object of primitives and therefore
+ * Holds the `FrappeError`, which the SDK produces as a plain object of primitives and therefore
  * round-trips through JSON intact - so the persisted marker still renders through the same shared error
- * path as the live one.
+ * path as the live one. Everything except the traceback is written; see the storage above for why.
  */
 export const bankRecImportFailuresAtom = atomWithStorage<Record<string, FrappeError>>(
     'bank-rec-import-failures',

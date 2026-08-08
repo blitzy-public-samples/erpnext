@@ -61,6 +61,23 @@ type AvailableHeightOptions = {
  * is what left the list 40-80px short after the filter row shrank - the document was still being watched,
  * and a document that stays exactly as tall reports nothing, so only chrome that GREW was ever noticed.
  *
+ * SIZE IS NOT POSITION, which is why a `MutationObserver` is watched as well. A `ResizeObserver` reports
+ * that a box changed SIZE; it says nothing about a box that merely MOVED. Chrome above the element can
+ * disappear and move the element up without a single observed box changing size, and then no size-driven
+ * trigger can fire at all: the refusal banner sits inside a wrapper carrying a `min-height` floor, so
+ * removing its 135px left that wrapper at an unchanged 901px and every ancestor out to `body` unchanged
+ * too - measured, not assumed - while the element's own top moved up by exactly 135px. The list kept the
+ * height it had measured with the banner present and left a 135px blank band below itself, and because
+ * nothing was pending it never recovered; only a window resize, which re-measures for its own reasons,
+ * put it right.
+ *
+ * A structural change is the honest signal there. Chrome appearing or disappearing above the element is
+ * an element added to or removed from one of its ancestors, so `childList` on each ancestor catches it
+ * whether or not anything resizes. `subtree` is deliberately NOT used: the element's own descendants are
+ * the virtualised rows, which mount and unmount continuously while scrolling, and observing those would
+ * force a layout read on every scroll frame to answer a question their own container's position cannot
+ * have changed. Ancestors only, one level each.
+ *
  * The element measured is expected to be the LAST thing in its column, so its own height does not feed
  * back into its own top; and because the hook only stores a changed value, an observation that resolves
  * to the same number ends the cycle rather than re-rendering.
@@ -76,8 +93,15 @@ export const useAvailableHeight = <T extends HTMLElement = HTMLDivElement>(
 	const ref = useRef<T | null>(null)
 	const [height, setHeight] = useState(min)
 	const observerRef = useRef<ResizeObserver | null>(null)
+	const mutationObserverRef = useRef<MutationObserver | null>(null)
 	/** The column currently being watched, so re-checking it costs nothing once it is settled. */
 	const watchedColumnRef = useRef<HTMLElement | null>(null)
+	/**
+	 * The ancestor chain currently watched for structural change, in order from the element outwards.
+	 * Held so an unchanged chain - the settled case, re-checked on every render - costs one length
+	 * comparison and nothing else.
+	 */
+	const watchedAncestorsRef = useRef<HTMLElement[]>([])
 
 	const measure = useCallback(() => {
 		const element = ref.current
@@ -128,6 +152,47 @@ export const useAvailableHeight = <T extends HTMLElement = HTMLDivElement>(
 		}
 	}, [])
 
+	/**
+	 * Points the mutation observer at every ancestor of the element, whenever that chain changes.
+	 *
+	 * Watches one level of each ancestor - not a subtree - so that chrome added above the element, or
+	 * taken away from above it, is noticed even when it changes no box's size. See SIZE IS NOT POSITION
+	 * above for the case this exists for. The walk stops at `body`, which is as far as anything that can
+	 * move the element vertically lives, and is also where portalled overlays mount.
+	 *
+	 * Re-targeted by disconnecting and re-observing, because `MutationObserver` has no per-target
+	 * `unobserve`. That is bounded work: the chain is a handful of elements and changes only when the
+	 * element itself is re-parented, which for these lists means mounting after their request answered.
+	 */
+	const watchAncestors = useCallback(() => {
+		const observer = mutationObserverRef.current
+		if (!observer) {
+			return
+		}
+
+		const ancestors: HTMLElement[] = []
+		for (let node = ref.current?.parentElement ?? null; node; node = node.parentElement) {
+			ancestors.push(node)
+			if (node === document.body) {
+				break
+			}
+		}
+
+		const watched = watchedAncestorsRef.current
+		const unchanged = watched.length === ancestors.length &&
+			watched.every((element, index) => element === ancestors[index])
+		if (unchanged) {
+			return
+		}
+
+		observer.disconnect()
+		watchedAncestorsRef.current = ancestors
+
+		for (const ancestor of ancestors) {
+			observer.observe(ancestor, { childList: true })
+		}
+	}, [])
+
 	/*
 	 * Layout effect rather than effect: the first measurement must land before the browser paints, or the
 	 * list is visibly sized twice on every mount. Deliberately un-gated - it runs after EVERY render,
@@ -138,6 +203,7 @@ export const useAvailableHeight = <T extends HTMLElement = HTMLDivElement>(
 	 */
 	useLayoutEffect(() => {
 		watchColumn()
+		watchAncestors()
 		measure()
 	})
 
@@ -154,18 +220,31 @@ export const useAvailableHeight = <T extends HTMLElement = HTMLDivElement>(
 		observerRef.current = observer
 		observer?.observe(document.documentElement)
 
+		// Structural change above the element, which no size-driven trigger can see when the chrome that
+		// went away leaves every surrounding box the same size. Tolerated as absent for the same reason
+		// as `ResizeObserver`: an environment without it still keeps the value current through resizes
+		// and re-renders.
+		const mutationObserver = typeof MutationObserver === 'undefined'
+			? null
+			: new MutationObserver(() => measure())
+		mutationObserverRef.current = mutationObserver
+
 		// The column carries the chrome above the element, so it shrinks and grows when that chrome does
 		// even while the document's own dimensions hold steady. `ResizeObserver` reports each new target
 		// once on attachment, so this also re-measures as soon as the column appears.
 		watchColumn()
+		watchAncestors()
 
 		return () => {
 			window.removeEventListener('resize', measure)
 			observer?.disconnect()
 			observerRef.current = null
 			watchedColumnRef.current = null
+			mutationObserver?.disconnect()
+			mutationObserverRef.current = null
+			watchedAncestorsRef.current = []
 		}
-	}, [measure, watchColumn])
+	}, [measure, watchColumn, watchAncestors])
 
 	return [ref, height]
 }

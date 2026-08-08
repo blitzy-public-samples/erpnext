@@ -52,6 +52,39 @@ const Probe = ({ top, min, gutter }: { top: number, min?: number, gutter?: numbe
 	)
 }
 
+/**
+ * Renders the hook with a piece of chrome above it that a test can take away WITHOUT re-rendering.
+ *
+ * That is the production shape, and the reason it has to be modelled: the refusal banner above the
+ * candidate pane is its own component and the only subscriber to the atom that decides whether it
+ * renders, so dismissing it re-renders nothing that measures. The element's rect is answered from the
+ * DOM the test is manipulating rather than from a prop, so it moves up when the chrome goes exactly as
+ * it does in a browser - jsdom lays nothing out, so the rect has to be supplied either way.
+ */
+const ChromeProbe = ({ withChrome, withoutChrome }: { withChrome: number, withoutChrome: number }) => {
+	const [ref, height] = useAvailableHeight<HTMLDivElement>({ min: 100, gutter: 0 })
+
+	return (
+		<div data-testid="column">
+			<div data-testid="chrome" />
+			<div
+				data-testid="probe"
+				data-height={height}
+				ref={(node) => {
+					if (!node) return
+					node.getBoundingClientRect = () => rectAt(
+						document.querySelector('[data-testid="chrome"]') ? withChrome : withoutChrome
+					)
+					ref.current = node
+				}}
+			/>
+		</div>
+	)
+}
+
+/** Lets jsdom deliver its mutation records, which it queues in a microtask. */
+const flushMutations = () => new Promise((resolve) => setTimeout(resolve, 0))
+
 const measuredHeight = () => Number(screen.getByTestId('probe').dataset.height)
 
 const setViewportHeight = (height: number) => {
@@ -298,5 +331,117 @@ describe('useAvailableHeight', () => {
 
 		// Default gutter of 16, default floor of 240.
 		expect(measuredHeight()).toBe(884)
+	})
+
+	it('reclaims the room when chrome above it is REMOVED, though no box around it changes size', async () => {
+		/*
+		 * The case no size-driven trigger can see, and the one this was reported for. The refusal banner
+		 * above the candidate pane sits inside a wrapper with a `min-height` floor, so removing its 135px
+		 * left that wrapper - and every ancestor out to `body` - at exactly the same height, while the
+		 * pane's own top moved up by 135px. Nothing resized, the window did not resize, and the pane's
+		 * component did not re-render, so the pane kept the height it had measured with the banner there
+		 * and left a 135px blank band below itself until the next window resize.
+		 *
+		 * The chrome is removed outside React deliberately: a re-render would re-measure through the
+		 * layout effect and prove nothing about the observation.
+		 */
+		setViewportHeight(1000)
+
+		render(<ChromeProbe withChrome={500} withoutChrome={365} />)
+		expect(measuredHeight()).toBe(500)
+
+		await act(async () => {
+			screen.getByTestId('chrome').remove()
+			await flushMutations()
+		})
+
+		// 1000 viewport - 365 top - 0 gutter: the 135px the chrome vacated is now the list's.
+		expect(measuredHeight()).toBe(635)
+	})
+
+	it('ignores mutations INSIDE itself, so a virtualised row mounting is not a re-measure', async () => {
+		/*
+		 * Why the ancestors are watched one level each rather than as subtrees. The element's own
+		 * descendants are the virtual rows, which mount and unmount continuously while scrolling; treating
+		 * those as a reason to re-measure would force a layout read on every scroll frame to answer a
+		 * question the container's unchanged position has already answered.
+		 */
+		setViewportHeight(1000)
+
+		render(<ChromeProbe withChrome={500} withoutChrome={365} />)
+		expect(measuredHeight()).toBe(500)
+
+		// A shorter viewport with no resize event dispatched: from here ANY measurement returns a
+		// different number, so an unchanged number is proof that none was taken.
+		setViewportHeight(800)
+
+		await act(async () => {
+			screen.getByTestId('probe').appendChild(document.createElement('div'))
+			await flushMutations()
+		})
+		expect(measuredHeight()).toBe(500)
+
+		// And the observation is demonstrably live - chrome ABOVE it still reports, at the new viewport.
+		await act(async () => {
+			screen.getByTestId('chrome').remove()
+			await flushMutations()
+		})
+		expect(measuredHeight()).toBe(435)
+	})
+
+	it('watches every ancestor up to body for structure, and lets go on unmount', () => {
+		const observed: Array<{ target: Node, options?: MutationObserverInit }> = []
+		let disconnects = 0
+		const original = globalThis.MutationObserver
+		globalThis.MutationObserver = class {
+			// No constructor: this stub never notifies, because what is under test here is WHICH targets
+			// are watched and that they are let go of, not what a notification does.
+			observe(target: Node, options?: MutationObserverInit) {
+				observed.push({ target, options })
+			}
+			disconnect() {
+				disconnects += 1
+			}
+			takeRecords() {
+				return []
+			}
+		} as unknown as typeof MutationObserver
+
+		try {
+			setViewportHeight(1000)
+
+			const { unmount } = render(<ChromeProbe withChrome={500} withoutChrome={365} />)
+
+			const targets = observed.map(({ target }) => target)
+			expect(targets).toContain(screen.getByTestId('column'))
+			// Right the way out to `body`, which is where portalled overlays mount and as far out as
+			// anything that can move the element vertically lives.
+			expect(targets).toContain(document.body)
+			// One level of each ancestor, never a subtree - see the test above for what that buys.
+			expect(observed.every(({ options }) => options?.childList === true)).toBe(true)
+			expect(observed.some(({ options }) => options?.subtree)).toBe(false)
+
+			const before = disconnects
+			unmount()
+			expect(disconnects).toBeGreaterThan(before)
+		} finally {
+			globalThis.MutationObserver = original
+		}
+	})
+
+	it('tolerates an environment without MutationObserver', () => {
+		const original = globalThis.MutationObserver
+		// @ts-expect-error - deliberately removing a browser global the hook must not depend on
+		delete globalThis.MutationObserver
+
+		try {
+			setViewportHeight(900)
+
+			render(<Probe top={100} min={100} gutter={0} />)
+
+			expect(measuredHeight()).toBe(800)
+		} finally {
+			globalThis.MutationObserver = original
+		}
 	})
 })
