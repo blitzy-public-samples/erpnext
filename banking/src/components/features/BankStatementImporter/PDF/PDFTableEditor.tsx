@@ -194,24 +194,30 @@ const PDFTableEditor = ({ data, mutate }: Props) => {
                             {reextracting ? _('Re-extracting') : _('Saving')}
                         </span>
                     )}
+                    {/* Page stepping was two identically-announced bare buttons either side of a text
+                        node, so neither direction was discoverable without sight of the chevrons. */}
                     <Button
                         variant="ghost"
                         isIconButton
+                        aria-label={_('Previous page')}
                         disabled={pageIndex === 0}
                         onClick={() => setPageIndex((i) => Math.max(0, i - 1))}
                     >
-                        <ChevronLeftIcon />
+                        <ChevronLeftIcon aria-hidden="true" />
                     </Button>
-                    <span className="min-w-24 text-center text-sm text-ink-gray-7">
+                    {/* `role="status"` so the page number is announced when stepping changes it, rather
+                        than silently updating behind a control that has just said only "button". */}
+                    <span role="status" className="min-w-24 text-center text-sm text-ink-gray-7">
                         {_('Page {0} of {1}', [currentPage.toString(), pages.length.toString()])}
                     </span>
                     <Button
                         variant="ghost"
                         isIconButton
+                        aria-label={_('Next page')}
                         disabled={pageIndex >= pages.length - 1}
                         onClick={() => setPageIndex((i) => Math.min(pages.length - 1, i + 1))}
                     >
-                        <ChevronRightIcon />
+                        <ChevronRightIcon aria-hidden="true" />
                     </Button>
                 </div>
             </div>
@@ -243,8 +249,15 @@ const PDFTableEditor = ({ data, mutate }: Props) => {
                                             disabled={isCompleted}
                                             onCheckedChange={(c) => onToggleIncluded(index, c)}
                                         />
-                                        <Button variant="ghost" size="sm" isIconButton onClick={() => toggleCollapsed(index)}>
-                                            <ChevronDownIcon className={cn('transition-transform', isCollapsed && '-rotate-90')} />
+                                        {/* `aria-expanded` as well as a name: the control's whole purpose is a
+                                            state a rotated chevron communicates only visually. */}
+                                        <Button variant="ghost" size="sm" isIconButton
+                                            aria-expanded={!isCollapsed}
+                                            aria-label={isCollapsed
+                                                ? _('Show table {0}', [(position + 1).toString()])
+                                                : _('Hide table {0}', [(position + 1).toString()])}
+                                            onClick={() => toggleCollapsed(index)}>
+                                            <ChevronDownIcon aria-hidden="true" className={cn('transition-transform', isCollapsed && '-rotate-90')} />
                                         </Button>
                                     </div>
                                 </div>

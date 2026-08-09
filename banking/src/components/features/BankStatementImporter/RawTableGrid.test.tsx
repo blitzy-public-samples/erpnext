@@ -226,3 +226,55 @@ describe('RawTableGrid', () => {
 		})
 	})
 })
+
+/**
+ * Theme-correct highlighting.
+ *
+ * The row and cell highlights were written as raw palette utilities with hand-written dark overrides -
+ * `bg-green-50 dark:bg-green-700`, `bg-yellow-100 dark:bg-yellow-400` - and the dark pairings were
+ * inverted: a MID-weight background arrived under text that stayed dark, measuring 1.97:1 on the gold
+ * header row and 2.59:1 on the green transaction rows. This is the one screen whose entire purpose is
+ * reading a parsed statement, so unreadable rows defeat the feature outright.
+ *
+ * The Espresso surface tokens already inverting correctly between themes are what fix it: each is
+ * paired with `ink-gray-8`, which resolves to near-black in light and near-white in dark, so one class
+ * is legible in both. Asserted as classes because jsdom evaluates no stylesheet - the ratios
+ * themselves are measured in the browser - but what these hold is that no raw palette utility and no
+ * hand-written `dark:` override can come back.
+ */
+describe('RawTableGrid theme-correct highlighting', () => {
+
+	it('highlights the detected header row with a token pair, not a raw palette colour', () => {
+		renderGrid()
+
+		const headerRow = screen.getByText('Withdrawal').closest('tr') as HTMLElement
+
+		expect(headerRow.className).toContain('bg-surface-amber-2')
+		expect(headerRow.className).toContain('text-ink-gray-8')
+	})
+
+	it('highlights the detected transaction rows with a token pair', () => {
+		renderGrid()
+
+		const transactionRow = screen.getByText('NEFT ACME Traders').closest('tr') as HTMLElement
+
+		expect(transactionRow.className).toContain('bg-surface-green-1')
+		expect(transactionRow.className).toContain('text-ink-gray-8')
+	})
+
+	it('never states a colour the theme cannot invert', () => {
+		/*
+		 * The general invariant. A raw `bg-green-50` has one value in both themes, so it can only ever
+		 * be right in one of them - and a hand-written `dark:` override is the same bug with an extra
+		 * step, since it has to be kept in step with the light value by hand.
+		 */
+		renderGrid()
+
+		const markup = document.body.innerHTML
+
+		expect(markup).not.toMatch(/\bbg-(green|yellow|red|amber)-\d{2,3}\b/)
+		expect(markup).not.toMatch(/\bdark:bg-/)
+		// An opacity modifier on an already mid-grey took the muted text to roughly 3.2:1.
+		expect(markup).not.toContain('text-ink-gray-5/70')
+	})
+})

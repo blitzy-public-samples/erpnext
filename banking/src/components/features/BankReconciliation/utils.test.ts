@@ -3,7 +3,6 @@ import type { FrappeError } from 'frappe-react-sdk'
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { Provider, createStore } from 'jotai'
 import { createElement, type PropsWithChildren } from 'react'
-import Fuse from 'fuse.js'
 import { toast } from 'sonner'
 import {
 	TEST_BANK,
@@ -40,6 +39,7 @@ import {
 vi.mock('frappe-react-sdk', () => createFrappeSDKMock())
 
 import {
+	createTransactionSearchIndex,
 	getSearchResults,
 	useGetAccountClosingBalance,
 	useGetAccountClosingBalanceAsPerStatement,
@@ -1687,11 +1687,12 @@ describe('getSearchResults', () => {
 
 	const rows = [debit, credit, valueless]
 
-	const searchIndex = () => new Fuse(rows, {
-		keys: ['description', 'reference_number'],
-		threshold: 0.5,
-		includeScore: true
-	})
+	/*
+	 * Built through the SAME factory the workbench uses, so the search this asserts on is the search
+	 * that ships. It used to be a hand-written Fuse index that happened to repeat the production
+	 * options, which meant a change to how the app searches could not fail a single test here.
+	 */
+	const searchIndex = () => createTransactionSearchIndex(rows)
 
 	const names = (results: UnreconciledTransaction[]) => results.map((transaction) => transaction.name)
 
@@ -1716,6 +1717,36 @@ describe('getSearchResults', () => {
 
 	it('searches the reference number as well as the description', () => {
 		expect(names(getSearchResults(searchIndex(), 'ATM-9001', 'All', 0, rows))).toContain(debit.name)
+	})
+
+	/*
+	 * The precision half of the search contract, and the reason the threshold was tightened.
+	 *
+	 * A reference that appears nowhere in the data used to be answered with a long list of approximate
+	 * rows - measured against the real workbench, 36 of them for a six-character query with zero literal
+	 * matches - and a reviewer has no way to tell an approximation from a match. On a screen where the
+	 * next click posts money against whichever row was believed, that is the whole of the risk.
+	 */
+	it('answers a reference that is in none of the rows with nothing', () => {
+		expect(getSearchResults(searchIndex(), 'FQA-P7', 'All', 0, rows)).toEqual([])
+	})
+
+	it('still finds a reference that was mistyped by a character', () => {
+		expect(names(getSearchResults(searchIndex(), 'ATM-9002', 'All', 0, rows))).toContain(debit.name)
+	})
+
+	/*
+	 * Descriptions are long and the identifying part of one is rarely at the front. Fuse penalises a
+	 * match by its distance from the start of the field unless told not to, so before `ignoreLocation`
+	 * a term at the end of a description scored badly - which is exactly what made the threshold look
+	 * like it had to be loose.
+	 */
+	it('matches a term at the END of a long description, not only the beginning', () => {
+		expect(names(getSearchResults(searchIndex(), 'Bengaluru', 'All', 0, rows))).toContain(debit.name)
+	})
+
+	it('ignores a fragment too short to identify anything', () => {
+		expect(getSearchResults(searchIndex(), 'AT', 'All', 0, rows)).toEqual([])
 	})
 
 	it('keeps only debits under the Debits filter', () => {

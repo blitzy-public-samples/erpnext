@@ -12,7 +12,7 @@ const BankEntryModal = () => {
 
 	return (
 		<Dialog open={isOpen} onOpenChange={setIsOpen}>
-			<DialogContent className='min-w-[95vw]'>
+			<DialogContent size='wide'>
 				<DialogHeader>
 					<DialogTitle>{_("Bank Entry")}</DialogTitle>
 					<DialogDescription>

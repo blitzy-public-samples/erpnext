@@ -50,7 +50,7 @@ function CommandDialog({
         className={cn("overflow-hidden p-0", className)}
         showCloseButton={showCloseButton}
       >
-        <Command className="[&_[cmdk-group-heading]]:text-ink-gray-4 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:font-medium **:data-[slot=command-input-wrapper]:h-12 [&_[cmdk-group]]:px-2 [&_[cmdk-group]:not([hidden])_~[cmdk-group]]:pt-0 [&_[cmdk-input-wrapper]_svg]:h-5 [&_[cmdk-input-wrapper]_svg]:w-5 [&_[cmdk-input]]:h-12 [&_[cmdk-item]]:px-2 [&_[cmdk-item]]:py-3 [&_[cmdk-item]_svg]:h-5 [&_[cmdk-item]_svg]:w-5">
+        <Command className="[&_[cmdk-group-heading]]:text-ink-gray-5 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:font-medium **:data-[slot=command-input-wrapper]:h-12 [&_[cmdk-group]]:px-2 [&_[cmdk-group]:not([hidden])_~[cmdk-group]]:pt-0 [&_[cmdk-input-wrapper]_svg]:h-5 [&_[cmdk-input-wrapper]_svg]:w-5 [&_[cmdk-input]]:h-12 [&_[cmdk-item]]:px-2 [&_[cmdk-item]]:py-3 [&_[cmdk-item]_svg]:h-5 [&_[cmdk-item]_svg]:w-5">
           {children}
         </Command>
       </DialogContent>
@@ -58,8 +58,25 @@ function CommandDialog({
   )
 }
 
+/**
+ * The filter field inside a command palette or combobox popover.
+ *
+ * It defaults its own `name`. Each of these is a real `<input>`, and none of the four call sites in
+ * this application - the company selector, the period picker, the account dropdown or the generic link
+ * field - supplied one, which leaves a field the browser cannot identify for autofill or for
+ * restore-on-back. The `name` is a plain default rather than something derived, because these fields
+ * filter a list on the client and are never submitted: it exists to identify the field, not to key a
+ * payload. A caller that passes its own still wins.
+ *
+ * `id` is deliberately NOT defaulted here. cmdk assigns the input its own generated id AFTER spreading
+ * the caller's props, so anything set here - or by a call site - is overwritten. Measured: an
+ * explicitly passed `id="account-search"` arrives in the DOM as cmdk's `radix-_r_e_`. Since that id is
+ * unique per instance and always present, the attribute is already satisfied; pretending to accept an
+ * override would be a promise this component cannot keep.
+ */
 function CommandInput({
   className,
+  name,
   ...props
 }: React.ComponentProps<typeof CommandPrimitive.Input>) {
   return (
@@ -68,8 +85,18 @@ function CommandInput({
       className="flex items-center gap-2 m-1.5 h-8 rounded px-2.5 py-2 border border-transparent transition-all bg-surface-gray-2 not-focus-within:hover:bg-surface-gray-3 text-ink-gray-7 focus-within:bg-surface-white focus-within:border-outline-gray-4 focus-within:shadow-focus-gray"
     >
       <SearchIcon className="size-4 shrink-0 text-ink-gray-4" />
+      {/*
+        * `outline-hidden` on the input is deliberate and is not a missing focus indicator. The input
+        * is a borderless field painted inside the wrapper above, and the wrapper carries the
+        * indicator for it: `focus-within:shadow-focus-gray` plus `focus-within:border-outline-gray-4`
+        * fire whenever this input holds focus, and the ring they draw fully encloses it. Giving the
+        * input its own outline as well would paint a second ring a few pixels inside the first.
+        * The `--focus-shadow-gray` token itself was the real defect and was corrected in index.css;
+        * it now measures 6.0:1 light and 7.2:1 dark, so this indicator clears the 3:1 non-text floor.
+        */}
       <CommandPrimitive.Input
         data-slot="command-input"
+        name={name ?? "search"}
         className={cn(
           "flex w-full bg-transparent outline-hidden text-base placeholder:text-ink-gray-4",
           className
@@ -116,7 +143,7 @@ function CommandGroup({
     <CommandPrimitive.Group
       data-slot="command-group"
       className={cn(
-        "text-ink-gray-6 [&_[cmdk-group-heading]]:text-ink-gray-4 overflow-hidden p-1 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-sm [&_[cmdk-group-heading]]:font-medium",
+        "text-ink-gray-6 [&_[cmdk-group-heading]]:text-ink-gray-5 overflow-hidden p-1 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-sm [&_[cmdk-group-heading]]:font-medium",
         className
       )}
       {...props}

@@ -1,6 +1,9 @@
 # Copyright (c) 2019, Frappe Technologies Pvt. Ltd. and contributors
 # For license information, please see license.txt
 
+import functools
+import inspect
+
 import frappe
 from frappe import _
 from frappe.model.docstatus import DocStatus
@@ -8,6 +11,154 @@ from frappe.model.document import Document
 from frappe.query_builder import Tuple
 from frappe.query_builder.functions import Abs, Max, Sum
 from frappe.utils import flt, fmt_money, getdate
+
+
+def refuse_missing_arguments(fn):
+	"""Refuse a call that omits a required argument, instead of letting Python raise.
+
+	WHAT THIS FIXES
+
+	Every whitelisted method in the banking DocTypes is reachable over ``/api/method/...``, and a
+	request that omits a required argument used to reach the function itself and raise a plain
+	``TypeError``. Frappe has no special handling for that, so it became an **HTTP 500** carrying the
+	full server traceback in the response's ``exc`` field. Measured against a running site before this
+	change: 26 of the 28 module-level whitelisted methods across the four banking DocTypes answered 500,
+	and a single one of those responses published 917 characters of traceback naming six framework
+	source paths. A caller mistake is not a server fault; it deserves a 4xx and a sentence.
+
+	With this decorator the same request is refused through ``frappe.throw``, which produces Frappe's
+	ordinary validation envelope - a 4xx with the message in ``_server_messages`` and no traceback - and
+	that envelope is exactly what the banking SPA's existing error pipeline already parses and renders.
+	The message names the missing parameters and nothing else. Those names are already part of the public
+	API contract (the SPA passes them by name), so naming them describes the contract rather than the
+	implementation, and is what makes the refusal actionable.
+
+	WHERE IT MUST BE APPLIED
+
+	Directly beneath ``@frappe.whitelist()``, never above it::
+
+	    @frappe.whitelist()
+	    @refuse_missing_arguments
+	    def get_bank_transactions(bank_account: str, ...):
+
+	``frappe.whitelist()`` registers the object it returns in ``frappe.whitelisted`` and that object is
+	what the module attribute becomes. Placing this decorator above it would leave the registered
+	callable unreachable from the dotted path, and the endpoint would stop being callable at all.
+
+	WHY WRAPPING IS SAFE HERE
+
+	``frappe.whitelist()`` wraps the function in ``validate_argument_types``, which coerces arguments
+	against their annotations using ``func.__annotations__`` and ``frappe._get_cached_signature_params``.
+	``functools.wraps`` copies ``__annotations__`` and sets ``__wrapped__``, and ``inspect.signature``
+	follows ``__wrapped__``, so both of those see the original function exactly as before. Frappe's
+	``get_newargs``, which filters incoming form data down to the parameters a method actually accepts,
+	resolves the signature the same way and is likewise unaffected.
+
+	One narrow difference is worth recording rather than leaving to be discovered. When coercion is
+	active, ``transform_parameter_types`` maps POSITIONAL arguments to names through
+	``func.__code__.co_varnames`` - the wrapper's own code object, not the original's - so positionally
+	passed arguments are no longer coerced. Arguments passed by name still are, and every HTTP request
+	arrives by name because Frappe dispatches as ``frappe.call(method, **frappe.form_dict)``. The
+	positional path exists only for the eleven internal call sites inside these same modules, every one
+	of which passes values that already match its annotation, so nothing there was relying on coercion.
+
+	:param fn: the undecorated function, with its real signature.
+	"""
+	signature = inspect.signature(fn)
+
+	@functools.wraps(fn)
+	def wrapper(*args, **kwargs):
+		missing = _missing_required_arguments(signature, args, kwargs)
+
+		if missing:
+			refuse_arguments(*missing)
+
+		try:
+			signature.bind(*args, **kwargs)
+		except TypeError as exception:
+			# Everything binding can still object to: too many positional arguments, or a keyword the
+			# method does not accept. Unreachable over HTTP, because Frappe filters form data down to the
+			# signature before dispatching - so this only ever answers an internal caller, and answers it
+			# with a sentence rather than a traceback. `str(exception)` is Python's own wording about this
+			# function's parameters and describes nothing beyond them.
+			frappe.throw(_("Invalid arguments: {0}").format(str(exception)), title=_("Invalid Request"))
+
+		return fn(*args, **kwargs)
+
+	return wrapper
+
+
+def refuse_arguments(*names: str):
+	"""Refuse the current call because these parameters were not supplied. Never returns.
+
+	Shared by {@link refuse_missing_arguments} and by the handful of methods whose signature cannot state
+	the requirement for itself, so that one missing parameter reads the same to a caller however the
+	requirement came to be enforced. ``frappe.throw`` produces Frappe's ordinary validation envelope: a
+	4xx whose message travels in ``_server_messages``, with no traceback attached.
+	"""
+	frappe.throw(
+		_("Missing required {0}: {1}").format(
+			_("parameter") if len(names) == 1 else _("parameters"),
+			", ".join(names),
+		),
+		title=_("Invalid Request"),
+	)
+
+
+def refuse_unknown_bank_transaction(name) -> None:
+	"""Refuse the current call because no Bank Transaction goes by this name. Never returns.
+
+	The row lookups that feed the voucher-creation endpoints take a name straight from the caller and
+	index the result - ``frappe.db.get_values(...)[0]``, or an attribute read on a ``get_value`` result
+	that is ``None`` when nothing matched. A name that does not exist therefore raised ``IndexError`` or
+	``AttributeError`` and became an HTTP 500, when what happened is simply that the caller named
+	something that is not there.
+
+	``frappe.DoesNotExistError`` rather than a plain validation error, so these endpoints answer 404 like
+	their siblings that resolve the same record through ``frappe.get_doc``: the same mistake gets the same
+	status whichever endpoint hears it. The wording follows the pattern already used in this module for an
+	unknown Bank Account and an unknown voucher.
+	"""
+	frappe.throw(
+		_("Bank Transaction {0} does not exist").format(frappe.bold(name)),
+		frappe.DoesNotExistError,
+	)
+
+
+def _missing_required_arguments(signature: inspect.Signature, args: tuple, kwargs: dict) -> list[str]:
+	"""Names of the parameters that have no default and were given no value.
+
+	Computed from the signature rather than parsed out of Python's ``TypeError`` text, so the answer does
+	not depend on an interpreter's phrasing, and so the caller can be told about ALL of the missing
+	parameters at once instead of discovering them one request at a time.
+
+	``*args`` and ``**kwargs`` parameters are skipped: they are never required. Keyword-only parameters
+	are checked against ``kwargs`` alone, because a positional value can never reach one.
+	"""
+	missing = []
+	positional_count = len(args)
+
+	for index, parameter in enumerate(signature.parameters.values()):
+		if parameter.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+			continue
+
+		if parameter.default is not inspect.Parameter.empty:
+			continue
+
+		fillable_by_position = parameter.kind in (
+			inspect.Parameter.POSITIONAL_ONLY,
+			inspect.Parameter.POSITIONAL_OR_KEYWORD,
+		)
+
+		if fillable_by_position and index < positional_count:
+			continue
+
+		if parameter.name in kwargs:
+			continue
+
+		missing.append(parameter.name)
+
+	return missing
 
 
 class BankTransaction(Document):
@@ -389,6 +540,7 @@ class BankTransaction(Document):
 
 
 @frappe.whitelist()
+@refuse_missing_arguments
 def get_doctypes_for_bank_reconciliation():
 	"""Get Bank Reconciliation doctypes from all the apps"""
 	return frappe.get_hooks("bank_reconciliation_doctypes")
@@ -399,6 +551,7 @@ def get_doctypes_for_bank_reconciliation():
 # changes from persisting, so nothing broke - but the caller was told an undo had happened when none
 # had, and any crawler or prefetch could ask for one. The SPA has always sent POST.
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def unreconcile_transaction(transaction_name: str | int):
 	"""
 	Unreconcile an entire bank transaction - this does not handle individual entries but clears the entire transaction
@@ -429,6 +582,7 @@ def unreconcile_transaction(transaction_name: str | int):
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def unreconcile_transaction_entry(bank_transaction_id: str | int, voucher_type: str, voucher_id: str | int):
 	"""
 	Removes a single payment entry from a bank transaction - for example only undoing one voucher instead of undoing the entire transaction

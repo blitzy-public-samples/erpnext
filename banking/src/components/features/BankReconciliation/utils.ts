@@ -1,4 +1,4 @@
-import { ActionLog, bankRecActionLog, bankRecAmountFilter, bankRecDateAtom, bankRecErrorDialogAtom, bankRecLastRefusalAtom, bankRecMatchFilters, bankRecSearchText, bankRecSelectedTransactionsAtom, bankRecTransactionTypeFilter, bankRecUnreconcileModalAtom, SelectedBank, selectedBankAccountAtom } from './bankRecAtoms'
+import { ActionLog, bankRecActionLog, bankRecAmountFilter, bankRecDateAtom, bankRecErrorDialogAtom, bankRecLastRefusalAtom, bankRecMatchFilters, bankRecReconcileInFlightAtom, bankRecSearchText, bankRecSelectedTransactionsAtom, bankRecTransactionTypeFilter, bankRecUnreconcileModalAtom, SelectedBank, selectedBankAccountAtom } from './bankRecAtoms'
 import { useAtom, useAtomValue, useSetAtom } from 'jotai'
 import { useContext, useMemo } from 'react'
 import { FrappeContext, SWRConfiguration, useFrappeGetCall, useFrappeGetDoc, useFrappePostCall, useSWRConfig } from 'frappe-react-sdk'
@@ -16,6 +16,7 @@ import { useRef } from 'react'
 import type { DebouncedState } from 'usehooks-ts'
 import { useDebounceCallback } from 'usehooks-ts'
 import Fuse from 'fuse.js'
+import type { IFuseOptions } from 'fuse.js'
 
 export const useGetAccountOpeningBalance = () => {
 
@@ -114,6 +115,30 @@ export const useGetUnreconciledTransactions = () => {
     })
 }
 
+/**
+ * Ask SWR to re-read the unreconciled list, WITHOUT subscribing to it.
+ *
+ * The distinction is the whole point. `useGetUnreconciledTransactions()` was being called purely for its
+ * `mutate`, which is a query hook: calling it subscribes to the key and therefore FETCHES. It was called
+ * once per bank-account card, and the card strip is mounted on the statement importer route too - so
+ * opening the importer issued the workbench's transaction query, several times over, for a list that
+ * route never renders. Roughly 40KB of transactions fetched to reach a function that only needed to
+ * invalidate a cache entry.
+ *
+ * This returns just the invalidation. Same endpoint, same cache key - the one
+ * {@link useGetUnreconciledTransactions} declares - so whoever IS mounted re-reads and nobody else pays
+ * for a request they will not use.
+ */
+export const useRevalidateUnreconciledTransactions = () => {
+    const bankAccount = useAtomValue(selectedBankAccountAtom)
+    const dates = useAtomValue(bankRecDateAtom)
+    const { mutate } = useSWRConfig()
+
+    return () => mutate(
+        `bank-reconciliation-unreconciled-transactions-${bankAccount?.name}-${dates.fromDate}-${dates.toDate}`
+    )
+}
+
 export interface LinkedPayment {
     rank: number,
     doctype: string,
@@ -193,11 +218,9 @@ export const useRefreshUnreconciledTransactions = () => {
 
         // From unreconciled transactions list, first apply the filters based on the search criteria and other filters
 
-        const searchIndex = unreconciledTransactions ? new Fuse(unreconciledTransactions.message, {
-            keys: ['description', 'reference_number'],
-            threshold: 0.5,
-            includeScore: true
-        }) : null
+        const searchIndex = unreconciledTransactions
+            ? createTransactionSearchIndex(unreconciledTransactions.message)
+            : null
 
         const results = getSearchResults(searchIndex, searchString, typeFilter, amountFilter.value, unreconciledTransactions?.message)
 
@@ -323,6 +346,11 @@ export const useReconcileTransaction = () => {
 
     const setBankRecErrorDialog = useSetAtom(bankRecErrorDialogAtom)
     const setLastRefusal = useSetAtom(bankRecLastRefusalAtom)
+    /*
+     * SHARED across every candidate row, unlike `loading` above, which `useFrappePostCall` scopes to the
+     * hook instance - and this hook is called inside each candidate. See the note on the atom.
+     */
+    const [reconcileInFlight, setReconcileInFlight] = useAtom(bankRecReconcileInFlightAtom)
     const selectedBank = useAtomValue(selectedBankAccountAtom)
     const dates = useAtomValue(bankRecDateAtom)
     const matchFilters = useAtomValue(bankRecMatchFilters)
@@ -416,7 +444,19 @@ export const useReconcileTransaction = () => {
          * than when the next answer arrives - otherwise an in-flight attempt sits beneath the reason the
          * LAST one failed.
          */
+        /*
+         * Refused rather than queued. The disable below is a UX affordance and can be bypassed - by a
+         * keyboard activation that lands in the same tick as the state update, or by anything that calls
+         * this directly - so the guard is here too, where it cannot be. The server would refuse the
+         * second attempt anyway; this keeps the reviewer from being shown a refusal for something the
+         * interface should never have let them start.
+         */
+        if (reconcileInFlight !== null) {
+            return
+        }
+
         setLastRefusal(null)
+        setReconcileInFlight(transaction.name)
 
         /*
          * `then(onPosted, onNotPosted)` rather than `then(...).catch(...)`: a `catch` chained after the
@@ -432,6 +472,12 @@ export const useReconcileTransaction = () => {
                 "amount": voucher.paid_amount
             }])
         }).then((res) => {
+            /*
+             * Cleared first, before the revalidation this handler goes on to trigger. The post itself is
+             * finished the moment the server answers; keeping the flag raised through the follow-up reads
+             * would leave every candidate disabled for as long as those reads took, for no reason.
+             */
+            setReconcileInFlight(null)
             addToActionLog({
                 type: 'match',
                 timestamp: (new Date()).getTime(),
@@ -463,6 +509,9 @@ export const useReconcileTransaction = () => {
                 }
             })
         }, (error) => {
+            // Cleared on this path too, or a single refusal would disable Reconcile for the rest of the
+            // session - the reviewer must be able to try a different candidate.
+            setReconcileInFlight(null)
             console.error(describeRejection('reconcile_vouchers rejected', error))
 
             /*
@@ -499,6 +548,13 @@ export const useReconcileTransaction = () => {
             return convergeWithServer(transaction)
         }).catch((error) => {
             /*
+             * Both handlers above clear the flag as their first statement, so this is unreachable in
+             * practice. It is here because the alternative failure mode - a permanently disabled Reconcile
+             * with nothing on screen able to clear it - is far worse than a redundant assignment.
+             */
+            setReconcileInFlight(null)
+
+            /*
              * Reached only when one of the handlers above threw - i.e. after the server's answer was
              * already known. Presented outcome-neutrally and NOT routed to the error dialog, because
              * this is a client-side follow-up failure and not something the server said.
@@ -512,7 +568,11 @@ export const useReconcileTransaction = () => {
         })
     }
 
-    return { reconcileTransaction, loading }
+    /**
+     * `loading` is this instance's own flag and drives the spinner on the button that was clicked;
+     * `reconcileInFlight` is shared and is what every candidate row must disable on.
+     */
+    return { reconcileTransaction, loading, reconcileInFlight }
 
 }
 
@@ -697,6 +757,42 @@ export function useTransactionSearch(): [string, DebouncedState<(value: string) 
 }
 
 /** Utility function to get the search results based on the search index, search string, type filter, amount filter and unreconciled transactions */
+/**
+ * How the transaction search behaves, defined ONCE.
+ *
+ * It used to be written out separately at each of its three call sites - the workbench's own index, the
+ * index rebuilt inside the post-reconcile "select the next transaction" walk, and the test's - which is
+ * how the three came to be a copy of each other that nothing kept in step. Anything about the search
+ * that is worth deciding is decided here, and every index is built from it.
+ *
+ * `threshold` is the decision that matters, and 0.5 was too generous by a wide margin: half of a query
+ * was allowed to be wrong, so a reference that appears nowhere in the data was still answered with
+ * dozens of rows (measured: 36 for a six-character query with zero literal matches). A reviewer reading
+ * that list has no way to tell "these are approximate" from "these are the matches", which on a
+ * reconciliation screen is the difference between finding a payment and mis-matching one. 0.3 - Fuse's
+ * own default - keeps a genuine typo or a truncated reference findable while refusing the rest.
+ *
+ * `ignoreLocation` matters just as much here, and its absence was quietly pulling the other way. Bank
+ * descriptions are long and the identifying part of one is rarely at the front, but Fuse scores by
+ * DISTANCE from the start of the field unless told not to, so a reference near the end of a description
+ * scored badly at any threshold. Scoring the whole field is what lets the threshold be tightened
+ * without losing the matches the reviewer actually wants.
+ *
+ * `minMatchCharLength` stops a one- or two-character fragment counting as a match at all, which is
+ * where fuzzy matching produces its least defensible results.
+ */
+export const TRANSACTION_SEARCH_OPTIONS: IFuseOptions<UnreconciledTransaction> = {
+    keys: ['description', 'reference_number'],
+    threshold: 0.3,
+    ignoreLocation: true,
+    minMatchCharLength: 3,
+    includeScore: true
+}
+
+/** Build the transaction search index. The one place a Fuse index for this list is constructed. */
+export const createTransactionSearchIndex = (transactions: UnreconciledTransaction[]) =>
+    new Fuse(transactions, TRANSACTION_SEARCH_OPTIONS)
+
 export const getSearchResults = (
     /** Fuse index of the unreconciled transactions */
     searchIndex: Fuse<UnreconciledTransaction> | null,

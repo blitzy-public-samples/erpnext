@@ -8,7 +8,7 @@ import { useFrappeGetCall } from "frappe-react-sdk"
 import { QueryReportReturnType } from "@/types/custom/Reports"
 import { formatDate } from "@/lib/date"
 import { ListView, type ListViewColumnMeta } from "@/components/ui/list-view"
-import { formatCurrency } from "@/lib/numbers"
+import { flt, formatCurrency } from "@/lib/numbers"
 import { getCompanyCurrency } from "@/lib/company"
 import { slug } from "@/lib/frappe"
 import { ScrollTextIcon } from "lucide-react"
@@ -209,6 +209,7 @@ const BankReconciliationStatementView = () => {
                 <ListView
                     data={statementRows}
                     columns={statementColumns}
+                    ariaLabel={_("Bank reconciliation statement entries")}
                     getRowId={(row) => row.payment_entry}
                     maxHeight="min(70vh, 640px)"
                     emptyState={_("No entries with a payment document in this list.")}
@@ -232,6 +233,59 @@ const BankReconciliationStatementView = () => {
     </div>
 }
 
+/**
+ * The four summary rows the report appends after the transaction rows, named by the EXACT source
+ * strings the server passes to its own translation helper.
+ *
+ * These are the server's words, copied verbatim from
+ * `erpnext/accounts/report/bank_reconciliation_statement/bank_reconciliation_statement.py`, and they
+ * must stay that way: they are the keys the translation catalogue is looked up with below. Note the
+ * en-GB spelling - the report is written with "Cheques".
+ */
+const SUMMARY_ROW_LABELS = {
+    balanceAsPerGL: "Bank Statement balance as per General Ledger",
+    outstanding: "Outstanding Cheques and Deposits to clear",
+    incorrectlyCleared: "Cheques and Deposits incorrectly cleared",
+    calculatedBalance: "Calculated Bank Statement balance"
+} as const
+
+/**
+ * Reduce a summary row label to something two spellings of the same sentence agree on.
+ *
+ * Case and internal whitespace are folded, and "cheque" is unified with "check". The spelling is the
+ * one that mattered: this component used to compare against a hardcoded "Outstanding **Checks** and
+ * Deposits to clear" while the server emits the en-GB "Cheques" it is written with, so the row never
+ * matched and the tile confidently reported a balanced 0.00 against a statement carrying six figures
+ * of outstanding items - a false statement about money, on the one screen whose entire job is to be
+ * true about money. Folding the spelling means neither side can drift from the other again, in
+ * either direction.
+ */
+const summaryLabelKey = (label: string) => label
+    .toLowerCase()
+    .replace(/cheque/g, 'check')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+/**
+ * Whether a report row is the summary row named by `sourceLabel`.
+ *
+ * The report identifies these rows by their translated DISPLAY TEXT - they carry no stable fieldname
+ * of their own - so the only way to recognise one without hardcoding English is to translate the
+ * server's own source string through the same catalogue the server used. `frappe.boot` ships that
+ * catalogue to this app, so `_(sourceLabel)` here and `_(source_label)` there resolve to the same
+ * sentence on a translated site. The untranslated source string is accepted as well, because a site
+ * with no translation loaded for a given string is answered with the string itself.
+ */
+const isSummaryRow = (rowLabel: unknown, sourceLabel: string) => {
+    if (typeof rowLabel !== 'string' || !rowLabel) {
+        return false
+    }
+
+    const key = summaryLabelKey(rowLabel)
+
+    return key === summaryLabelKey(sourceLabel) || key === summaryLabelKey(_(sourceLabel))
+}
+
 const SummarySection = ({ data }: { data: { message: QueryReportReturnType } }) => {
 
     const company = useCurrentCompany()
@@ -253,22 +307,22 @@ const SummarySection = ({ data }: { data: { message: QueryReportReturnType } }) 
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         data?.message.result.forEach((r: any) => {
-            if (r.payment_entry === 'Bank Statement balance as per General Ledger') {
-                bankStatementBalanceAsPerGL = r.debit - r.credit
+            if (isSummaryRow(r.payment_entry, SUMMARY_ROW_LABELS.balanceAsPerGL)) {
+                bankStatementBalanceAsPerGL = flt(r.debit) - flt(r.credit)
             }
 
-            if (r.payment_entry === 'Outstanding Checks and Deposits to clear') {
-                outstandingChecksDebit = r.debit
-                outstandingChecksCredit = r.credit
+            if (isSummaryRow(r.payment_entry, SUMMARY_ROW_LABELS.outstanding)) {
+                outstandingChecksDebit = flt(r.debit)
+                outstandingChecksCredit = flt(r.credit)
             }
 
-            if (r.payment_entry === 'Checks and Deposits incorrectly cleared') {
-                incorrectlyClearedEntriesDebit = r.debit
-                incorrectlyClearedEntriesCredit = r.credit
+            if (isSummaryRow(r.payment_entry, SUMMARY_ROW_LABELS.incorrectlyCleared)) {
+                incorrectlyClearedEntriesDebit = flt(r.debit)
+                incorrectlyClearedEntriesCredit = flt(r.credit)
             }
 
-            if (r.payment_entry === 'Calculated Bank Statement balance') {
-                calculatedBankStatementBalance = r.debit - r.credit
+            if (isSummaryRow(r.payment_entry, SUMMARY_ROW_LABELS.calculatedBalance)) {
+                calculatedBankStatementBalance = flt(r.debit) - flt(r.credit)
             }
         })
 
@@ -287,26 +341,26 @@ const SummarySection = ({ data }: { data: { message: QueryReportReturnType } }) 
 
     return <div className="flex gap-4 items-start justify-between">
         <StatContainer>
-            <StatLabel>{_("Bank Statement Balance as per General Ledger")}</StatLabel>
+            <StatLabel>{_(SUMMARY_ROW_LABELS.balanceAsPerGL)}</StatLabel>
             <StatValue className="font-numeric">{formatCurrency(bankStatementBalanceAsPerGL, currency)}</StatValue>
         </StatContainer>
 
+        {/* The tiles are labelled with the report's OWN wording, so a reviewer reading a tile and the
+            row it summarises sees one vocabulary rather than two spellings of it. */}
         <StatContainer>
-            <StatLabel>{_("Outstanding Checks and Deposits to clear")}</StatLabel>
+            <StatLabel>{_(SUMMARY_ROW_LABELS.outstanding)}</StatLabel>
             <StatValue className="font-numeric">{formatCurrency(outstandingChecksDebit - outstandingChecksCredit, currency)}</StatValue>
         </StatContainer>
 
+        {/* Both of these used to format without a currency, so a foreign-currency account was shown the
+            right number under the wrong symbol - the same mislabelling the first tile already avoids. */}
         {(incorrectlyClearedEntriesDebit > 0 || incorrectlyClearedEntriesCredit > 0) && <StatContainer>
-            <StatLabel className="text-ink-red-3">{_("Checks and Deposits incorrectly cleared")}</StatLabel>
-            <StatValue className="text-ink-red-3 font-numeric">{formatCurrency(incorrectlyClearedEntriesDebit - incorrectlyClearedEntriesCredit)}</StatValue>
-            {/* <div className="" divider={<StackDivider height='20px' />}>
-                {incorrectlyClearedEntriesDebit !== 0 && <StatHelpText>Debit: {formatCurrency(incorrectlyClearedEntriesDebit)}</StatHelpText>}
-                {incorrectlyClearedEntriesCredit !== 0 && <StatHelpText>Credit: {formatCurrency(incorrectlyClearedEntriesCredit)}</StatHelpText>}
-            </div> */}
+            <StatLabel className="text-ink-red-3">{_(SUMMARY_ROW_LABELS.incorrectlyCleared)}</StatLabel>
+            <StatValue className="text-ink-red-3 font-numeric">{formatCurrency(incorrectlyClearedEntriesDebit - incorrectlyClearedEntriesCredit, currency)}</StatValue>
         </StatContainer>}
         <StatContainer>
-            <StatLabel>{_("Calculated Bank Statement Balance")}</StatLabel>
-            <StatValue className="font-numeric">{formatCurrency(calculatedBankStatementBalance)}</StatValue>
+            <StatLabel>{_(SUMMARY_ROW_LABELS.calculatedBalance)}</StatLabel>
+            <StatValue className="font-numeric">{formatCurrency(calculatedBankStatementBalance, currency)}</StatValue>
         </StatContainer>
 
     </div>

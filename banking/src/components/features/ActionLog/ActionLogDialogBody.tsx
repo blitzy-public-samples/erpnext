@@ -484,7 +484,7 @@ const CancelActionLogItem = ({ item, type, timestamp, bank }: { item: ActionLogI
                 {undoLabel}
             </TooltipContent>
         </Tooltip>
-        <AlertDialogContent className='min-w-3xl'>
+        <AlertDialogContent size='3xl'>
             <AlertDialogHeader>
                 <AlertDialogTitle>{type === 'match' ? _("Unmatch Transaction?") : _("Undo {}?", [item.voucher.reference_doctype])}</AlertDialogTitle>
                 <AlertDialogDescription>{type === 'match' ? _("Are you sure you want to unmatch the voucher from this transaction?") : _("Are you sure you want to cancel this {} {}?", [_(item.voucher.reference_doctype), item.voucher.reference_name])}</AlertDialogDescription>

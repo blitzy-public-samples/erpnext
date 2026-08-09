@@ -305,8 +305,11 @@ const SortableRuleItem = ({
                 <div className="flex items-center gap-2 h-full justify-center shrink-0">
                     <DropdownMenu open={isDropdownOpen} onOpenChange={setIsDropdownOpen}>
                         <DropdownMenuTrigger asChild>
-                            <Button variant='ghost' isIconButton className="hover:bg-transparent">
-                                <MoreVertical />
+                            {/* Named with the rule it acts on: a column of bare "button" entries gives no
+                                way to tell which rule is about to be deleted. */}
+                            <Button variant='ghost' isIconButton className="hover:bg-transparent"
+                                aria-label={_("Actions for {0}", [rule.rule_name ?? rule.name])}>
+                                <MoreVertical aria-hidden="true" />
                             </Button>
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end">

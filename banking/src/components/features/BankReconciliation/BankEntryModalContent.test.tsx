@@ -213,16 +213,21 @@ describe('BankEntryModalContent', () => {
 			it('announces the constraint in words, with the asterisk hidden from the reader', () => {
 				renderModal([charge()])
 
-				// One spoken "(required)" per required field, hidden from sight...
-				expect(screen.getAllByText('(required)').length).toBeGreaterThan(0)
+				// One spoken ", required" per required field, hidden from sight...
+				expect(screen.getAllByText(', required').length).toBeGreaterThan(0)
 
 				// ...and the asterisk itself hidden from the accessibility tree, so it is not announced
 				// as "star". Both live inside the label, which is what carries the field's name.
 				const label = Array.from(document.querySelectorAll('label'))
 					.find((candidate) => (candidate.textContent ?? '').startsWith('Reference')) as HTMLElement
 				expect(label.querySelector('[aria-hidden="true"]')).toHaveTextContent('*')
-				// The separator matters: without it the name ran together as "Reference(required)".
-				expect(label.querySelector('.sr-only')?.textContent).toBe(' (required)')
+				/*
+				 * The separator matters, and it has to be a COMMA. Accessible-name computation trims
+				 * each node's text before joining, and `trim` strips U+00A0 as well as a plain space,
+				 * so either kind of space produced the run-together "Reference(required)". Measured
+				 * both ways before settling on this.
+				 */
+				expect(label.querySelector('.sr-only')?.textContent).toBe(', required')
 			})
 
 			it('leaves an optional field unmarked, so the marking still means something', () => {

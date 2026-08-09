@@ -1,7 +1,7 @@
 import { useAtom } from "jotai"
 import { SelectedBank, selectedBankAccountAtom } from "./bankRecAtoms"
 import { useCallback, useEffect, useRef } from "react"
-import { useGetBankAccounts, useGetUnreconciledTransactions } from "./utils"
+import { useGetBankAccounts, useRevalidateUnreconciledTransactions } from "./utils"
 import { cn } from "@/lib/utils"
 import { getTimeago } from "@/lib/date"
 import ErrorBanner from "@/components/ui/error-banner"
@@ -109,25 +109,62 @@ const BankPickerItem = ({ bank }: { bank: SelectedBank }) => {
 
     const isSelected = selectedBank?.name === bank.name
 
-    const { mutate } = useGetUnreconciledTransactions()
+    /*
+     * Invalidation ONLY - deliberately not the query hook.
+     *
+     * This used to be `useGetUnreconciledTransactions()`, called for its `mutate` alone. That is a query
+     * hook, so every card in this strip subscribed to the workbench's transaction list and fetched it -
+     * including on the statement importer route, where this strip is also mounted and that list is never
+     * rendered. See `useRevalidateUnreconciledTransactions`.
+     */
+    const revalidateUnreconciledTransactions = useRevalidateUnreconciledTransactions()
 
     const ref = useRef<HTMLDivElement>(null)
 
     /*
-     * Bring the selected account into view once the strip has rendered. The selection is persisted in
-     * `localStorage`, so a reload can restore an account that sits outside the strip's visible scroll
-     * range - and because the strip always starts scrolled to the far left, that account looked
-     * unselected. `block: 'nearest'` keeps the page itself from scrolling.
+     * Bring the selected account into view once the strip has rendered - but ONLY when it is not
+     * already there.
+     *
+     * The selection is persisted in `localStorage`, so a reload can restore an account that sits
+     * outside the strip's visible scroll range, and because the strip always starts scrolled to the
+     * far left that account looked unselected. That is what the scroll is for, and it is kept.
+     *
+     * The guard is what is new, and it fixes a defect with nothing to do with scrolling. Chrome moves
+     * the document's sequential-focus-navigation starting point to the target of a programmatic
+     * `scrollIntoView`, so this call - which fired on every mount, usually to scroll by zero pixels -
+     * relocated the first Tab press to just after this card. Measured: the first Tab landed on the
+     * SECOND account card, skipping nine controls including the skip link and the entire header
+     * toolbar, which made the skip link unreachable by the one gesture it exists for. Rects are
+     * compared rather than offsets so the check is correct under RTL, and the 1px tolerance matches
+     * the one the scroll-overflow hook uses for the same sub-pixel reason.
      */
     useEffect(() => {
-        if (isSelected) {
-            ref.current?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+        if (!isSelected) {
+            return
         }
+
+        const card = ref.current
+        const strip = card?.parentElement
+
+        if (!card || !strip) {
+            return
+        }
+
+        const cardBox = card.getBoundingClientRect()
+        const stripBox = strip.getBoundingClientRect()
+        const alreadyVisible =
+            cardBox.left >= stripBox.left - 1 && cardBox.right <= stripBox.right + 1
+
+        if (alreadyVisible) {
+            return
+        }
+
+        card.scrollIntoView({ block: 'nearest', inline: 'nearest' })
     }, [isSelected])
 
     const onSelect = () => {
         setSelectedBank(bank)
-        mutate()
+        revalidateUnreconciledTransactions()
     }
 
     /*

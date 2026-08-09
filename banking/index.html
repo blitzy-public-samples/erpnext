@@ -12,8 +12,18 @@
   <meta content="text/html;charset=utf-8" http-equiv="Content-Type">
   <meta content="utf-8" http-equiv="encoding">
   <meta name="author" content="">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0,
-        maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, minimal-ui">
+  <!--
+    There used to be a second, restrictive viewport declaration here carrying
+    `maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, minimal-ui`. It has been removed rather
+    than corrected, because the permissive declaration further down this head already says everything
+    that needs saying and two `viewport` metas in one document is itself the defect: the browser
+    resolves the later one, so which behaviour applied depended on source order rather than on intent.
+
+    Its content was the problem regardless of order. `user-scalable=no` together with a locked
+    minimum and maximum scale forbids pinch-zoom outright, which is the one accommodation a reviewer
+    with low vision has on a screen full of currency figures, and it is a WCAG 1.4.4 failure with no
+    upside on a desktop-first reconciliation workbench.
+  -->
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="white">
   <meta name="mobile-web-app-capable" content="yes">

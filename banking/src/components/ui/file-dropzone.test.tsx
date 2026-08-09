@@ -204,6 +204,40 @@ describe('FileDropzone', () => {
 		})
 	})
 
+	/*
+	 * The file input inside is invisible, so the dropzone as a whole is what a keyboard user sees receive
+	 * focus - and it had no focus indicator at all. The only focus treatment was a background and border
+	 * tint one step along the same grey ramp, which is not perceivable as focus, and
+	 * `focus-within:outline-none` then removed the browser's own ring on top of that.
+	 *
+	 * Asserted on the class rather than on computed style because Tailwind's utilities are not compiled in
+	 * this environment; what is being pinned is that the indicator is DECLARED, on a token, and that the
+	 * removal is gone.
+	 */
+	describe('its focus indicator', () => {
+
+		it('declares a visible ring when something inside it is focused', () => {
+			const { root } = renderDropzone()
+
+			expect(root.className).toContain('focus-within:outline-2')
+			expect(root.className).toContain('focus-within:outline-outline-gray-5')
+		})
+
+		it('no longer removes the outline it used to suppress', () => {
+			const { root } = renderDropzone()
+
+			expect(root.className).not.toContain('focus-within:outline-none')
+		})
+
+		it('keeps the file input reachable by keyboard', () => {
+			const { input } = renderDropzone()
+
+			input.focus()
+
+			expect(input).toHaveFocus()
+		})
+	})
+
 	describe('while a file is being dragged over it', () => {
 
 		it('is idle before anything is dragged', () => {

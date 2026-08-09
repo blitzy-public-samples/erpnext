@@ -62,8 +62,9 @@ const PartyTypeDropdown = ({ value, onChange, readOnly, disabled, type, hideOpti
         }
     }
 
+    // Controlled from the first render - see the note on `SelectFormField` in `ui/form-elements.tsx`.
     return (
-        <Select onValueChange={onSelect} value={value} disabled={disabled}>
+        <Select onValueChange={onSelect} value={value ?? ''} disabled={disabled}>
             {useInForm ? <FormControl>
                 <SelectTrigger tabIndex={0} aria-readonly={readOnly} aria-required={isRequired || undefined} disabled={disabled || readOnly} {...triggerProps}>
                     <SelectValue placeholder={_("Type")} aria-readonly={readOnly} {...valueProps} />

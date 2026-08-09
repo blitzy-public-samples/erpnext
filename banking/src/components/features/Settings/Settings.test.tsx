@@ -30,7 +30,7 @@
  */
 
 import { describe, expect, it, vi, beforeAll, beforeEach } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Provider, createStore } from 'jotai'
 import { MemoryRouter } from 'react-router'
@@ -303,6 +303,47 @@ describe('Settings', { timeout: 20000 }, () => {
 					screen.queryByText('Configure settings for the banking module')
 				).not.toBeInTheDocument()
 			})
+		})
+
+		/**
+		 * `ui/settings-dialog.tsx` passed `showCloseButton={false}` and put nothing in its place, so the
+		 * only exits were Escape and a click on the overlay - neither of which is visible, and neither of
+		 * which a reviewer who does not already know them will find. The control is restored and
+		 * repositioned into the panel's own padding so it cannot collide with the tab rail.
+		 */
+		it('offers a visible close control, not only Escape', async () => {
+			await openSettings()
+
+			const close = screen.getByRole('button', { name: 'Close' })
+			expect(close).toBeInTheDocument()
+			expect(close).toHaveAttribute('data-slot', 'dialog-close')
+		})
+
+		it('closes when that control is used', async () => {
+			const user = await openSettings()
+
+			await user.click(screen.getByRole('button', { name: 'Close' }))
+
+			await waitFor(() => {
+				expect(
+					screen.queryByText('Configure settings for the banking module')
+				).not.toBeInTheDocument()
+			})
+		})
+
+		/**
+		 * The old width was `min-w-5xl max-lg:min-w-[98vw]`, which had an exact-boundary bug: `max-lg`
+		 * means *below* 64rem and `5xl` IS 64rem, so at precisely 1024px neither branch applied a gutter
+		 * and the dialog ran edge to edge. The clamped size expression has no boundary to get wrong.
+		 */
+		it('sizes itself from the clamped size set rather than a minimum width', async () => {
+			await openSettings()
+
+			const content = document.querySelector<HTMLElement>('[data-slot="dialog-content"]')
+			expect(content).not.toBeNull()
+			expect(content).toHaveAttribute('data-size', '5xl')
+			expect(content!.className).toContain('calc(100vw-2rem)')
+			expect(content!.className).not.toMatch(/\bmin-w-/)
 		})
 	})
 
@@ -666,9 +707,17 @@ describe('Settings', { timeout: 20000 }, () => {
 				mutate: listMutate
 			} as never)
 
-			// Each row owns its own menu, so the first trigger belongs to the first rule.
-			const rowMenus = screen.getAllByRole('button', { name: '' })
-			await user.click(rowMenus[rowMenus.length - 1])
+			/*
+			 * Addressed by name rather than by position. This previously read
+			 * `getAllByRole('button', { name: '' })` and took the last match - which only worked
+			 * because every row menu was UNNAMED, so the assertion silently depended on the very
+			 * defect this phase fixes. Naming each menu for its own rule makes the intent explicit
+			 * and stops a fourth unnamed button elsewhere on the panel from changing which row is
+			 * clicked.
+			 */
+			await user.click(
+				screen.getByRole('button', { name: `Actions for ${SECOND_RULE.rule_name}` })
+			)
 
 			await user.click(await screen.findByRole('menuitem', { name: 'Delete' }))
 
@@ -779,6 +828,39 @@ describe('Settings', { timeout: 20000 }, () => {
 			expect(screen.getByText('Record Payment')).toBeInTheDocument()
 			expect(screen.getByText('Accept Matching Rule')).toBeInTheDocument()
 			expect(screen.getByText('Reconciliation History')).toBeInTheDocument()
+		})
+	})
+
+	describe('its accessibility structure', () => {
+
+		it('lets the tablist own its tabs, with no landmark in between', async () => {
+			/*
+			 * ARIA requires a `tablist` to own its `tab` children, and the settings rail put a group `div`
+			 * and a `<nav>` landmark between the two - so the rail exposed a tablist with no tabs in it,
+			 * and a navigation landmark nested inside a composite widget. Neither is valid, and the second
+			 * also offered a landmark shortcut into the middle of a widget. Both wrappers are now
+			 * `role="presentation"`, which removes only themselves from the accessibility tree.
+			 */
+			await openSettings()
+
+			const tablist = screen.getByRole('tablist')
+			const owned = within(tablist).getAllByRole('tab')
+
+			expect(owned.length).toBeGreaterThan(0)
+			expect(owned).toEqual(screen.getAllByRole('tab'))
+			// The landmark that used to sit inside the widget.
+			expect(within(tablist).queryByRole('navigation')).not.toBeInTheDocument()
+		})
+
+		it('states that the dialog is modal, rather than leaving it to be inferred', async () => {
+			/*
+			 * Radix renders a real modal - it traps focus and marks everything outside `aria-hidden` - but
+			 * it never sets `aria-modal`, verified by searching the installed bundle for the attribute. The
+			 * behaviour was already right; what was missing was saying so.
+			 */
+			await openSettings()
+
+			expect(screen.getByRole('dialog')).toHaveAttribute('aria-modal', 'true')
 		})
 	})
 })

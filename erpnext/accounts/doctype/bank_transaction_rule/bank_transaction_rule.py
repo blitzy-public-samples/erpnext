@@ -8,7 +8,10 @@ from frappe import _
 from frappe.model.document import Document
 from frappe.utils import sbool
 
-from erpnext.accounts.doctype.bank_transaction.bank_transaction import BankTransaction
+from erpnext.accounts.doctype.bank_transaction.bank_transaction import (
+	BankTransaction,
+	refuse_missing_arguments,
+)
 
 PLAIN_NUMBER_PATTERN = re.compile(r"^-?\d+(\.\d+)?$")
 # Tokens accepted by safe-expr-eval on the frontend (must stay in sync).
@@ -255,6 +258,7 @@ def get_permitted_companies_for_rule_evaluation() -> list[str] | None:
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def run_rule_evaluation(force_evaluate: bool = False):
 	# The job this enqueues WRITES `matched_transaction_rule` and `is_rule_evaluated` on Bank
 	# Transactions, so read permission is not the right gate - a read-only user must not be able to

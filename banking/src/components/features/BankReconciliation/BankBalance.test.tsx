@@ -176,6 +176,47 @@ describe('BankBalance', () => {
 
 			expect(await screen.findByText('₹ 10,000.00')).toBeInTheDocument()
 		})
+
+		/**
+		 * The strip was a `w-[80%]` wrapping flex row with `justify-between`, which is the one
+		 * combination that guarantees a void. Once the longest label pushed a stat onto a second line,
+		 * `justify-between` shoved the remaining items to opposite ends of an 800px row with nothing
+		 * between them; at 1920 the same rule spread four ~190px stats across a 1500px track. Both were
+		 * reported as large empty areas in the middle of the most-read part of the screen.
+		 *
+		 * A grid removes the failure mode rather than tuning it: equal tracks cannot be spread apart, and
+		 * the reflow happens on a breakpoint instead of on whatever the longest translated label measures.
+		 */
+		it('lays the four figures out on a grid that reflows on a breakpoint', async () => {
+			renderPanel(<BankBalance />)
+
+			const label = await screen.findByText('Opening Balance')
+			const strip = label.closest('.grid')
+
+			expect(strip).not.toBeNull()
+			// Two columns by default, four from `xl` up.
+			expect(strip!.className).toContain('grid-cols-2')
+			expect(strip!.className).toContain('xl:grid-cols-4')
+			// The two rules that produced the void.
+			expect(strip!.className).not.toContain('justify-between')
+			expect(strip!.className).not.toContain('flex-wrap')
+			expect(strip!.className).not.toContain('w-[80%]')
+		})
+
+		/**
+		 * The progress bar was `w-[18%]`: 184px at 1024, too narrow for its own "x / y reconciled" hint,
+		 * and 345px at 1920, which is where the trailing gap in the strip came from.
+		 */
+		it('gives the progress bar a definite width rather than a percentage', async () => {
+			renderPanel(<BankBalance />)
+
+			const bar = await screen.findByRole('progressbar', { name: 'Reconciliation progress' })
+			const column = bar.closest('.shrink-0')
+
+			expect(column).not.toBeNull()
+			expect(column!.className).toContain('w-64')
+			expect(column!.className).not.toContain('w-[18%]')
+		})
 	})
 
 	describe('the difference', () => {

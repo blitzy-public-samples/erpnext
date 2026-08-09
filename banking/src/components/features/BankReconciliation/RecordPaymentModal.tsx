@@ -12,7 +12,7 @@ const RecordPaymentModal = () => {
 
 	return (
 		<Dialog open={isOpen} onOpenChange={setIsOpen}>
-			<DialogContent className='min-w-[95vw]'>
+			<DialogContent size='wide'>
 				<DialogHeader>
 					<DialogTitle>{_("Record Payment")}</DialogTitle>
 					<DialogDescription>

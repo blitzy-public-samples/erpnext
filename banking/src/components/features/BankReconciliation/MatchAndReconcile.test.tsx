@@ -82,6 +82,7 @@ import {
 	bankRecDateAtom,
 	bankRecErrorDialogAtom,
 	bankRecLastRefusalAtom,
+	bankRecReconcileInFlightAtom,
 	bankRecSelectedTransactionsAtom,
 	selectedBankAccountAtom
 } from './bankRecAtoms'
@@ -234,6 +235,12 @@ interface WorkbenchOptions {
 	olderCount?: number
 	dialogError?: QueryError
 	amountFilter?: number
+	/**
+	 * Pre-set the SHARED reconcile in-flight atom, i.e. render as though a post were already
+	 * outstanding for this transaction. Distinct from the per-instance `loading` flag that
+	 * `useFrappePostCall` returns - the whole point of N-10 is that those two are not the same thing.
+	 */
+	reconcileInFlight?: string
 	/*
 	 * Supplies an ANCESTOR `TooltipProvider`, and is off by default deliberately: the subject wraps
 	 * every tooltip IT renders in its own provider, so the absent case is the production contract this
@@ -259,6 +266,7 @@ const renderWorkbench = (options: WorkbenchOptions = {}) => {
 		olderCount = 0,
 		dialogError,
 		amountFilter,
+		reconcileInFlight,
 		withAncestorTooltipProvider = false
 	} = options
 
@@ -275,6 +283,9 @@ const renderWorkbench = (options: WorkbenchOptions = {}) => {
 	}
 	if (amountFilter !== undefined) {
 		store.set(bankRecAmountFilter, { value: amountFilter, stringValue: String(amountFilter) })
+	}
+	if (reconcileInFlight !== undefined) {
+		store.set(bankRecReconcileInFlightAtom, reconcileInFlight)
 	}
 
 	frappeSDKMock.useFrappeGetCall.mockImplementation((method) => {
@@ -1437,7 +1448,18 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			expect(store.get(SELECTED_TRANSACTION_ATOM).map((row) => row.name)).toEqual([DEPOSIT_ROW.name])
 		})
 
-		it('closes the affordance while a post is in flight', async () => {
+		/**
+		 * N-10. `useFrappePostCall`'s `loading` flag belongs to the hook INSTANCE, and
+		 * `useReconcileTransaction` is called inside every candidate row - so each row had its own flag and
+		 * clicking one candidate left every sibling for the same transaction fully live for the whole round
+		 * trip. The two signals now do different jobs and both are pinned here: `loading` labels the button
+		 * that was clicked, the SHARED atom disables all of them.
+		 *
+		 * The test this replaced forced `loading: true` and asserted the button was disabled - which is
+		 * precisely the per-instance mechanism the finding is about, so it could only ever have described
+		 * the defect.
+		 */
+		it('labels the clicked candidate from its own request state', async () => {
 			frappeSDKMock.useFrappePostCall.mockImplementation(() => ({
 				call: frappePostCall,
 				result: null,
@@ -1449,10 +1471,141 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 
 			renderWorkbench({ transactions: [DEPOSIT_ROW], selected: [DEPOSIT_ROW], vouchers: [suggested] })
 
-			const control = await screen.findByRole('button', { name: /Reconciling/ })
-			expect(control).toBeDisabled()
-
+			expect(await screen.findByRole('button', { name: /Reconciling/ })).toBeInTheDocument()
 			expect(screen.queryByRole('button', { name: 'Reconcile' })).not.toBeInTheDocument()
+		})
+
+		it('disables EVERY candidate while a post is in flight, not only the one clicked', async () => {
+			const alternative = makeLinkedPayment({
+				name: 'ACC-PAY-2026-09999',
+				reference_no: 'ALT-REF-9999',
+				paid_amount: DEPOSIT_ROW.unallocated_amount
+			})
+
+			renderWorkbench({
+				transactions: [DEPOSIT_ROW],
+				selected: [DEPOSIT_ROW],
+				vouchers: [suggested, alternative],
+				reconcileInFlight: DEPOSIT_ROW.name
+			})
+
+			const controls = await screen.findAllByRole('button', { name: /^Reconcil/ })
+			expect(controls).toHaveLength(2)
+			// Both, including the sibling that was never clicked. Before the shared atom this was 1 of 2.
+			controls.forEach((control) => expect(control).toBeDisabled())
+		})
+
+		it('leaves every candidate enabled when nothing is in flight', async () => {
+			// The negative half of the case above, so a permanently-disabled button could not pass it.
+			renderWorkbench({
+				transactions: [DEPOSIT_ROW],
+				selected: [DEPOSIT_ROW],
+				vouchers: [suggested, makeLinkedPayment({ name: 'ACC-PAY-2026-09998', reference_no: 'ALT-9998' })]
+			})
+
+			const controls = await screen.findAllByRole('button', { name: /^Reconcil/ })
+			expect(controls).toHaveLength(2)
+			controls.forEach((control) => expect(control).toBeEnabled())
+		})
+
+		it('explains why a candidate is unavailable while a post is outstanding', async () => {
+			/*
+			 * A disabled control fires no pointer or focus events, so the reason lives on a focusable
+			 * wrapper - the same arrangement the already-reconciled explanation uses. Without it the
+			 * siblings went from live to disabled with nothing on screen saying why.
+			 *
+			 * Both halves are asserted: that the wrapper exists and is reachable, and that focusing it
+			 * yields THESE words rather than the already-reconciled ones. Radix opens on focus with no
+			 * hover delay to wait out.
+			 */
+			renderWorkbench({
+				transactions: [DEPOSIT_ROW],
+				selected: [DEPOSIT_ROW],
+				vouchers: [suggested],
+				reconcileInFlight: DEPOSIT_ROW.name
+			})
+
+			const control = await screen.findByRole('button', { name: /^Reconcil/ })
+			const trigger = control.parentElement
+			expect(trigger).toHaveAttribute('data-slot', 'tooltip-trigger')
+			expect(trigger).toHaveAttribute('tabindex', '0')
+
+			await act(async () => {
+				;(trigger as HTMLElement).focus()
+			})
+
+			/*
+			 * `findAllByText`, because Radix renders the tooltip text twice on purpose: once in the visible
+			 * bubble and once in a visually-hidden node so it is announced. The visible bubble is asserted
+			 * explicitly by slot so this cannot pass on the hidden copy alone.
+			 */
+			const shown = await screen.findAllByText(/A reconciliation is being posted for this transaction/)
+			expect(shown.length).toBeGreaterThan(0)
+			expect(
+				shown.some((node) => node.closest('[data-slot="tooltip-content"]') !== null)
+			).toBe(true)
+			expect(screen.queryByText(/already fully reconciled/)).not.toBeInTheDocument()
+		})
+
+		it('refuses a second post while one is outstanding', async () => {
+			/*
+			 * The guard in the hook, not the disabled attribute. The attribute can be bypassed - a keyboard
+			 * activation landing in the same tick as the state update, or any direct call - so the refusal
+			 * is asserted where it cannot be: exactly one request leaves the client.
+			 */
+			const user = userEvent.setup()
+			const alternative = makeLinkedPayment({
+				name: 'ACC-PAY-2026-09997',
+				reference_no: 'ALT-REF-9997',
+				paid_amount: DEPOSIT_ROW.unallocated_amount
+			})
+			// Never settles, so the post stays in flight for the whole test.
+			frappePostCall.mockReturnValue(new Promise(() => undefined))
+
+			renderWorkbench({
+				transactions: [DEPOSIT_ROW],
+				selected: [DEPOSIT_ROW],
+				vouchers: [suggested, alternative]
+			})
+
+			const controls = await screen.findAllByRole('button', { name: /^Reconcil/ })
+			await user.click(controls[0])
+
+			await waitFor(() => {
+				expect(frappePostCall).toHaveBeenCalledTimes(1)
+			})
+
+			// Re-queried: the first click re-rendered the panel, so the earlier nodes may be stale.
+			const afterFirst = await screen.findAllByRole('button', { name: /^Reconcil/ })
+			afterFirst.forEach((control) => expect(control).toBeDisabled())
+
+			// Straight past the disabled attribute, which is what a same-tick activation does.
+			afterFirst[1].removeAttribute('disabled')
+			await user.click(afterFirst[1])
+
+			expect(frappePostCall).toHaveBeenCalledTimes(1)
+		})
+
+		it('releases the shared flag once the server answers', async () => {
+			frappePostCall.mockResolvedValue(makeReconcileSuccessResponse())
+
+			const { store } = await confirmSuggested()
+
+			await waitFor(() => {
+				expect(store.get(bankRecReconcileInFlightAtom)).toBeNull()
+			})
+		})
+
+		it('releases the shared flag on a refusal, so another candidate can be tried', async () => {
+			// A flag left raised here would disable Reconcile for the rest of the session with nothing on
+			// screen able to clear it - strictly worse than the defect being fixed.
+			frappePostCall.mockRejectedValue(makeAlreadyReconciledError(DEPOSIT_ROW.name))
+
+			const { store } = await confirmSuggested()
+
+			await waitFor(() => {
+				expect(store.get(bankRecReconcileInFlightAtom)).toBeNull()
+			})
 		})
 
 		it('reports the refusal and leaves the transaction unreconciled', async () => {
@@ -2829,6 +2982,87 @@ describe('MatchAndReconcile', { timeout: 20000 }, () => {
 			})
 
 			expect(screen.queryByText(/unreconciled transaction/)).not.toBeInTheDocument()
+		})
+	})
+
+	/**
+	 * Accessible names on the icon-only controls.
+	 *
+	 * Every candidate voucher renders three or four match indicators, and each one is a
+	 * `TooltipTrigger` - which Radix renders as a focusable BUTTON that takes its accessible name from
+	 * its children. The children were a bare icon, so on a normal working screen roughly a hundred and
+	 * eighty focusable buttons announced as nothing at all, and the information they carry - whether the
+	 * amount, the posting date and the reference actually match the transaction being reconciled - was
+	 * available only by sight. This was the single largest accessibility defect in the application by
+	 * count.
+	 *
+	 * The name states the finding rather than the glyph ("Amount matches..." rather than "tick"), so it
+	 * carries the same meaning the icon does, and the glyph itself is hidden so it cannot contribute a
+	 * second wordless name.
+	 */
+	describe('the match indicators name what they found', () => {
+
+		it('names the amount and posting-date indicators on a candidate voucher', async () => {
+			renderWorkbench({
+				transactions: [DEPOSIT_ROW],
+				selected: [DEPOSIT_ROW],
+				vouchers: [makeSuggestedLinkedPayment(DEPOSIT_ROW)]
+			})
+
+			await waitFor(() => {
+				expect(screen.getByRole('button', { name: 'Reconcile' })).toBeInTheDocument()
+			})
+
+			// The suggested voucher is built to match the transaction, so both read as a match.
+			expect(
+				screen.getByRole('button', { name: 'Amount matches the selected transaction' })
+			).toBeInTheDocument()
+			expect(
+				screen.getByRole('button', { name: 'Posting date matches the selected transaction' })
+			).toBeInTheDocument()
+		})
+
+		it('says so when the amount does NOT match, rather than showing a wordless cross', async () => {
+			const voucher = makeSuggestedLinkedPayment(DEPOSIT_ROW)
+
+			renderWorkbench({
+				transactions: [DEPOSIT_ROW],
+				selected: [DEPOSIT_ROW],
+				vouchers: [{ ...voucher, paid_amount: (voucher.paid_amount ?? 0) + 100 }]
+			})
+
+			await waitFor(() => {
+				expect(screen.getByRole('button', { name: 'Reconcile' })).toBeInTheDocument()
+			})
+
+			expect(
+				screen.getByRole('button', { name: 'Amount does not match the selected transaction' })
+			).toBeInTheDocument()
+		})
+
+		it('leaves no unnamed control anywhere in the voucher panel', async () => {
+			/*
+			 * The invariant behind the two cases above, and the one that would catch a NEW icon-only
+			 * trigger being added later. Every button on screen must resolve to a name - computed the
+			 * way a browser computes it, not read back off an attribute, so a name that comes from
+			 * visible text counts just as much as one from `aria-label`.
+			 */
+			renderWorkbench({
+				transactions: [DEPOSIT_ROW],
+				selected: [DEPOSIT_ROW],
+				vouchers: [makeSuggestedLinkedPayment(DEPOSIT_ROW)]
+			})
+
+			await waitFor(() => {
+				expect(screen.getByRole('button', { name: 'Reconcile' })).toBeInTheDocument()
+			})
+
+			// An empty `name` matches only controls whose computed accessible name IS empty, so this is
+			// the whole population of unnamed buttons on screen - reported with their markup so a
+			// regression names the culprit instead of just failing a count.
+			const unnamed = screen.queryAllByRole('button', { name: '' })
+
+			expect(unnamed.map((control) => control.outerHTML.slice(0, 120))).toEqual([])
 		})
 	})
 })

@@ -15,6 +15,7 @@ import { useFrappeEventListener, useFrappePostCall } from 'frappe-react-sdk'
 import type { FrappeError } from 'frappe-react-sdk'
 import { toast } from 'sonner'
 import ErrorBanner from '@/components/ui/error-banner'
+import { makeClientRefusal } from '@/lib/frappe'
 import { Link, useNavigate } from 'react-router'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Progress } from '@/components/ui/progress'
@@ -186,6 +187,16 @@ const StatementDetails = ({ data }: Props) => {
         setProgress({ percent, total: event.total })
     })
 
+    /**
+     * The statement was accepted as a file but nothing in it could be read as a transaction.
+     *
+     * This is a real failure with no server-side record of it: the import log is inserted with
+     * `number_of_transactions = 0` and left at `Not Started`, which is indistinguishable from a statement
+     * nobody has imported yet. It is derived rather than remembered, so it holds after a reload, in a new
+     * tab and for a different reviewer - which is exactly what the transient surfaces could not do.
+     */
+    const hasNothingToImport = data.doc.status !== 'Completed' && (data.final_transactions?.length ?? 0) === 0
+
     const file_name = data.doc.file.split("/").pop() ?? ""
 
     const { banks } = useGetBankAccounts()
@@ -215,6 +226,15 @@ const StatementDetails = ({ data }: Props) => {
                             {loading ? _("Importing...") : _("Import {0} transactions", [data.final_transactions?.length?.toString() || "0"])}</Button>
                     }
                 </div>
+                {/*
+                  * The blurb answers the state the screen is actually in, rather than one of them.
+                  *
+                  * It used to tell every reviewer to "click the 'Import' button" - including the one
+                  * looking at an already-imported statement, where that button has been replaced by a
+                  * Completed badge and there is nothing to click, and the one looking at a statement the
+                  * parser found nothing in, where the button is present but disabled. Being told to press
+                  * something that is not there is worse than being told nothing.
+                  */}
                 <div className='flex items-start gap-4'>
                     <div className='flex flex-col gap-1'>
                         <H2 className='text-lg border-0 p-0'>{_("Statement Details")}</H2>
@@ -222,11 +242,41 @@ const StatementDetails = ({ data }: Props) => {
                             {_("We've auto-detected the details of the statement file.")}
                         </span><br />
                             <span>
-                                {_("Please review the details below and click the 'Import' button to proceed.")}
+                                {data.doc.status === 'Completed'
+                                    ? _("This statement has already been imported. The details below are what was read from it.")
+                                    : hasNothingToImport
+                                        ? _("Nothing could be read from this statement as transactions. Correct the header row or the column mapping below, or upload a corrected statement.")
+                                        : _("Please review the details below and click the 'Import' button to proceed.")}
                             </span>
                         </Paragraph>
                     </div>
                 </div>
+
+                {/*
+                  * FM2's reason surface for a statement that WAS accepted as a file but yielded no
+                  * transactions.
+                  *
+                  * This is the quietest of the import failures and was the one with no voice at all. The
+                  * file parses, so the framework accepts it and the import log is created; the column
+                  * detection then finds nothing it can read as a transaction, so the log is inserted with
+                  * zero of them and left at `Not Started`. The reviewer arrived at a screen that looked
+                  * ordinary apart from a disabled button reading "Import 0 transactions" - no error, no
+                  * dialog, no marker, and nothing saying whether the file was wrong, the mapping was
+                  * wrong, or the import had simply not happened yet.
+                  *
+                  * Stated inline rather than through the shared dialog, deliberately: a dialog is for
+                  * something that just happened to a request the reviewer made, and this is a standing
+                  * fact about the record they are looking at - it has to still be here after any dialog
+                  * would have been dismissed, and after a reload. It also says what to DO, because unlike
+                  * a refused upload this one is usually recoverable from this very screen: the header row
+                  * and the column mapping are both editable below.
+                  */}
+                {hasNothingToImport && <ErrorBanner
+                    error={makeClientRefusal(
+                        _("No transactions could be read from this statement, so there is nothing to import and nothing has been created. This usually means the header row or the column mapping was detected incorrectly - correct them below and the preview will update. If the file is not a bank statement, upload a corrected one instead."),
+                        _("No Transactions Found")
+                    )}
+                />}
 
                 {/* The server's figure is a PERCENTAGE, so it is labelled as one. Only the terminal
                     event carries `total`, which is the row count actually written - the one point at
@@ -318,7 +368,11 @@ const StatementDetails = ({ data }: Props) => {
                             <TableHead>
                                 <div className='flex items-center gap-2'>
                                     {_("Detected Amount Format")} <Tooltip>
-                                        <TooltipTrigger><InfoIcon size={16} /></TooltipTrigger>
+                                        {/* A TooltipTrigger renders a focusable button, so an icon-only
+                                            trigger reaches the accessibility tree as an unnamed control.
+                                            The name is taken from the row's own visible label so the two
+                                            can never drift apart. */}
+                                        <TooltipTrigger aria-label={_("About {0}", [_("Detected Amount Format")])}><InfoIcon size={16} aria-hidden="true" /></TooltipTrigger>
                                         <TooltipContent>
                                             {_("The amount format detected in the statement file. This is used to parse the deposit and withdrawal values from each row.")}
                                         </TooltipContent>
@@ -332,7 +386,7 @@ const StatementDetails = ({ data }: Props) => {
                                 <div className='flex items-center gap-2'>
                                     {_("Detected Date Format")}
                                     <Tooltip>
-                                        <TooltipTrigger><InfoIcon size={16} /></TooltipTrigger>
+                                        <TooltipTrigger aria-label={_("About {0}", [_("Detected Date Format")])}><InfoIcon size={16} aria-hidden="true" /></TooltipTrigger>
                                         <TooltipContent>
                                             {_("The date format detected in the statement file. This is used to parse the date values.")}
                                         </TooltipContent>
@@ -357,7 +411,12 @@ const StatementDetails = ({ data }: Props) => {
                 <div className='flex flex-col gap-4'>
                     <div className='flex flex-col gap-1'>
                         <H3 className='text-base border-0 p-0'>{_("Preview Transactions")}</H3>
-                        {data.final_transactions?.length === 1 ? (
+                        {/* The zero case is not a quantity of transactions, it is the absence of any, and
+                            it needs different words: "0 transactions will be imported ... click the
+                            'Import' button" described a button that is present but permanently disabled. */}
+                        {hasNothingToImport ? (
+                            <Paragraph className='text-p-sm'>{_("No transactions were found in this statement file. Adjust the header row or the column mapping above and this preview will update.")}</Paragraph>
+                        ) : data.final_transactions?.length === 1 ? (
                             <Paragraph className='text-p-sm'>{_("We've found 1 transaction in the statement file that will be imported into the system. Please review the details below and click the 'Import' button to proceed.")}</Paragraph>
                         ) : (
                             <Paragraph className='text-p-sm'>{_("{0} transactions will be imported into the system. Please review the details below and click the 'Import' button to proceed.", [data.final_transactions?.length?.toString() || "0"])}</Paragraph>
@@ -426,7 +485,7 @@ const ConflictingTransactions = ({ transactions }: { transactions: GetStatementD
                                 <span>{transactions.length > 1 ? _("View transactions") : _("View transaction")}</span>
                             </Button>
                         </DialogTrigger>
-                        <DialogContent className='min-w-7xl'>
+                        <DialogContent size='7xl'>
                             <DialogHeader>
                                 <DialogTitle>{_("Conflicting Transactions")}</DialogTitle>
                                 <DialogDescription>

@@ -232,7 +232,17 @@ describe('BankTransactionList', () => {
 			expect(screen.getAllByText('₹ 4,825.50')).toHaveLength(2)
 		})
 
-		it('badges the transaction type, and omits the badge when there is none', async () => {
+		/*
+		 * The Type column is offered on the strength of the DATA, not of the schema.
+		 *
+		 * `transaction_type` is free text on `Bank Transaction` that nothing in this app writes - neither
+		 * the CSV/XLSX column mapping nor the PDF pipeline maps a column onto it - so for a page of
+		 * imported statement rows it is empty on every row. Rendered unconditionally it produced a headed
+		 * column of blank cells, which reads as a broken cell renderer rather than as "these have no
+		 * type", and spent 112px doing it. Records that DO carry a type - entered on the desk, or written
+		 * by an integration - still get their column.
+		 */
+		it('badges the transaction type, and omits the badge when a row has none', async () => {
 			answerWith([
 				transaction({ name: 'ACC-BTN-2026-00001', transaction_type: 'Bank Transfer' }),
 				transaction({ name: 'ACC-BTN-2026-00002', transaction_type: undefined })
@@ -241,6 +251,26 @@ describe('BankTransactionList', () => {
 			renderPanel(<BankTransactions />)
 
 			expect(await screen.findByText('Bank Transfer')).toBeInTheDocument()
+			// Matched loosely at the start because the grid's own resize handle contributes to a column
+			// header's accessible name; what is asserted here is that the column is headed "Type" at all.
+			expect(screen.getByRole('columnheader', { name: /^Type\b/ })).toBeInTheDocument()
+		})
+
+		it('leaves the Type column out entirely when no row carries a type', async () => {
+			answerWith([
+				transaction({ name: 'ACC-BTN-2026-00001', transaction_type: undefined }),
+				transaction({ name: 'ACC-BTN-2026-00002', transaction_type: '' })
+			])
+
+			renderPanel(<BankTransactions />)
+
+			// The rows themselves still render...
+			expect(await screen.findAllByText('NEFT inbound from ACME Traders')).toHaveLength(2)
+			// ...but no empty column is headed for a field none of them has.
+			expect(screen.queryByRole('columnheader', { name: /^Type\b/ })).not.toBeInTheDocument()
+			// And the columns that do carry something are untouched.
+			expect(screen.getByRole('columnheader', { name: /^Status\b/ })).toBeInTheDocument()
+			expect(screen.getByRole('columnheader', { name: /^Unallocated\b/ })).toBeInTheDocument()
 		})
 
 		it('renders a withdrawal as readily as a deposit', async () => {

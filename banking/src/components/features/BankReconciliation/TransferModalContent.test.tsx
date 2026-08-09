@@ -20,13 +20,14 @@
  */
 
 import { describe, expect, it, vi, beforeEach } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { Provider, createStore } from 'jotai'
 import { MemoryRouter } from 'react-router'
 
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { Dialog, DialogContent } from '@/components/ui/dialog'
-import { createFrappeSDKMock, frappeSDKMock, makeUnreconciledTransaction } from '@/test/factories'
+import { createFrappeSDKMock, frappePostCall, frappeSDKMock, makeUnreconciledTransaction } from '@/test/factories'
 
 vi.mock('frappe-react-sdk', () => createFrappeSDKMock())
 
@@ -191,6 +192,123 @@ describe('TransferModalContent', () => {
 			])
 
 			expect(registeredPostEndpoints()).toContain(BULK_ENDPOINT)
+		})
+	})
+
+	/**
+	 * The five required fields on this form carried `isRequired`, which drew the red asterisk and set
+	 * `aria-required`, and nothing else. Validation lives in a separate `rules` prop that this form never
+	 * supplied, so the constraint was an assertion to the reader that the form itself did not hold: an
+	 * empty Reference submitted, the control was never marked invalid, no message appeared, and the
+	 * request went to `create_internal_transfer` regardless.
+	 *
+	 * It is worth being precise about what that cost. `paid_to` defaults to the matching rule's account
+	 * or the empty string, so on a withdrawal with no rule the destination account is blank until the
+	 * reviewer picks one - and submitting sent that blank straight to the server as the other half of an
+	 * internal transfer.
+	 *
+	 * The rule is now derived from `isRequired` inside the form primitives, so the two cannot drift apart
+	 * again. The three behaviours below are what "required" has to mean: the request is not sent, the
+	 * control is marked invalid, and the reviewer is told which field to fix.
+	 */
+	describe('required fields', () => {
+
+		const submit = async () => {
+			const user = userEvent.setup()
+			await user.click(screen.getByRole('button', { name: 'Transfer' }))
+			return user
+		}
+
+		/**
+		 * Resolved by the control's `name` attribute rather than by its accessible name.
+		 *
+		 * The accessible name is the label plus the required indicator's screen-reader text, so it reads
+		 * `Reference(required)` - and both the wording and the spacing of that suffix are an accessibility
+		 * concern in their own right, which means an assertion keyed on it would break the moment that is
+		 * improved. `name` is the field's identity in the form and is exactly what the request carries.
+		 */
+		const field = (name: string): HTMLInputElement => {
+			const node = document.querySelector<HTMLInputElement>(`input[name="${name}"]`)
+			if (!node) throw new Error(`no control named ${name}`)
+			return node
+		}
+
+		it('blocks the request when Reference is cleared', async () => {
+			renderModal([transfer({ reference_number: 'SWEEP-1' })])
+			const user = userEvent.setup()
+
+			await user.clear(field('reference_no'))
+			await user.click(screen.getByRole('button', { name: 'Transfer' }))
+
+			// The point of the finding: nothing may reach the server.
+			expect(frappePostCall).not.toHaveBeenCalled()
+		})
+
+		it('marks the cleared control invalid and names it in a message', async () => {
+			renderModal([transfer({ reference_number: 'SWEEP-1' })])
+			const user = userEvent.setup()
+
+			const reference = field('reference_no')
+			await user.clear(reference)
+			await user.click(screen.getByRole('button', { name: 'Transfer' }))
+
+			await waitFor(() => {
+				expect(reference).toHaveAttribute('aria-invalid', 'true')
+			})
+			// Named rather than a bare "this field is required": several labels here are visually
+			// similar and one form holds twelve controls.
+			expect(await screen.findByText('Reference is required')).toBeInTheDocument()
+		})
+
+		/**
+		 * The destination account is genuinely empty on arrival for a withdrawal with no matching rule -
+		 * `paid_to` defaults to `rule?.account ?? ''` - so this is not a contrived blank but the state the
+		 * form opens in.
+		 */
+		it('blocks the request when the destination account was never chosen', async () => {
+			renderModal([transfer()])
+
+			await submit()
+
+			expect(frappePostCall).not.toHaveBeenCalled()
+			expect(await screen.findByText('Paid To is required')).toBeInTheDocument()
+		})
+
+		it('states the constraint in the accessible tree as well as in the asterisk', () => {
+			renderModal([transfer({ reference_number: 'SWEEP-1' })])
+
+			// `aria-required` rather than the native attribute: no <form> here sets `noValidate`, so a
+			// native `required` would hand validation to the browser's own bubble and pre-empt the
+			// form's own message.
+			expect(field('reference_no')).toHaveAttribute('aria-required', 'true')
+		})
+
+		it('still submits once every required field is answered', async () => {
+			frappePostCall.mockResolvedValue({
+				message: { transaction: { name: 'ACC-BTN-2026-00001' }, payment_entry: { name: 'ACC-PAY-2026-00001' } }
+			} as never)
+
+			// A deposit pre-fills `paid_to` with the selected bank account, so the only blank left is the
+			// source account, which the recommended-account default supplies.
+			renderModal([
+				transfer({
+					withdrawal: 0,
+					deposit: 5000,
+					unallocated_amount: 5000,
+					reference_number: 'SWEEP-1'
+				})
+			])
+
+			const user = userEvent.setup()
+			await user.click(screen.getByRole('button', { name: 'Transfer' }))
+
+			// Guards against the fix overshooting into "nothing can ever be submitted": with `paid_from`
+			// still blank the form must refuse, and it must refuse for that field and no other.
+			expect(await screen.findByText('Paid From is required')).toBeInTheDocument()
+			expect(screen.queryByText('Reference is required')).not.toBeInTheDocument()
+			expect(screen.queryByText('Posting Date is required')).not.toBeInTheDocument()
+			expect(screen.queryByText('Reference Date is required')).not.toBeInTheDocument()
+			expect(screen.queryByText('Paid To is required')).not.toBeInTheDocument()
 		})
 	})
 

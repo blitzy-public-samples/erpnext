@@ -128,6 +128,14 @@ const BankRecDateFilter = () => {
         }
     }, [bankRecDate.fromDate, bankRecDate.toDate])
 
+    /*
+     * Built once and used for BOTH the visible label and the accessible name, which is what keeps the
+     * two in step. An accessible name that paraphrases the visible text - "from X to Y" against a
+     * rendered "X - Y" - breaks the rule that the name must contain the visible label, so anyone
+     * speaking the label they can see would fail to address the control.
+     */
+    const visibleDateRange = `${formatDate(bankRecDate.fromDate)} - ${formatDate(bankRecDate.toDate)}`
+
     const direction = useDirection()
 
 
@@ -135,15 +143,17 @@ const BankRecDateFilter = () => {
     return <div className='flex items-center'>
         <Popover open={open} onOpenChange={setOpen}>
             <PopoverTrigger asChild>
+                {/* Purpose plus value - see the note on `CompanySelector`. */}
                 <Button
                     variant={'outline'}
                     aria-expanded={open}
                     size='md'
+                    aria-label={_("Period: {0}", [timePeriodOptions.find((period) => period.label === timePeriod)?.translatedLabel ?? _(timePeriod)])}
                     className='rounded-e-none border-e-0'
                     role="combobox">
                     {timePeriodOptions.find((period) => period.label === timePeriod)?.translatedLabel ?? _(timePeriod)}
 
-                    <ChevronDownIcon />
+                    <ChevronDownIcon aria-hidden="true" />
                 </Button>
             </PopoverTrigger>
 
@@ -173,8 +183,11 @@ const BankRecDateFilter = () => {
 
         <Popover>
             <PopoverTrigger asChild>
-                <Button variant={'outline'} className='rounded-s-none' size='md'>
-                    {formatDate(bankRecDate.fromDate)} - {formatDate(bankRecDate.toDate)}
+                {/* The dates alone read as two numbers with no indication that the control opens a
+                    calendar, and no relationship to the period combobox immediately before it. */}
+                <Button variant={'outline'} className='rounded-s-none' size='md'
+                    aria-label={_("Change date range: {0}", [visibleDateRange])}>
+                    {visibleDateRange}
                 </Button>
             </PopoverTrigger>
             <PopoverContent className='w-auto overflow-hidden p-0' align='end'>

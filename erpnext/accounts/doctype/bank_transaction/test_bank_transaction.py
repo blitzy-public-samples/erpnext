@@ -11,7 +11,10 @@ from erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool 
 	get_linked_payments,
 	reconcile_vouchers,
 )
-from erpnext.accounts.doctype.bank_transaction.bank_transaction import unreconcile_transaction_entry
+from erpnext.accounts.doctype.bank_transaction.bank_transaction import (
+	refuse_missing_arguments,
+	unreconcile_transaction_entry,
+)
 from erpnext.accounts.doctype.mode_of_payment.test_mode_of_payment import (
 	set_default_account_for_mode_of_payment,
 )
@@ -514,6 +517,96 @@ class TestBankTransaction(ERPNextTestSuite):
 
 		linked_payments = get_linked_payments(bank_transaction.name, ["loan_repayment", "exact_match"])
 		self.assertEqual(linked_payments[0]["name"], repayment_entry.name)
+
+	def test_missing_argument_is_refused_rather_than_raised(self):
+		"""
+		Every whitelisted banking method is reachable over `/api/method/...`, and a request that omits a
+		required argument used to reach the function and raise a plain `TypeError`. Frappe has no special
+		handling for that, so it became an HTTP 500 carrying the server traceback. Measured against a
+		running site before the guard: 26 of the 28 module-level whitelisted methods across the four
+		banking DocTypes answered 500 that way.
+
+		`ValidationError` is what `frappe.throw` raises, and it is what turns the same request into an
+		ordinary 4xx whose message travels in `_server_messages` with no traceback attached.
+		"""
+
+		@refuse_missing_arguments
+		def needs_two(first, second=None):
+			return first, second
+
+		self.assertRaises(frappe.ValidationError, needs_two)
+
+	def test_the_refusal_names_every_missing_argument_at_once(self):
+		# Named from the signature rather than parsed out of Python's TypeError text, so the caller learns
+		# about all of them in one answer instead of one request at a time.
+		@refuse_missing_arguments
+		def needs_three(alpha, beta, gamma=None):
+			return alpha, beta, gamma
+
+		frappe.clear_messages()
+		self.assertRaises(frappe.ValidationError, needs_three)
+
+		messages = " ".join(str(entry.get("message", "")) for entry in frappe.get_message_log())
+		self.assertIn("alpha", messages)
+		self.assertIn("beta", messages)
+		# `gamma` has a default, so it was never required and must not be reported as missing.
+		self.assertNotIn("gamma", messages)
+
+	def test_a_supplied_argument_is_not_reported_missing(self):
+		# By keyword and by position, because HTTP dispatch supplies keywords while the internal callers in
+		# these modules supply positions, and both must satisfy the guard.
+		@refuse_missing_arguments
+		def needs_two(first, second):
+			return first, second
+
+		self.assertEqual(needs_two(1, 2), (1, 2))
+		self.assertEqual(needs_two(first=1, second=2), (1, 2))
+		self.assertEqual(needs_two(1, second=2), (1, 2))
+
+	def test_none_counts_as_supplied(self):
+		# The guard answers "was a value given", not "is the value useful". A method that wants to reject
+		# `None` specifically has to say so itself - which is what `get_linked_payments` does for
+		# `document_types`, because every path in it treats that parameter as required.
+		@refuse_missing_arguments
+		def needs_one(first):
+			return first
+
+		self.assertIsNone(needs_one(None))
+
+	def test_the_guard_keeps_the_signature_frappe_dispatches_against(self):
+		"""
+		`frappe.whitelist()` wraps a method in `validate_argument_types`, and Frappe's `get_newargs`
+		filters incoming form data down to the parameters a method accepts. Both resolve the signature
+		through `inspect`, which follows `functools.wraps`' `__wrapped__`. If the guard did not preserve
+		that, every decorated endpoint would either stop coercing its arguments or stop accepting them.
+		"""
+		import inspect
+
+		def documented(first: str, second: int = 3) -> str:
+			return f"{first}{second}"
+
+		guarded = refuse_missing_arguments(documented)
+
+		self.assertEqual(inspect.signature(guarded), inspect.signature(documented))
+		self.assertEqual(guarded.__annotations__, documented.__annotations__)
+		self.assertEqual(guarded.__name__, documented.__name__)
+		self.assertIs(guarded.__wrapped__, documented)
+
+	def test_an_unexpected_keyword_is_refused_rather_than_raised(self):
+		# Unreachable over HTTP, because Frappe filters form data to the signature before dispatching, so
+		# this only ever answers an internal caller - and answers it with a sentence, not a traceback.
+		@refuse_missing_arguments
+		def needs_one(first):
+			return first
+
+		self.assertRaises(frappe.ValidationError, needs_one, 1, unexpected=2)
+
+	def test_too_many_positional_arguments_are_refused_rather_than_raised(self):
+		@refuse_missing_arguments
+		def needs_one(first):
+			return first
+
+		self.assertRaises(frappe.ValidationError, needs_one, 1, 2, 3)
 
 
 def create_bank_account(

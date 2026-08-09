@@ -71,7 +71,7 @@ const RawTableGrid = ({ rows, columnMapping, headerIndex, editable, disabled, on
     }, [stringRows, headerIndex, dateColumn, amountColumns])
 
     return (
-        <Table containerClassName="rounded-none">
+        <Table containerClassName="rounded-none" containerLabel={_("Statement preview")}>
             <TableBody>
                 {editable && (
                     <TableRow className="border-b border-outline-gray-2 bg-surface-white hover:bg-surface-white">
@@ -109,10 +109,28 @@ const RawTableGrid = ({ rows, columnMapping, headerIndex, editable, disabled, on
                     return (
                         <TableRow
                             key={index}
+                            /*
+                             * Espresso surface tokens, not raw palette values.
+                             *
+                             * These four rules were written against Tailwind's own palette with hand-picked
+                             * dark-mode overrides - `bg-green-50 dark:bg-green-700`, `bg-yellow-100
+                             * dark:bg-yellow-400` - and the dark pairings were the wrong way round: a MID
+                             * tone behind text that stays light in the dark theme, measured at 1.97:1 and
+                             * 2.59:1 against the 4.5:1 floor. A `surface-*` token already resolves to the
+                             * pale end in the light theme and the deep end in the dark one, so one class
+                             * gives a legible pairing in both and no `dark:` override is needed at all.
+                             *
+                             * The text colour is stated rather than inherited, because the guarantee is
+                             * about the PAIR: a token background is only as good as the token in front of it.
+                             *
+                             * `text-ink-gray-5/70` on the ignored rows is gone too - the opacity was applied
+                             * on top of an already-mid grey and took it to roughly 3.2:1, below the floor for
+                             * body text. The token without it is what the rest of the app dims text to.
+                             */
                             className={cn({
-                                'bg-green-50 hover:bg-green-50 dark:bg-green-700 dark:hover:bg-green-700': isTransactionRow,
-                                'bg-yellow-100 hover:bg-yellow-100 dark:bg-yellow-400': isHeaderRow,
-                                'text-ink-gray-5/70': !isTransactionRow && !isHeaderRow,
+                                'bg-surface-green-1 hover:bg-surface-green-1 text-ink-gray-8': isTransactionRow,
+                                'bg-surface-amber-2 hover:bg-surface-amber-2 text-ink-gray-8': isHeaderRow,
+                                'text-ink-gray-5': !isTransactionRow && !isHeaderRow,
                             })}
                         >
                             {editable && onSetHeader ? (
@@ -155,7 +173,11 @@ const RawTableGrid = ({ rows, columnMapping, headerIndex, editable, disabled, on
                                             <div className="flex items-center gap-1 px-1 text-xs font-medium text-ink-gray-8">
                                                 {columnType && (
                                                     <Tooltip>
-                                                        <TooltipTrigger>
+                                                        {/* The trigger is a focusable button and the glyph
+                                                            gives it no name, so it announced as an unnamed
+                                                            control once per detected column. The name is the
+                                                            same detected type the tooltip itself shows. */}
+                                                        <TooltipTrigger aria-label={_("Detected column type: {0}", [_(columnType)])}>
                                                             <ColumnHeaderIcon columnType={columnType} />
                                                         </TooltipTrigger>
                                                         <TooltipContent>{_(columnType)}</TooltipContent>
@@ -171,7 +193,10 @@ const RawTableGrid = ({ rows, columnMapping, headerIndex, editable, disabled, on
                                     <TableCell
                                         key={cellIndex}
                                         className={cn('max-w-[200px] overflow-hidden text-ellipsis py-0.5', {
-                                            'bg-green-100 dark:bg-green-400 hover:bg-green-100 dark:hover:bg-green-400': isValidColumn && isTransactionRow,
+                                            /* One step deeper than the row behind it, so the "this column is
+                                               mapped" emphasis survives in BOTH themes rather than only in the
+                                               light one. */
+                                            'bg-surface-green-2 hover:bg-surface-green-2 text-ink-gray-8': isValidColumn && isTransactionRow,
                                             'text-ink-gray-5': !isValidColumn && isTransactionRow,
                                         })}
                                     >

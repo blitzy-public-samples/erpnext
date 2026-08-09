@@ -161,7 +161,8 @@ const IncorrectlyClearedEntriesView = () => {
                 header: _("Actions"),
                 size: 180,
                 enableResizing: false,
-                meta: { truncate: false, truncateTooltip: false } satisfies ListViewColumnMeta,
+                // Pinned so Reset Clearing Date survives a narrow viewport. See BankTransactionList.
+                meta: { truncate: false, truncateTooltip: false, stickyEnd: true } satisfies ListViewColumnMeta,
                 cell: ({ row }) => (
                     <Button
                         variant="link"
@@ -203,6 +204,7 @@ const IncorrectlyClearedEntriesView = () => {
                 <ListView
                     data={data.message.result}
                     columns={incorrectlyClearedColumns}
+                    ariaLabel={_("Incorrectly cleared entries")}
                     getRowId={(row) => `${row.payment_entry}-${row.posting_date}`}
                     maxHeight="min(70vh, 640px)"
                     emptyState={_("No rows to display.")}

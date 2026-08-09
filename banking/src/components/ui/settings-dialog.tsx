@@ -63,7 +63,22 @@ function SettingsDialog({
     const contextValue = React.useMemo(() => ({ onClose }), [onClose])
 
     return (
-        <DialogContent className={cn("min-w-5xl max-lg:min-w-[98vw] p-0 overflow-y-hidden", contentClassName)} showCloseButton={false}>
+        /*
+         * Width comes from the primitive's clamped size set, and the close control is BACK.
+         *
+         * The old expression was `min-w-5xl max-lg:min-w-[98vw]`, which had an exact-boundary bug: `max-lg`
+         * means *below* 64rem, and `5xl` IS 64rem - so at precisely 1024px neither branch left a gutter and
+         * the dialog ran edge to edge. `size="5xl"` clamps to `min(64rem, 100vw - 2rem)`, which has no
+         * boundary to get wrong.
+         *
+         * `showCloseButton` was false and nothing replaced it: the only ways out of the settings dialog
+         * were Escape and a click on the overlay, neither of which is visible, and neither of which a
+         * reviewer who does not already know them will find. It is restored, and positioned in the panel's
+         * own padding rather than the dialog's, so it cannot collide with the tab rail.
+         */
+        <DialogContent
+            size="5xl"
+            className={cn("p-0 overflow-hidden [&>[data-slot=dialog-close]]:top-4 [&>[data-slot=dialog-close]]:ltr:right-4 [&>[data-slot=dialog-close]]:rtl:left-4 [&>[data-slot=dialog-close]]:z-20", contentClassName)}>
             <SettingsDialogContext.Provider value={contextValue}>
                 <TabsPrimitive.Root
                     data-slot="settings-dialog"
@@ -119,14 +134,28 @@ function SettingsTabGroup({
     ...props
 }: SettingsTabGroupProps) {
     return (
-        <div data-slot="settings-tab-group" className={className} {...props}>
+        /*
+         * Every wrapper between the tablist and its tabs is `role="presentation"`, and the inner one used
+         * to be a `<nav>`.
+         *
+         * ARIA requires a `tablist` to OWN its `tab` children, and this group sits between the two - so
+         * with a landmark and two generic containers in the way, the settings rail exposed a tablist with
+         * no tabs in it and a navigation landmark nested inside a composite widget, neither of which is
+         * valid. `role="presentation"` removes only the wrapper itself from the accessibility tree, so the
+         * tabs become direct children of the tablist there while the DOM and the styling are untouched.
+         *
+         * The group header is hidden from the tree for the same reason: it is a bare text node inside the
+         * tablist, and its wording repeats the dialog's own title, so it carries nothing a screen-reader
+         * user would lose. It stays visible.
+         */
+        <div data-slot="settings-tab-group" role="presentation" className={className} {...props}>
             {header && (
-                <div className="h-7.5 px-2 py-[7px] my-[3px] flex cursor-default gap-1.5 text-xs font-medium text-ink-gray-5 transition-all duration-300 ease-in-out sticky top-0 z-10 bg-surface-menu-bar">
+                <div aria-hidden="true" className="h-7.5 px-2 py-[7px] my-[3px] flex cursor-default gap-1.5 text-xs font-medium text-ink-gray-5 transition-all duration-300 ease-in-out sticky top-0 z-10 bg-surface-menu-bar">
                     <span>{header}</span>
                 </div>
             )}
-            <nav className="space-y-[3px] px-1">{children}</nav>
-            <div className="mb-0.5 mt-[5px]"></div>
+            <div role="presentation" className="space-y-[3px] px-1">{children}</div>
+            <div aria-hidden="true" className="mb-0.5 mt-[5px]"></div>
         </div>
     )
 }
@@ -146,7 +175,16 @@ function SettingsTabItem({
         <TabsPrimitive.Trigger
             data-slot="settings-tab-item"
             className={cn(
-                "flex h-7.5 cursor-pointer items-center rounded text-ink-gray-6 duration-300 ease-in-out focus:outline-none focus:transition-none focus-visible:rounded focus-visible:ring-2 focus-visible:ring-outline-gray-3 w-full",
+                /*
+                 * The focus ring was `outline-gray-3`, which resolves to gray-400 in light and
+                 * gray-500 in dark and measures 1.44-1.69:1 against the three surfaces this tab can
+                 * sit on (menu bar, hover, selected) and 1.26-1.91:1 in dark - so the keyboard
+                 * position was effectively unmarked. `outline-gray-5` is the ramp's focus value and
+                 * measures 10.0-11.7:1 light and 5.8-8.7:1 dark on the same three surfaces, clearing
+                 * the 3:1 non-text floor with room to spare. Token-for-token within the existing
+                 * ramp: no new colour and no geometry change.
+                 */
+                "flex h-7.5 cursor-pointer items-center rounded text-ink-gray-6 duration-300 ease-in-out focus:outline-none focus:transition-none focus-visible:rounded focus-visible:ring-2 focus-visible:ring-outline-gray-5 w-full",
                 "hover:bg-surface-gray-3",
                 "data-[state=active]:bg-surface-selected data-[state=active]:shadow-sm data-[state=active]:hover:bg-surface-selected",
                 className

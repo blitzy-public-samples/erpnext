@@ -105,13 +105,6 @@ const BankTransactionListView = () => {
                 cell: ({ row }) => <span className="font-numeric">{formatCurrency(row.original.unallocated_amount, accountCurrency)}</span>,
             },
             {
-                accessorKey: "transaction_type",
-                header: _("Type"),
-                size: 112,
-                cell: ({ row }) =>
-                    row.original.transaction_type ? <Badge>{row.original.transaction_type}</Badge> : null,
-            },
-            {
                 id: "status",
                 header: _("Status"),
                 size: 168,
@@ -147,7 +140,10 @@ const BankTransactionListView = () => {
                 header: _("Actions"),
                 size: 200,
                 enableResizing: false,
-                meta: { truncate: false, truncateTooltip: false } satisfies ListViewColumnMeta,
+                // Pinned to the trailing edge: at every width below ~1456px this column was the first
+                // to leave the scrollport, which put Undo and Force Clear out of reach rather than
+                // merely out of sight.
+                meta: { truncate: false, truncateTooltip: false, stickyEnd: true } satisfies ListViewColumnMeta,
                 cell: ({ row }) => (
                     <div className="flex gap-2 ps-0.5 items-center">
                         <Button variant="ghost" asChild size='sm'>
@@ -178,6 +174,45 @@ const BankTransactionListView = () => {
         ],
         [accountCurrency, onUndo],
     )
+
+    /*
+     * `transaction_type` is a free-text field on `Bank Transaction` that nothing in this app ever
+     * writes: neither the CSV/XLSX column mapping nor the PDF pipeline maps a column onto it, so for
+     * every statement imported here it is empty. Rendered unconditionally it produced a headed column
+     * of blank cells in front of the reviewer - which reads as a broken cell renderer, not as "these
+     * transactions have no type" - while taking 112px away from the columns that do carry something.
+     *
+     * So the column is offered on the strength of the DATA rather than of the schema. Records that do
+     * carry a type - entered on the desk, or written by an integration - still get a column for it,
+     * and a page of imported statement rows no longer gets an empty one. Placed immediately before
+     * Status, exactly where it used to sit, so its presence changes nothing else about the layout.
+     */
+    const hasTransactionType = useMemo(
+        () => Boolean(data?.message?.some((transaction) => Boolean(transaction.transaction_type))),
+        [data?.message],
+    )
+
+    const columns = useMemo<ColumnDef<BankTransaction, unknown>[]>(() => {
+        if (!hasTransactionType) {
+            return transactionColumns
+        }
+
+        const statusIndex = transactionColumns.findIndex((column) => column.id === 'status')
+        const typeColumn: ColumnDef<BankTransaction, unknown> = {
+            accessorKey: "transaction_type",
+            header: _("Type"),
+            size: 112,
+            cell: ({ row }) =>
+                row.original.transaction_type ? <Badge>{row.original.transaction_type}</Badge> : null,
+        }
+
+        const insertAt = statusIndex === -1 ? transactionColumns.length : statusIndex
+        return [
+            ...transactionColumns.slice(0, insertAt),
+            typeColumn,
+            ...transactionColumns.slice(insertAt),
+        ]
+    }, [hasTransactionType, transactionColumns])
 
     const [search, setSearch] = useDebounceValue('', 250)
     const [amountFilter, setAmountFilter] = useState<{ value: number, stringValue?: string | number }>({ value: 0, stringValue: '0.00' })
@@ -288,7 +323,8 @@ const BankTransactionListView = () => {
 
         <ListView
             data={filteredResults}
-            columns={transactionColumns}
+            columns={columns}
+            ariaLabel={_("Bank transactions")}
             getRowId={(row) => row.name}
             maxHeight="calc(100vh - 200px)"
             scrollAreaClassName="min-h-[calc(100vh-200px)]"

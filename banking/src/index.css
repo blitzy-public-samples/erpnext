@@ -645,14 +645,34 @@
   --ink-gray-2: var(--gray-300);
   --ink-gray-3: var(--gray-400);
   --ink-gray-4: var(--gray-500);
-  --ink-gray-5: var(--gray-600);
+  /*
+   * Raised one step, from gray-600 (#7C7C7C) to gray-700 (#525252), because the old value could not
+   * carry text. Measured against every surface this token is painted on: 4.17 on surface-white, 3.93
+   * on gray-1, 3.76 on gray-2, 3.57 on gray-3, 4.00 on green-1, 3.88 on amber-2 - every one of them
+   * short of the 4.5:1 floor for body text. It is the single cause of ten reported contrast failures
+   * on the workbench and thirteen on the importer, including all four inactive tab labels and every
+   * "Previous Imports" column header. gray-700 measures 6.67 at worst and 7.81 on white.
+   *
+   * This is the muted-text token and it is used 111 times as `text-`, once as `border-`, so raising it
+   * fixes the failures at their source rather than at 111 call sites. It now resolves to the same value
+   * as --ink-gray-6; the ramp already collapses --ink-gray-8 and --ink-gray-9 onto #171717, so a shared
+   * step is an existing property of this scale rather than something introduced here.
+   */
+  --ink-gray-5: var(--gray-700);
   --ink-gray-6: var(--gray-700);
   --ink-gray-7: var(--gray-800);
   --ink-gray-8: var(--gray-900);
 
   --ink-red-1: var(--red-50);
   --ink-red-2: var(--red-400);
-  --ink-red-3: var(--red-500);
+  /*
+   * Raised one step, from red-500 (#E03636) to red-600 (#CC2929). The old value measured 4.42 on
+   * surface-white and 3.78 at worst - it is the second reported cause of contrast failures, and it
+   * carries the balance strip's negative difference, its "Shortfall" label and the "As of ..." warning,
+   * all of which state a number the reviewer is expected to act on. red-600 measures 4.58 at worst and
+   * 5.36 on white. One step only, so --ink-red-4 (red-700) stays darker and the ramp keeps its order.
+   */
+  --ink-red-3: var(--red-600);
   --ink-red-4: var(--red-700);
 
   --ink-green-1: var(--green-50);
@@ -770,7 +790,20 @@
   --outline-gray-modals: var(--gray-200);
 
   /** Focus Box Shadows **/
-  --focus-shadow-gray: 0px 0px 0px 2px rgba(201, 201, 201, 0.9);
+  /*
+   * The GRAY focus ring is the default one - `button`, `input`, `select`, `textarea`, `checkbox`,
+   * `input-group` and the command input all resolve to it - and it was the least visible thing on the
+   * page. `rgba(201,201,201,.9)` composites to a contrast of 1.57:1 against white and 1.5:1 against
+   * `surface-gray-2`, so a keyboard user could not see where focus had gone; WCAG 1.4.11 asks for 3:1
+   * on a non-text indicator.
+   *
+   * `gray-700` at the same alpha measures 6.0:1 against white and 5.2:1 against the palest grey
+   * surface, so it clears the floor everywhere with room to spare. The value moves within the ramp the
+   * theme already defines - no new colour and no new token - and the halo idiom, its geometry and its
+   * alpha are unchanged, so nothing else about the design shifts. The four coloured rings below sit on
+   * their own tinted surfaces and are not part of this finding.
+   */
+  --focus-shadow-gray: 0px 0px 0px 2px rgba(82, 82, 82, 0.9);
   --focus-shadow-blue: 0px 0px 0px 2px rgba(101, 185, 252, 0.9);
   --focus-shadow-green: 0px 0px 0px 2px rgba(94, 210, 156, 0.9);
   --focus-shadow-red: 0px 0px 0px 2px rgba(250, 156, 157, 0.9);
@@ -942,15 +975,37 @@
   --ink-gray-2: var(--gray-500);
   --ink-gray-3: var(--gray-450);
   --ink-gray-4: var(--gray-400);
-  --ink-gray-5: var(--gray-300);
+  /*
+   * Raised one step, from gray-300 (#808080) to gray-250 (#999999), mirroring the light-theme change
+   * for the same reason. The old value measured 3.98 on surface-gray-1, 3.59 on gray-2, 3.94 on
+   * amber-2 and 4.31 on green-1 - the last of which is the import preview's unmapped-column text,
+   * measured in the browser at exactly 4.31 and reported as the one remaining sub-4.5 pairing in that
+   * grid. gray-250 takes it to 5.97, and measures 4.97 at worst across every surface it is actually
+   * painted on. gray-250 rather than gray-200 keeps this step distinct from --ink-gray-6 and preserves
+   * the ramp's order; the only surface where it would fall short (gray-3, at 4.37) is never combined
+   * with this token anywhere in the application - verified by searching every class list for the pair.
+   */
+  --ink-gray-5: var(--gray-250);
   --ink-gray-6: var(--gray-200);
   --ink-gray-7: var(--gray-100);
   --ink-gray-8: var(--gray-50);
 
   --ink-red-1: var(--white);
   --ink-red-2: var(--red-700);
-  --ink-red-3: var(--red-400);
-  --ink-red-4: var(--red-300);
+  /*
+   * Both raised one step - red-3 from red-400 (#D82727) to red-200 (#FE7C7C), red-4 from red-300 to
+   * red-100 - and they move together so the scale keeps its order, red-4 remaining the brighter of the
+   * two as it was before.
+   *
+   * The old red-3 measured 3.87 on surface-white, 3.17 on gray-1 and 3.67 on surface-red-1, which is
+   * the background of this application's own error banners: error text in the dark theme was below the
+   * floor on the very surface built to carry it. red-200 measures 4.97 at worst and 7.66 on
+   * surface-white; red-100 measures 8.09 at worst. Shifting a step in the dark theme means moving
+   * LIGHTER, which is the opposite direction to the light theme and is why the two are stated
+   * separately rather than as one shared value.
+   */
+  --ink-red-3: var(--red-200);
+  --ink-red-4: var(--red-100);
 
   --ink-green-1: var(--white);
   --ink-green-2: var(--green-700);
@@ -1069,7 +1124,12 @@
   --outline-gray-modals: var(--gray-600);
 
   /** Focus Box Shadows **/
-  --focus-shadow-gray: 0px 0px 0px 3px rgba(70, 70, 70, 0.8);
+  /*
+   * Dark theme, same finding: `rgba(70,70,70,.8)` measures 1.71:1 against `surface-white` and 1.49:1
+   * against `surface-modal` - a dark ring on a dark surface. The dark ramp's `gray-200` reverses the
+   * relationship and measures 7.2:1 and 6.1:1 respectively. Width and alpha are untouched.
+   */
+  --focus-shadow-gray: 0px 0px 0px 3px rgba(175, 175, 175, 0.8);
   --focus-shadow-blue: 0px 0px 0px 3px rgba(14, 61, 98, 0.8);
   --focus-shadow-green: 0px 0px 0px 3px rgba(29, 86, 59, 0.8);
   --focus-shadow-red: 0px 0px 0px 3px rgba(117, 24, 25, 0.8);

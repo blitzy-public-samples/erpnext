@@ -10,7 +10,7 @@
  *      skeleton, so `data: []` and `data: undefined` reach the SAME empty branch.
  */
 
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Provider, createStore } from 'jotai'
 import { MemoryRouter, Route, Routes, useParams } from 'react-router'
@@ -65,6 +65,7 @@ import {
 import {
 	bankRecErrorDialogAtom,
 	bankRecImportFailuresAtom,
+	bankRecUploadRefusalsAtom,
 	selectedBankAccountAtom
 } from '@/components/features/BankReconciliation/bankRecAtoms'
 import { TooltipProvider } from '@/components/ui/tooltip'
@@ -97,8 +98,16 @@ const SELECTED_BANK = makeSelectedBank()
 
 /*
  * Each row carries a slash-bearing `file` so `file.split('/').pop()` yields a real displayed name.
- * `status` uses only the two values the DocType declares; it has no third value and no error field,
- * which is why every failure state below comes from a client-side marker instead.
+ * `status` uses only the two values the DocType declares and it has no error field, so the failed state
+ * is reached two different ways and the fixtures below are shaped to keep them apart:
+ *
+ *   - a session MARKER, for an import this client attempted and the server refused. The import rolls
+ *     back, so nothing on the row records it. These fixtures carry a realistic non-zero parsed count, so
+ *     that a test asserting the marker is genuinely asserting the marker.
+ *   - a zero PARSED COUNT, for a statement the parser could make nothing of. `before_insert` runs the
+ *     detection, so a real log that is waiting to be imported always has a non-zero count and a count of
+ *     zero means detection found nothing at all. Derived from the row, so it needs no marker and cannot
+ *     be lost to a reload.
  */
 
 const COMPLETED_LOG = makeBankStatementImportLog({
@@ -119,7 +128,10 @@ const NOT_STARTED_LOG = makeBankStatementImportLog({
 	creation: '2024-02-14 09:05:11.000000',
 	start_date: undefined,
 	end_date: undefined,
-	number_of_transactions: 0,
+	// A statement whose rows parsed but whose DATE column has not been mapped, so it has transactions to
+	// import and no date range to show. Non-zero on purpose: this is the fixture for "waiting", and a
+	// real waiting log always has rows.
+	number_of_transactions: 12,
 	closing_balance: 0
 })
 
@@ -130,7 +142,8 @@ const FAILED_LOG = makeBankStatementImportLog({
 	creation: '2024-03-12 08:15:42.000000',
 	start_date: '2024-03-01',
 	end_date: '2024-03-31',
-	number_of_transactions: 0,
+	// Non-zero, so this row's failed state can only come from the marker.
+	number_of_transactions: 31,
 	closing_balance: 0
 })
 
@@ -141,6 +154,22 @@ const INDETERMINATE_LOG = makeBankStatementImportLog({
 	creation: '2024-04-08 16:42:03.000000',
 	start_date: '2024-04-01',
 	end_date: '2024-04-30',
+	// Non-zero, so this row's failed state can only come from the marker.
+	number_of_transactions: 17,
+	closing_balance: 0
+})
+
+/**
+ * A statement the parser could read as a file but found no transactions in. NO marker: this is the
+ * durable half of the indicator, and the point of it is that it needs nothing remembered.
+ */
+const UNPARSED_LOG = makeBankStatementImportLog({
+	name: 'BSIL-2024-00005',
+	file: '/files/not-really-a-statement.csv',
+	status: 'Not Started',
+	creation: '2024-05-02 11:20:00.000000',
+	start_date: undefined,
+	end_date: undefined,
 	number_of_transactions: 0,
 	closing_balance: 0
 })
@@ -164,6 +193,7 @@ interface ImporterScenario {
 	logs?: BankStatementImportLog[]
 	listError?: FrappeErrorFixture
 	markers?: Record<string, FrappeError>
+	store?: ReturnType<typeof createStore>
 	dialogError?: FrappeErrorFixture
 	uploadError?: FrappeErrorFixture
 	/**
@@ -265,7 +295,13 @@ const renderImporter = ({
 	uploadError,
 	projectQueriedFieldsOnly = false,
 	withSelectedBank = true,
-	selectedBank = SELECTED_BANK
+	selectedBank = SELECTED_BANK,
+	/**
+	 * Mount on an EXISTING store instead of a fresh one, which is what lets a test remount the page the
+	 * way a reload does: session-backed atoms keep their values, while every hook and every open modal
+	 * starts over.
+	 */
+	store: existingStore
 }: ImporterScenario = {}) => {
 	if (projectQueriedFieldsOnly) {
 		installProjectedImportLogQuery(logs ?? [])
@@ -277,7 +313,7 @@ const renderImporter = ({
 		installFileUploadError(uploadError)
 	}
 
-	const store = createStore()
+	const store = existingStore ?? createStore()
 
 	if (withSelectedBank) {
 		store.set(selectedBankAccountAtom, selectedBank)
@@ -363,10 +399,22 @@ const chooseStatementFile = async (container: HTMLElement, file: File): Promise<
 	await userEvent.upload(input, file)
 }
 
+/*
+ * `lastModified` is pinned rather than left to default, because the default is `Date.now()` at
+ * construction time - so two `File` objects built from the same statement would differ, which a real
+ * file picked twice from disk does not. The per-file failure marker is keyed on name + size +
+ * modification time precisely so that a CORRECTED file starts clean while the same file re-selected
+ * keeps its answer, and that distinction is untestable if every construction is a different file.
+ */
+const STATEMENT_LAST_MODIFIED = Date.UTC(2024, 0, 15, 9, 30)
+
 const csvStatementFile = (
 	name = 'hdfc-statement-jan-2024.csv',
 	rows = '2024-01-15,NEFT credit,12500'
-): File => new File([`Date,Description,Amount\n${rows}\n`], name, { type: 'text/csv' })
+): File => new File([`Date,Description,Amount\n${rows}\n`], name, {
+	type: 'text/csv',
+	lastModified: STATEMENT_LAST_MODIFIED
+})
 
 describe('BankStatementImporter', () => {
 
@@ -390,6 +438,15 @@ describe('BankStatementImporter', () => {
 			renderImporter({ logs: ALL_LOGS })
 
 			expect(screen.getByText('Previous Imports')).toBeInTheDocument()
+
+			/*
+			 * Level 2, not 3. The four bank cards are `div[role="button"]`, and ARIA treats a button's
+			 * subtree as presentational - so the level-2 heading inside each card is dropped from the
+			 * accessibility tree entirely. Measured on this route, the AT-facing outline therefore ran
+			 * h1 -> h3 with nothing at level 2, because the only level-2 headings were the discarded ones.
+			 * This is the heading that closes the gap, so its level is pinned here.
+			 */
+			expect(screen.getByRole('heading', { name: 'Previous Imports', level: 2 })).toBeInTheDocument()
 
 			// Scoped to the table, because the bank picker renders a link of its own when the
 			// account list is empty — a document-wide link query would collect that too.
@@ -416,11 +473,25 @@ describe('BankStatementImporter', () => {
 			// keyboard path at all: no focusable element in the row led to it.
 			renderImporter({ logs: [COMPLETED_LOG] })
 
+			/*
+			 * Addressed by a name that includes the FILE, not the date alone. Ten imports made on one day
+			 * produced ten links all reading the same date, so a screen-reader user listing the page's
+			 * links heard one name ten times, with the distinguishing detail sitting in cells they were
+			 * not reading.
+			 */
 			const dateLink = screen.getByRole('link', {
-				name: displayedDate(COMPLETED_LOG)
+				name: `${displayedDate(COMPLETED_LOG)} - open import of hdfc-statement-jan-2024.csv`
 			})
 
 			expect(dateLink).toHaveAttribute('href', `${IMPORTER_ROUTE}/${COMPLETED_LOG.name}`)
+
+			/*
+			 * The VISIBLE label is still just the date, and the accessible name still contains it - which
+			 * is the rule that lets someone speak the label they can see and reach the right control. An
+			 * `aria-label` that replaced the date rather than extending it would break that.
+			 */
+			expect(dateLink).toHaveTextContent(displayedDate(COMPLETED_LOG))
+			expect(dateLink.getAttribute('aria-label')).toContain(displayedDate(COMPLETED_LOG))
 		})
 
 		it('keeps the filename readable rather than letting it stretch the row', () => {
@@ -721,6 +792,43 @@ describe('BankStatementImporter', () => {
 			expect(badge).toHaveAttribute('data-theme', 'gray')
 			expect(badge).toHaveTextContent('Not Started')
 			expect(badge).not.toHaveTextContent('Failed')
+		})
+
+		/*
+		 * The DURABLE half of the indicator, and the one FM2 was actually failing on.
+		 *
+		 * A statement whose rows the parser could make nothing of is inserted with zero transactions and
+		 * left at `Not Started` - so it used to be listed in neutral grey, visually identical to a
+		 * statement nobody had got round to importing, and it read that way again after a reload, in a new
+		 * tab, and for a different reviewer. Nothing was remembered because nothing was recorded. Derived
+		 * from the row instead, this needs no marker at all and cannot be lost.
+		 */
+		it('marks a log that parsed no transactions as Failed, with no marker at all', () => {
+			const { store } = renderImporter({ logs: [UNPARSED_LOG] })
+
+			const badge = statusBadgeIn(rowFor(UNPARSED_LOG))
+
+			expect(badge).toHaveAttribute('data-theme', 'red')
+			expect(badge).toHaveTextContent('Failed')
+			// Nothing was remembered to produce that: it is read off what the server returned.
+			expect(store.get(bankRecImportFailuresAtom)).toEqual({})
+		})
+
+		it('still reports a COMPLETED log as completed even if it imported nothing', () => {
+			// The server's own answer outranks anything derived. A completed import of an empty statement
+			// is a completed import, not a failure.
+			const completedButEmpty = makeBankStatementImportLog({
+				name: 'BSIL-2024-00006',
+				file: '/files/empty-but-imported.csv',
+				status: 'Completed',
+				number_of_transactions: 0
+			})
+
+			renderImporter({ logs: [completedButEmpty] })
+
+			const badge = statusBadgeIn(rowFor(completedButEmpty))
+			expect(badge).toHaveAttribute('data-theme', 'green')
+			expect(badge).toHaveTextContent('Completed')
 		})
 
 		it('marks a log the server refused as Failed', () => {
@@ -1124,6 +1232,118 @@ describe('BankStatementImporter', () => {
 
 			expect(screen.getByText('hdfc-statement-jan-2024.csv')).toBeInTheDocument()
 			expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
+		})
+
+		/*
+		 * A disabled Upload button, on its own, is a control that refuses without saying why - and to a
+		 * screen reader it is simply "unavailable". So the unmet prerequisites are named in text and tied
+		 * to the button by `aria-describedby`, which is what makes the reason reach the reviewer with the
+		 * control rather than have to be hunted for.
+		 */
+		it('says what upload is still waiting for, and ties the reason to the button', async () => {
+			const { container } = renderImporter({ logs: [] })
+
+			const upload = screen.getByRole('button', { name: 'Upload' })
+			const requirementsId = upload.getAttribute('aria-describedby')
+
+			expect(requirementsId).toBeTruthy()
+			const requirements = document.getElementById(requirementsId!)
+			expect(requirements).not.toBeNull()
+			expect(requirements).toHaveTextContent('Bank Statement')
+
+			// Once the last prerequisite is met the reason goes with it, rather than lingering as advice
+			// about a form that is now complete.
+			await chooseStatementFile(container, csvStatementFile())
+
+			expect(screen.getByRole('button', { name: 'Upload' })).not.toHaveAttribute('aria-describedby')
+			expect(document.getElementById(requirementsId!)).toBeNull()
+		})
+
+		it('names the account as outstanding when no account has been chosen', () => {
+			renderImporter({ logs: [], withSelectedBank: false })
+
+			const upload = screen.getByRole('button', { name: 'Upload' })
+			const requirements = document.getElementById(upload.getAttribute('aria-describedby')!)
+
+			expect(requirements).toHaveTextContent('Bank Account')
+			expect(requirements).toHaveTextContent('Bank Statement')
+		})
+
+		/*
+		 * The supported-format prose is DERIVED from the dropzone's own accept map, because the two had
+		 * drifted: the copy said "CSV, XLSX and PDF" while the map has always also accepted `.xls`, so a
+		 * reviewer holding a perfectly importable `.xls` statement was told the app would not take it.
+		 */
+		it('names every format the dropzone actually accepts, XLS included', () => {
+			renderImporter({ logs: [] })
+
+			expect(
+				screen.getByText(/We support CSV, XLSX, XLS and PDF files\./)
+			).toBeInTheDocument()
+		})
+
+		/*
+		 * An empty statement is refused HERE, without asking, because the server's answer to it is worse
+		 * than no answer: Frappe's `File.before_insert` reads the bytes off disk and raises `OSError` for a
+		 * zero-length file, which arrives as an HTTP 500 with a Python traceback and no import log - a
+		 * crash shown to a reviewer whose mistake was picking the wrong file, and no record afterwards
+		 * that an attempt was ever made.
+		 */
+		describe('an empty statement file', () => {
+
+			const emptyStatementFile = (name = 'empty-statement.csv') =>
+				new File([], name, { type: 'text/csv', lastModified: STATEMENT_LAST_MODIFIED })
+
+			it('is refused without a request being made at all', async () => {
+				const { container } = renderImporter({ logs: [] })
+				await chooseStatementFile(container, emptyStatementFile())
+
+				await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+				// No upload, no document creation - so no 500 and nothing left behind on the server.
+				expect(frappeFileUpload).not.toHaveBeenCalled()
+				expect(frappeCreateDoc).not.toHaveBeenCalled()
+			})
+
+			it('says why, in the shared dismissible dialog', async () => {
+				const { container } = renderImporter({ logs: [] })
+				await chooseStatementFile(container, emptyStatementFile())
+
+				await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+				const dialog = await screen.findByRole('alertdialog')
+				expect(within(dialog).getByText(/empty-statement\.csv is empty/)).toBeInTheDocument()
+				expect(within(dialog).getByRole('button', { name: 'Dismiss' })).toBeInTheDocument()
+			})
+
+			it('records the refusal against the file, so it outlives the dialog', async () => {
+				const { container, store } = renderImporter({ logs: [] })
+				await chooseStatementFile(container, emptyStatementFile())
+
+				await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+				await userEvent.click(await screen.findByRole('button', { name: 'Dismiss' }))
+				await waitFor(() => {
+					expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+				})
+
+				const recorded = Object.values(store.get(bankRecUploadRefusalsAtom))
+				expect(recorded).toHaveLength(1)
+				expect(recorded[0].fileName).toBe('empty-statement.csv')
+				// And it is on the page, not only in the store.
+				expect(screen.getByText(/empty-statement\.csv was refused/)).toBeInTheDocument()
+			})
+
+			it('lets a non-empty statement through untouched', async () => {
+				const createdLog = makeBankStatementImportLog({ name: 'BSIL-2024-00042' })
+				frappeFileUpload.mockResolvedValue(makeFileUploadResponse())
+				frappeCreateDoc.mockResolvedValue(createdLog)
+
+				const { container } = renderImporter({ logs: [] })
+				await chooseStatementFile(container, csvStatementFile())
+				await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+				expect(await screen.findByText(detailViewFor(createdLog.name))).toBeInTheDocument()
+			})
 		})
 
 		it('opens the new import log once the server has created it', async () => {
@@ -1586,13 +1806,22 @@ describe('BankStatementImporter', () => {
 		 */
 		describe('marks the refused file on the form itself', () => {
 
+			/*
+			 * The indicator for the file currently CHOSEN, as distinct from the session list of other
+			 * refusals below it. Both use the same red badge - one failure reads the same way wherever it
+			 * is shown - so they are told apart structurally: the session list is a `ul`, this is not.
+			 */
 			const failureIndicator = (): HTMLElement | null => {
 				const badge = screen
 					.queryAllByText('Failed')
-					.find((node) => node.getAttribute('data-slot') === 'badge')
+					.find((node) => node.getAttribute('data-slot') === 'badge' && !node.closest('li'))
 
 				return badge?.parentElement ?? null
 			}
+
+			/** The session list of files refused OTHER than the one currently chosen. */
+			const sessionRefusalList = (): HTMLElement | null =>
+				screen.queryByText('Other files refused in this session')?.parentElement ?? null
 
 			it('names the file it refused, so the marker is about that file and not the form', async () => {
 				await refuseCreation()
@@ -1622,7 +1851,20 @@ describe('BankStatementImporter', () => {
 				expect(failureIndicator()).toBeNull()
 			})
 
-			it('retires when a different file is chosen, because it described the old one', async () => {
+			/*
+			 * Choosing another file MOVES the record; it does not destroy it.
+			 *
+			 * This is the half of FM2 that the previous behaviour lost. The marker was component state
+			 * cleared on any change of selection, so a reviewer working through several statements - which
+			 * is the ordinary way this screen is used - answered the question "which of these failed?" by
+			 * doing the one thing that erased the answer. Nothing on the server records it either: no
+			 * import log was created, so there is no row to badge and nothing for the list on the right to
+			 * report. If the form does not carry it, it is gone.
+			 *
+			 * So the indicator now follows the FILE. The newly chosen file gets a clean form, and the
+			 * refused one is listed among the session's other refusals.
+			 */
+			it('moves the record to the session list when a different file is chosen, rather than erasing it', async () => {
 				const { container } = await refuseCreation()
 
 				// Dismissed first because the modal is genuinely modal: Radix takes pointer events off the
@@ -1631,15 +1873,82 @@ describe('BankStatementImporter', () => {
 				await waitFor(() => {
 					expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
 				})
-				expect(failureIndicator()).not.toBeNull()
+				expect(failureIndicator()).toHaveTextContent('hdfc-statement-jan-2024.csv')
 
 				await chooseStatementFile(container, csvStatementFile('barclays-statement-feb-2024.csv'))
 
+				// The newly chosen file carries no refusal of its own...
 				expect(failureIndicator()).toBeNull()
+				// ...and the refused one is still accounted for, by name, in the session list.
+				const sessionList = sessionRefusalList()
+				expect(sessionList).not.toBeNull()
+				expect(sessionList).toHaveTextContent('hdfc-statement-jan-2024.csv')
+				expect(sessionList).toHaveTextContent('Failed')
 			})
 
-			it('retires the moment a retry is dispatched, rather than lingering over it', async () => {
-				await refuseCreation()
+			it('re-shows the refusal if the very same file is chosen again', async () => {
+				const { container } = await refuseCreation()
+
+				await userEvent.click(await screen.findByRole('button', { name: 'Dismiss' }))
+				await waitFor(() => {
+					expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+				})
+
+				await chooseStatementFile(container, csvStatementFile('barclays-statement-feb-2024.csv'))
+				expect(failureIndicator()).toBeNull()
+
+				// Same name, same size, same modification time - so the same file, and the same answer.
+				await chooseStatementFile(container, csvStatementFile())
+
+				expect(failureIndicator()).toHaveTextContent('hdfc-statement-jan-2024.csv')
+				expect(failureIndicator()).toHaveTextContent('nothing was imported from it')
+			})
+
+			it('survives a remount, which a reload is, because the record is not component state', async () => {
+				const { store, container } = await refuseCreation()
+
+				await userEvent.click(await screen.findByRole('button', { name: 'Dismiss' }))
+				await waitFor(() => {
+					expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+				})
+
+				const persisted = store.get(bankRecUploadRefusalsAtom)
+				expect(Object.values(persisted)).toHaveLength(1)
+				expect(Object.values(persisted)[0].fileName).toBe('hdfc-statement-jan-2024.csv')
+
+				/*
+				 * Mount the page again on the same store, which is what a reload amounts to: session-backed
+				 * atoms keep their values while everything else starts over. The create hook's error has to
+				 * be cleared explicitly, because this harness makes it a standing value rather than one
+				 * that lives and dies with a request - a real reload gives every hook a fresh, empty state,
+				 * and the whole point of this test is that the persisted record is then the ONLY thing left
+				 * that knows the file was refused.
+				 */
+				frappeSDKMock.useFrappeCreateDoc.mockImplementation(() => ({
+					createDoc: frappeCreateDoc,
+					loading: false,
+					error: null,
+					isCompleted: false,
+					reset: () => undefined
+				}))
+				cleanup()
+				const remounted = renderImporter({ logs: [], store })
+				await chooseStatementFile(remounted.container, csvStatementFile())
+
+				expect(failureIndicator()).toHaveTextContent('hdfc-statement-jan-2024.csv')
+				expect(screen.getByRole('alert')).toHaveTextContent(REFUSAL)
+				expect(container.isConnected).toBe(false)
+			})
+
+			/*
+			 * A retry in flight is not a failure, so nothing calls it one while it is running - but the
+			 * record is SUPPRESSED for the duration rather than deleted, which is the difference between
+			 * "not asserting failure over an unfinished attempt" and "losing the only evidence there was".
+			 * If the retry also fails, the record is simply written again; if it succeeds, the form
+			 * unmounts and the question is moot.
+			 */
+			it('stops describing the file as failed while a retry is in flight, without losing the record', async () => {
+				const { store } = await refuseCreation()
 				await screen.findByRole('alertdialog')
 				expect(failureIndicator()).not.toBeNull()
 
@@ -1650,9 +1959,7 @@ describe('BankStatementImporter', () => {
 
 				/*
 				 * A retry that never settles. Asserting against a SUCCESSFUL retry would prove nothing
-				 * here, because success navigates away and unmounts the whole form - the marker would be
-				 * gone whether the dispatch cleared it or not. Leaving the retry in flight is what pins
-				 * the actual behaviour: the marker is retired when the attempt goes out.
+				 * here, because success navigates away and unmounts the whole form.
 				 */
 				frappeCreateDoc.mockReset()
 				frappeCreateDoc.mockReturnValue(new Promise(() => undefined))
@@ -1662,6 +1969,9 @@ describe('BankStatementImporter', () => {
 				await waitFor(() => {
 					expect(failureIndicator()).toBeNull()
 				})
+				// Off the screen, still in the store: the attempt has not concluded, so nothing about the
+				// previous one has been disproved.
+				expect(Object.values(store.get(bankRecUploadRefusalsAtom))).toHaveLength(1)
 				expect(screen.queryByText(new RegExp(DETAIL_SENTINEL))).not.toBeInTheDocument()
 			})
 

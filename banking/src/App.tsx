@@ -9,6 +9,7 @@ import { LucideProvider } from 'lucide-react'
 import { ThemeProvider } from './components/ui/theme-provider'
 import ErrorBoundary from '@/components/common/ErrorBoundary'
 import AppRenderFailure from '@/components/common/AppRenderFailure'
+import { SkipToContent } from '@/components/common/PageShell'
 
 const BankStatementImporter = lazy(() => import('@/pages/BankStatementImporter'))
 const ViewBankStatementImportLog = lazy(() => import('@/pages/ViewBankStatementImportLog'))
@@ -54,6 +55,10 @@ function App() {
 							 */
 							<ErrorBoundary label="Banking app root" fallback={<AppRenderFailure />}>
 								<BrowserRouter basename={import.meta.env.VITE_BASE_NAME ? `/${import.meta.env.VITE_BASE_NAME}` : ''}>
+									{/* First focusable element in the document, so it is the first Tab stop on every
+									    route. Mounted here rather than per page because it must precede the header
+									    each page renders, and because one document has one skip target. */}
+									<SkipToContent />
 									<Routes>
 										<Route index element={<BankReconciliation />} />
 										<Route path="/statement-importer" element={<BankStatementImporterContainer />}>

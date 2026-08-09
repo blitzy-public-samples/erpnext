@@ -13,7 +13,11 @@ from frappe.utils import add_days, add_to_date, getdate, today
 from erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool import (
 	auto_reconcile_vouchers,
 	clear_clearing_date,
+	create_bulk_bank_entry_and_reconcile,
+	create_bulk_internal_transfer,
 	create_bulk_payment_entry_and_reconcile,
+	create_journal_entry_bts,
+	create_payment_entry_bts,
 	filter_permitted_vouchers,
 	get_account_balance,
 	get_auto_reconcile_message,
@@ -1039,6 +1043,71 @@ class TestBankReconciliationTool(ERPNextTestSuite, AccountsTestMixin):
 		self.assertEqual(bank_transaction.payment_entries, [])
 		self.assertEqual(bank_transaction.status, "Unreconciled")
 		self.assertEqual(bank_transaction.unallocated_amount, 100)
+
+	def test_voucher_creation_refuses_an_unknown_transaction(self):
+		"""
+		Each of these four endpoints resolved the caller's transaction name with a bare row lookup and then
+		used the result without checking it - two indexed `frappe.db.get_values(...)[0]`, which raises
+		`IndexError` on an empty list, and two attribute reads on a `frappe.db.get_value` result that is
+		`None` when nothing matched, which raise `AttributeError`. Either way an unknown name became an
+		HTTP 500 with a traceback, for what is only a caller naming something that is not there.
+
+		`DoesNotExistError` is asserted rather than a generic validation error, because these endpoints must
+		answer 404 like their siblings that resolve the same record through `frappe.get_doc`: the same
+		mistake should get the same status whichever endpoint hears it.
+		"""
+		unknown = "ACC-BTN-does-not-exist"
+
+		self.assertRaises(frappe.DoesNotExistError, create_journal_entry_bts, bank_transaction_name=unknown)
+		self.assertRaises(frappe.DoesNotExistError, create_payment_entry_bts, bank_transaction_name=unknown)
+		self.assertRaises(
+			frappe.DoesNotExistError,
+			create_bulk_internal_transfer,
+			bank_transaction_names=[unknown],
+			bank_account=self.bank_account,
+		)
+		self.assertRaises(
+			frappe.DoesNotExistError,
+			create_bulk_bank_entry_and_reconcile,
+			bank_transactions=[unknown],
+			account=self.bank,
+		)
+
+	def test_the_refusal_names_the_transaction_that_was_not_found(self):
+		# In a BULK call the bad name may be one entry among many, so an answer that only says "not found"
+		# leaves the caller to work out which one. Asserted on the message, not just the exception class.
+		frappe.clear_messages()
+
+		self.assertRaises(
+			frappe.DoesNotExistError,
+			create_bulk_internal_transfer,
+			bank_transaction_names=["ACC-BTN-nope-77"],
+			bank_account=self.bank_account,
+		)
+
+		messages = " ".join(str(entry.get("message", "")) for entry in frappe.get_message_log())
+		self.assertIn("ACC-BTN-nope-77", messages)
+
+	def test_get_linked_payments_refuses_an_absent_document_type_filter(self):
+		"""
+		`document_types` carries a default of `None`, but every path below it treats it as required: the
+		candidate query set is assembled from membership tests against it, so `None` reached
+		`check_matching` and raised `TypeError: argument of type 'NoneType' is not iterable`.
+
+		It is refused rather than defaulted on purpose. Inventing a document-type set would return a
+		DIFFERENT set of candidate vouchers than the caller asked for, and on a reconciliation screen a
+		quietly wrong answer is worse than being told what was missing.
+		"""
+		bank_transaction = self.make_bank_transaction(date=today())
+
+		self.assertRaises(
+			frappe.ValidationError,
+			get_linked_payments,
+			bank_transaction_name=bank_transaction.name,
+		)
+
+		# The ordinary call still answers, so the refusal above is about the missing filter and nothing else.
+		self.assertIsInstance(get_linked_payments(bank_transaction.name, ["payment_entry"]), list)
 
 	def test_validate_vouchers_to_reconcile_accepts_a_permitted_voucher(self):
 		# Every refusal above is only meaningful if the validator passes the ordinary case, so this

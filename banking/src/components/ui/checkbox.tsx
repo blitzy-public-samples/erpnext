@@ -2,7 +2,7 @@ import * as React from "react"
 import { CheckIcon } from "lucide-react"
 import { Checkbox as CheckboxPrimitive } from "radix-ui"
 
-import { cn } from "@/lib/utils"
+import { cn, TARGET_MIN_SIZE } from "@/lib/utils"
 
 function Checkbox({
   className,
@@ -27,6 +27,12 @@ function Checkbox({
         // Invalid state
         "aria-invalid:border-red-500",
         size === "sm" ? "size-3.5" : "size-4",
+        /*
+         * The box paints at 14px (`sm`) or 16px (`md`), which is the design's size and is kept, so
+         * the pointer target is grown to the 24x24 minimum with a transparent centred pseudo-element
+         * instead. See TARGET_MIN_SIZE.
+         */
+        TARGET_MIN_SIZE,
         className
       )}
       {...props}

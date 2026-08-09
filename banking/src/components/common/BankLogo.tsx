@@ -2,7 +2,7 @@ import { cn } from '@/lib/utils'
 import { SelectedBank } from '../features/BankReconciliation/bankRecAtoms'
 import { useTheme } from '../ui/theme-provider'
 import { Landmark } from 'lucide-react'
-import { H4 } from '../ui/typography'
+import { H2 } from '../ui/typography'
 
 const BankLogo = ({ bank, className, imageClassName, iconSize = '18px', iconClassName }: { bank?: SelectedBank | null, className?: string, imageClassName?: string, iconSize?: string, iconClassName?: string }) => {
 
@@ -16,8 +16,15 @@ const BankLogo = ({ bank, className, imageClassName, iconSize = '18px', iconClas
             }, bank.logoClassName)}
         /> : <>
             <Landmark size={iconSize} className={iconClassName} />
-            <H4 className={cn("text-xs -mb-0.5", {
-            })}>{bank?.bank ?? ''}</H4>
+            {/*
+                A level-TWO heading, not four. The page's only `h1` is its title, so an `h4` here made
+                every route's outline jump h1 -> h4 with nothing between, which is what both axe and
+                Lighthouse flagged. `border-0 p-0` strips the H2 primitive's decorative underline and
+                padding - the convention already used elsewhere in this codebase - so the rendered
+                heading is pixel-identical to before.
+            */}
+            <H2 className={cn("text-xs -mb-0.5 border-0 p-0", {
+            })}>{bank?.bank ?? ''}</H2>
         </>
         }</div>
     )

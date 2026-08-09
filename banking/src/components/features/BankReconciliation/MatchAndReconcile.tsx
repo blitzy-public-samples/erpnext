@@ -1,13 +1,12 @@
 import { useAtom, useAtomValue, useSetAtom } from "jotai"
 import { bankRecAmountFilter, bankRecDateAtom, bankRecLastRefusalAtom, bankRecRecordJournalEntryModalAtom, bankRecRecordPaymentModalAtom, bankRecSelectedTransactionsAtom, bankRecTransactionTypeFilter, bankRecTransferModalAtom, selectedBankAccountAtom, selectedTransactionScopeKey } from "./bankRecAtoms"
-import { H4 } from "@/components/ui/typography"
+import { H2 } from "@/components/ui/typography"
 import { useEffect, useMemo, useRef, useState } from "react"
 import { useAvailableHeight } from "@/hooks/use-available-height"
 import { getCompanyCurrency } from "@/lib/company"
 import ErrorBanner from "@/components/ui/error-banner"
 import { Separator } from "@/components/ui/separator"
-import Fuse from 'fuse.js'
-import { getSearchResults, LinkedPayment, TransactionDirection, UnreconciledTransaction, useGetRuleForTransaction, useGetUnreconciledTransactions, useGetVouchersForTransaction, useIsTransactionWithdrawal, useReconcileTransaction, useSelectedBankAccountCurrency, useTransactionSearch } from "./utils"
+import { createTransactionSearchIndex, getSearchResults, LinkedPayment, TransactionDirection, UnreconciledTransaction, useGetRuleForTransaction, useGetUnreconciledTransactions, useGetVouchersForTransaction, useIsTransactionWithdrawal, useReconcileTransaction, useSelectedBankAccountCurrency, useTransactionSearch } from "./utils"
 import { Input } from "@/components/ui/input"
 import { AlertCircleIcon, ArrowDownRight, ArrowRightIcon, ArrowRightLeft, ArrowUpRight, BadgeCheck, ChevronDown, DollarSign, Landmark, LandmarkIcon, ListIcon, Loader2, MinusIcon, Receipt, ReceiptIcon, Search, User, XCircle, ZapIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -63,13 +62,21 @@ const MatchAndReconcile = ({ contentHeight }: { contentHeight: number }) => {
             instead. */}
         <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:gap-2" >
             <div className="flex-1 min-w-0">
-                <H4 className="text-sm font-medium">{_("Unreconciled Transactions")}</H4>
+                {/*
+                    A level-TWO heading, not four. The document's only `h1` is the page title, so an `h4`
+                    here made the outline jump from h1 straight to h4 with no h2 or h3 between - and the
+                    heading outline is how a screen-reader user understands a page's shape. `border-0 p-0`
+                    removes the H2 primitive's own decorative underline and padding, the convention this
+                    codebase's other headings already use, so the rendered result is unchanged: size,
+                    weight and margins all come from the same overrides as before.
+                */}
+                <H2 className="text-sm font-medium border-0 p-0">{_("Unreconciled Transactions")}</H2>
                 <UnreconciledTransactions />
             </div>
             <Separator orientation="vertical" className="hidden xl:block" style={{ minHeight: `${contentHeight}px` }} />
             <Separator orientation="horizontal" className="xl:hidden" />
             <div className="flex-1 min-w-0 xl:px-1">
-                <H4 className="text-sm font-medium">{_("Match or Create")}</H4>
+                <H2 className="text-sm font-medium border-0 p-0">{_("Match or Create")}</H2>
                 <VouchersSection contentHeight={contentHeight} />
             </div>
         </div>
@@ -165,11 +172,7 @@ const UnreconciledTransactions = () => {
             return null
         }
 
-        return new Fuse(unreconciledTransactions.message, {
-            keys: ['description', 'reference_number'],
-            threshold: 0.5,
-            includeScore: true
-        })
+        return createTransactionSearchIndex(unreconciledTransactions.message)
     }, [unreconciledTransactions])
 
     const results = useMemo(() => {
@@ -1187,7 +1190,15 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
 
     }, [voucher, selectedTransaction, index])
 
-    const { reconcileTransaction, loading } = useReconcileTransaction()
+    /*
+     * Two flags, and the difference is the fix. `loading` belongs to THIS row's own hook instance, so it
+     * is what shows the spinner on the button that was actually clicked. `reconcileInFlight` is shared
+     * across every candidate row, so it is what disables all of them - including the siblings - while a
+     * post is outstanding. Before it existed, only the clicked button went disabled and every other
+     * candidate for the same transaction stayed live for the whole round trip.
+     */
+    const { reconcileTransaction, loading, reconcileInFlight } = useReconcileTransaction()
+    const isPosting = reconcileInFlight !== null
 
     /*
      * The already-reconciled guard mirrors the server's own predicate rather than inventing one:
@@ -1210,10 +1221,16 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
         reconcileTransaction(selectedTransaction[0], voucher)
     }
 
+    const disabledReason = isAlreadyReconciled
+        ? _("This bank transaction is already fully reconciled, so it cannot be reconciled again.")
+        : isPosting && !loading
+            ? _("A reconciliation is being posted for this transaction. Wait for it to finish before choosing a different match.")
+            : null
+
     const reconcileButton = <Button
         variant={isSuggested || amountMatches ? "solid" : "outline"}
         theme={isSuggested || amountMatches ? "green" : "gray"}
-        onClick={onClick} disabled={loading || isAlreadyReconciled}>{loading ? <><Loader2 className="w-4 h-4 animate-spin" /> {_("Reconciling")}...</> : `${_("Reconcile")}`}</Button>
+        onClick={onClick} disabled={isPosting || isAlreadyReconciled}>{loading ? <><Loader2 className="w-4 h-4 animate-spin" /> {_("Reconciling")}...</> : `${_("Reconcile")}`}</Button>
 
     return <div className="py-1 px-1">
         <div
@@ -1278,15 +1295,22 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
                     {/* A disabled control emits no pointer or focus events, so the reason is anchored to a
                         focusable wrapper span rather than to the Button, keeping it discoverable by mouse
                         and keyboard alike. The provider that wraps the match badges above has already
-                        closed, so this subtree needs its own. */}
-                    {isAlreadyReconciled
+                        closed, so this subtree needs its own.
+
+                        Two reasons can disable this button and they need different words. Already-reconciled
+                        is a property of the transaction and is not going to change by waiting; a post in
+                        flight is transient and belongs to a DIFFERENT candidate, which is exactly the case
+                        that used to be silent - the clicked button says "Reconciling..." for itself, but its
+                        siblings went from live to disabled with nothing explaining why. The clicked button
+                        needs no tooltip of its own, hence the `!loading` test. */}
+                    {disabledReason
                         ? <TooltipProvider>
                             <Tooltip>
                                 <TooltipTrigger asChild>
                                     <span tabIndex={0} className="inline-flex rounded outline-none focus-visible:shadow-focus-gray">{reconcileButton}</span>
                                 </TooltipTrigger>
                                 <TooltipContent side="top" align="end" className="max-w-sm text-balance wrap-break-word">
-                                    {_("This bank transaction is already fully reconciled, so it cannot be reconciled again.")}
+                                    {disabledReason}
                                 </TooltipContent>
                             </Tooltip>
                         </TooltipProvider>
@@ -1303,12 +1327,22 @@ const VoucherItem = ({ voucher, index }: { voucher: LinkedPayment, index: number
 }
 
 
+/**
+ * The per-voucher match indicator.
+ *
+ * `label` is the full explanation - it was already being passed and shown in the tooltip, and it is now
+ * also the trigger's accessible name. Without it this was the single largest accessibility defect on the
+ * workbench by count: a `TooltipTrigger` renders a focusable button and contributes no name of its own,
+ * so two of the three states put nothing but an icon inside it and around 180 buttons on a populated
+ * screen announced themselves as an unlabelled "button". Tooltip text does not help, because a tooltip
+ * is shown on hover or focus and is not part of the trigger's name.
+ */
 const MatchBadge = ({ matchType, label }: { matchType: 'full' | 'partial' | 'none', label: string }) => {
     return <Tooltip>
-        <TooltipTrigger>
-            {matchType === 'full' ? <BadgeCheck className="text-ink-white fill-surface-green-5 size-4" /> : matchType === 'partial' ?
-                <Badge theme="orange" variant="subtle">{_("Partial Match")}</Badge> :
-                <XCircle className="text-ink-red-4 size-4" />}
+        <TooltipTrigger aria-label={label}>
+            {matchType === 'full' ? <BadgeCheck aria-hidden="true" className="text-ink-white fill-surface-green-5 size-4" /> : matchType === 'partial' ?
+                <Badge theme="orange" variant="subtle" aria-hidden="true">{_("Partial Match")}</Badge> :
+                <XCircle aria-hidden="true" className="text-ink-red-4 size-4" />}
         </TooltipTrigger>
         <TooltipContent>
             {label}

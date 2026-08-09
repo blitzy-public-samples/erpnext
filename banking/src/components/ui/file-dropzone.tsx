@@ -97,16 +97,40 @@ export const FileDropzone = ({ files, setFiles, accept, multiple = true, onDrop,
             /* The drag state is exposed as data rather than inferred from classes, so it can be asserted. */
             data-drag-state={isDragReject ? 'reject' : isDragAccept ? 'accept' : isDragActive ? 'active' : 'idle'}
             className={cn(
-                'border border-outline-gray-2 border-dashed p-4 rounded bg-surface-gray-1 focus-within:bg-surface-gray-2 hover:bg-surface-gray-2 hover:border-outline-gray-3 focus-within:border-outline-gray-3 focus-within:outline-none',
+                'border border-outline-gray-2 border-dashed p-4 rounded bg-surface-gray-1 focus-within:bg-surface-gray-2 hover:bg-surface-gray-2 hover:border-outline-gray-3 focus-within:border-outline-gray-3',
+                /*
+                 * A VISIBLE focus indicator, which this had none of.
+                 *
+                 * The input inside is `sr-only`-scale and invisible, so the dropzone as a whole is what
+                 * receives focus in the reviewer's eyes - yet the only focus treatment was a background
+                 * and border tint one step along the same grey ramp, which is not perceivable as focus.
+                 * `focus-within:outline-none` then actively removed the browser's own ring, so a
+                 * keyboard user tabbing through the upload form had nothing at all to tell them they had
+                 * reached the file picker.
+                 *
+                 * `outline-gray-5` rather than the `shadow-focus-*` ring used elsewhere: that token is a
+                 * pale 2px halo (measured 1.66:1 against the light surface) and would not meet the 3:1
+                 * floor for a non-text indicator on this already-grey surface. `outline-gray-5` resolves
+                 * to `gray-800` in the light theme and `gray-200` in the dark one, so ONE token gives a
+                 * high-contrast ring in both. No new token is introduced.
+                 */
+                'focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-outline-gray-5',
                 // Answers the drag BEFORE the drop, so a file that is about to be refused says so while
                 // the reviewer can still change their mind.
                 isDragAccept && 'border-outline-green-3 bg-surface-green-1',
                 (isDragReject || hasRejections) && 'border-outline-red-3 bg-surface-red-1',
                 className
             )}>
+            {/*
+                The input carries its own name. It is visually hidden and has no associated <label>, so
+                it announced itself as a bare "file upload button" with no indication of what would be
+                uploaded - and it is the only control in the dropzone, so there was nothing else for a
+                screen-reader user to go on.
+            */}
             <input
                 {...getInputProps()}
                 id={inputId}
+                aria-label={multiple ? _("Choose files to upload") : _("Choose a file to upload")}
                 aria-invalid={hasRejections || undefined}
                 aria-describedby={hasRejections ? rejectionId : undefined} />
             {files.length === 0 ? <p className='text-sm text-ink-gray-5 text-center h-8 flex items-center justify-center'>{multiple ? _("Drop some files here, or click to select files") : _("Drop a file here, or click to select a file")}</p> : null}
@@ -133,14 +157,17 @@ export const FileDropzone = ({ files, setFiles, accept, multiple = true, onDrop,
                             <span className='text-ink-gray-5 text-xs'>{formatBytes(f.size)}</span>
                         </div>
                     </div>
+                    {/* Named per file, because a list of identical "button" entries says nothing about
+                        which file each one removes. */}
                     <Button type='button' variant='ghost' isIconButton
+                        aria-label={_("Remove {0}", [f.name])}
                         className='text-ink-gray-5 hover:text-ink-gray-8 hover:bg-transparent'
                         onClick={(e) => {
                             e.stopPropagation()
                             setFiles?.(files.filter(file => file.name !== f.name))
                             onUpdate?.()
                         }}>
-                        <Trash2Icon className='w-4 h-4' />
+                        <Trash2Icon className='w-4 h-4' aria-hidden='true' />
                     </Button>
                 </div>)}
             </div>

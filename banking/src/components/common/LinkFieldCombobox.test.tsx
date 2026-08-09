@@ -415,4 +415,44 @@ describe('LinkFieldCombobox', () => {
 			expect(screen.queryByPlaceholderText('Select Supplier')).not.toBeInTheDocument()
 		})
 	})
+
+	describe('trigger overflow containment', () => {
+		/*
+		 * These encode the flex-shrink contract that keeps the chevron inside the trigger. The trigger is
+		 * `w-full justify-between` and `Button` sets `whitespace-nowrap`, so before this fix a long value
+		 * could neither wrap nor shrink and `justify-between` pushed the icon cluster past the button's
+		 * right edge - measured as 24px of horizontal overflow in the Record Payment dialog at 768px.
+		 * jsdom does not lay out, so asserting on rects here would be vacuous; the honest assertion is on
+		 * the class contract that produces the layout, which is exactly what regressed.
+		 */
+		it('lets a long label shrink and ellipsise instead of pushing the chevron out', () => {
+			renderCombobox({ value: 'A supplier with an extremely long name that cannot fit the trigger' })
+
+			const label = screen.getByText('A supplier with an extremely long name that cannot fit the trigger')
+
+			expect(label.tagName).toBe('SPAN')
+			// min-w-0 defeats a flex item's default `min-width: auto`, which is what refused to shrink.
+			expect(label).toHaveClass('min-w-0')
+			expect(label).toHaveClass('truncate')
+		})
+
+		it('keeps the icon cluster at full size so the chevron is never the item that shrinks', () => {
+			renderCombobox({ value: 'ACME Traders' })
+
+			const chevronCluster = trigger().querySelector('div.flex.items-center')
+
+			expect(chevronCluster).not.toBeNull()
+			expect(chevronCluster).toHaveClass('shrink-0')
+		})
+
+		it('applies the same contract to the placeholder, not just a selected value', () => {
+			renderCombobox({})
+
+			const label = screen.getByText('Select Supplier')
+
+			expect(label.tagName).toBe('SPAN')
+			expect(label).toHaveClass('min-w-0', 'truncate')
+		})
+	})
+
 })

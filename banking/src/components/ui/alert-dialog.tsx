@@ -3,6 +3,26 @@ import { AlertDialog as AlertDialogPrimitive } from "radix-ui"
 
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
+import { useReturnFocus } from "@/hooks/use-return-focus"
+
+/**
+ * Alert-dialog widths, CLAMPED TO THE VIEWPORT, matching `DialogContent`'s set so a size means the same
+ * thing in both primitives. See the note on `DIALOG_SIZES` in `dialog.tsx` for why a call-site `min-w-*`
+ * was the wrong tool: a minimum width beats a maximum, so it bled off the screen on a narrow viewport
+ * and took its controls with it.
+ *
+ * `sm` and `default` keep the two the primitive already shipped, so existing call sites are unaffected.
+ */
+const ALERT_DIALOG_SIZES = {
+  sm: "data-[size=sm]:max-w-xs",
+  default: "data-[size=default]:sm:max-w-lg",
+  "2xl": "w-[min(42rem,calc(100vw-2rem))] max-w-none sm:max-w-none",
+  "3xl": "w-[min(48rem,calc(100vw-2rem))] max-w-none sm:max-w-none",
+  "5xl": "w-[min(64rem,calc(100vw-2rem))] max-w-none sm:max-w-none",
+  "7xl": "w-[min(80rem,calc(100vw-2rem))] max-w-none sm:max-w-none",
+} as const
+
+export type AlertDialogSize = keyof typeof ALERT_DIALOG_SIZES
 
 function AlertDialog({
   ...props
@@ -45,18 +65,70 @@ function AlertDialogOverlay({
 function AlertDialogContent({
   className,
   size = "default",
+  onOpenAutoFocus,
+  onCloseAutoFocus,
   ...props
 }: React.ComponentProps<typeof AlertDialogPrimitive.Content> & {
-  size?: "default" | "sm"
+  size?: AlertDialogSize
 }) {
+  const contentRef = React.useRef<HTMLDivElement>(null)
+
+  /*
+   * Returns focus to the control that opened this dialog. These dialogs are atom-driven and have no
+   * `AlertDialogTrigger`, so Radix has no trigger to restore to and focus fell to `document.body` on
+   * close - see the note in `use-return-focus.ts`.
+   */
+  const returnFocusToOpener = useReturnFocus(onCloseAutoFocus)
+
+  /**
+   * Guarantees focus actually LANDS in the dialog, even when its body has not arrived yet.
+   *
+   * Radix's alert dialog moves focus by doing `event.preventDefault(); cancelRef.current?.focus()` - it
+   * focuses the Cancel button specifically, and nothing else. Several dialogs in this app load their body
+   * as a lazy chunk, so on a COLD first open there is no Cancel mounted, `cancelRef.current` is null, and
+   * the optional call quietly does nothing: default focus behaviour has been prevented, nothing has
+   * replaced it, and focus is left on the trigger - which sits in a background the dialog has just marked
+   * `aria-hidden`. Chrome logs its "blocked aria-hidden on an element because its descendant retained
+   * focus" warning, keyboard users are outside the dialog they just opened, and Escape does not reach it.
+   *
+   * Checked on the next frame rather than assumed, because Radix's own handler runs immediately AFTER this
+   * one (it composes the caller's handler first). If focus did move - the warm case, where Cancel exists -
+   * nothing happens here at all. If it did not, the content container takes it, which is where the browser
+   * would have put it had default behaviour never been prevented.
+   */
+  const ensureFocusEntersDialog = (event: Event) => {
+    onOpenAutoFocus?.(event)
+
+    requestAnimationFrame(() => {
+      const content = contentRef.current
+      if (!content || content.contains(document.activeElement)) {
+        return
+      }
+
+      content.focus({ preventScroll: true })
+    })
+  }
+
   return (
     <AlertDialogPortal>
       <AlertDialogOverlay />
       <AlertDialogPrimitive.Content
+        ref={contentRef}
+        // Focusable by script but not by Tab, so the container can hold focus while the body loads
+        // without adding a stop to the dialog's own tab order once it has.
+        tabIndex={-1}
+        onOpenAutoFocus={ensureFocusEntersDialog}
+        onCloseAutoFocus={returnFocusToOpener}
+        // Stated explicitly for the same reason as in `dialog.tsx`: Radix renders a real modal but never
+        // sets `aria-modal`, so the attribute is supplied here rather than left to be inferred.
+        aria-modal="true"
         data-slot="alert-dialog-content"
         data-size={size}
         className={cn(
-          "bg-surface-modal shadow-xl rounded-xl data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 group/alert-dialog-content fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] translate-x-[-50%] translate-y-[-50%] gap-4 p-6 duration-200 data-[size=sm]:max-w-xs data-[size=default]:sm:max-w-lg",
+          "bg-surface-modal shadow-xl rounded-xl data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 group/alert-dialog-content fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] translate-x-[-50%] translate-y-[-50%] gap-4 p-6 duration-200",
+          /* One uninflatable column and both scroll axes - see the same two notes in `dialog.tsx`. */
+          "grid-cols-[minmax(0,1fr)] max-h-[90vh] overflow-auto [scrollbar-gutter:stable]",
+          ALERT_DIALOG_SIZES[size],
           className
         )}
         {...props}
@@ -90,6 +162,8 @@ function AlertDialogFooter({
       data-slot="alert-dialog-footer"
       className={cn(
         "flex flex-col-reverse gap-2 group-data-[size=sm]/alert-dialog-content:grid group-data-[size=sm]/alert-dialog-content:grid-cols-2 sm:flex-row sm:justify-end",
+        /* Kept in view while the dialog scrolls - see the same note on `DialogFooter`. */
+        "sticky bottom-0 z-10 -mx-6 -mb-6 bg-surface-modal px-6 pb-6 pt-3",
         className
       )}
       {...props}

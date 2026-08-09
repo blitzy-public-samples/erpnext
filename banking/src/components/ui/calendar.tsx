@@ -6,11 +6,13 @@ import {
 } from "lucide-react"
 import {
   DayPicker,
+  Dropdown,
   getDefaultClassNames,
   type DayButton,
 } from "react-day-picker"
 
 import { cn } from "@/lib/utils"
+import _ from "@/lib/translate"
 import { Button, buttonVariants } from "@/components/ui/button"
 
 function Calendar({
@@ -72,7 +74,12 @@ function Calendar({
           defaultClassNames.dropdowns
         ),
         dropdown_root: cn(
-          "relative has-focus:border-outline-gray-1 border border-outline-gray-2 shadow-xs has-focus:ring-outline-gray-1/50 has-focus:ring-[3px] rounded-md",
+          /*
+           * The focus ring was `outline-gray-1` at 50% alpha - gray-200 in light, so about 1.1:1
+           * against the field it surrounds and invisible in practice. `outline-gray-5` is the ramp's
+           * focus value and clears the 3:1 non-text floor in both themes. Geometry unchanged.
+           */
+          "relative has-focus:border-outline-gray-5 border border-outline-gray-2 shadow-xs has-focus:ring-outline-gray-5 has-focus:ring-[3px] rounded-md",
           defaultClassNames.dropdown_root
         ),
         dropdown: cn(
@@ -160,6 +167,60 @@ function Calendar({
             <ChevronDownIcon className={cn("size-4", className)} {...props} />
           )
         },
+        /*
+         * The month and year pickers are react-day-picker's own native `<select>`s, laid over the styled
+         * caption. Two problems were measured on them, both from the library's defaults, so both are fixed
+         * here rather than at the call sites.
+         *
+         * They arrive with `id=""` and no `name`, and have no associated `<label>`, so the browser cannot
+         * identify them for autofill or for restoring a value on a back-navigation, and nothing can address
+         * them by a stable selector. `useId` supplies an id unique per instance.
+         *
+         * The naming is what costs a user something. A range calendar renders TWO months side by side, so
+         * the library's stock labels produced four controls sharing two names - two comboboxes both called
+         * "Choose the Month" and two both called "Choose the Year" - with nothing to say which panel each
+         * governed. Each label now states its own current value, which is what distinguishes the two month
+         * pickers. Two year pickers showing the same year still share a name; that is inherent to the value
+         * and is a naming weakness rather than a missing name, so it is left rather than papered over with a
+         * positional label the user cannot see.
+         *
+         * Both are delegated to the library's OWN `Dropdown`, not reimplemented. `Dropdown` also renders the
+         * visible caption label and its chevron, so replacing it means reproducing that structure from
+         * library internals - and getting it slightly wrong erases the month name from the caption, which is
+         * exactly what happened on the first attempt.
+         */
+        MonthsDropdown: ({ options, value, ...props }) => {
+          const generatedId = React.useId()
+          const displayed =
+            options?.find((option) => String(option.value) === String(value))?.label ?? String(value ?? '')
+
+          return (
+            <Dropdown
+              {...props}
+              options={options}
+              value={value}
+              id={props.id || generatedId}
+              name={props.name || 'calendar-month'}
+              aria-label={_("Month: {0}", [displayed])}
+            />
+          )
+        },
+        YearsDropdown: ({ options, value, ...props }) => {
+          const generatedId = React.useId()
+          const displayed =
+            options?.find((option) => String(option.value) === String(value))?.label ?? String(value ?? '')
+
+          return (
+            <Dropdown
+              {...props}
+              options={options}
+              value={value}
+              id={props.id || generatedId}
+              name={props.name || 'calendar-year'}
+              aria-label={_("Year: {0}", [displayed])}
+            />
+          )
+        },
         DayButton: CalendarDayButton,
         WeekNumber: ({ children, ...props }) => {
           return (
@@ -206,7 +267,7 @@ function CalendarDayButton({
       data-range-end={modifiers.range_end}
       data-range-middle={modifiers.range_middle}
       className={cn(
-        "data-[selected-single=true]:bg-surface-gray-7 data-[selected-single=true]:text-ink-white data-[range-middle=true]:bg-surface-gray-1 data-[range-middle=true]:text-ink-gray-8 data-[range-start=true]:bg-surface-gray-7 data-[range-start=true]:text-ink-white data-[range-end=true]:bg-surface-gray-7 data-[range-end=true]:text-ink-white group-data-[focused=true]/day:border-outline-gray-1 group-data-[focused=true]/day:ring-outline-gray-1/50 dark:hover:text-ink-gray-8 flex aspect-square size-auto w-full min-w-(--cell-size) flex-col gap-1 leading-none font-normal group-data-[focused=true]/day:relative group-data-[focused=true]/day:z-10 group-data-[focused=true]/day:ring-[3px] data-[range-end=true]:rounded-md data-[range-end=true]:rounded-e-md data-[range-middle=true]:rounded-none data-[range-start=true]:rounded-md data-[range-start=true]:rounded-s-md [&>span]:text-xs [&>span]:opacity-70",
+        "data-[selected-single=true]:bg-surface-gray-7 data-[selected-single=true]:text-ink-white data-[range-middle=true]:bg-surface-gray-1 data-[range-middle=true]:text-ink-gray-8 data-[range-start=true]:bg-surface-gray-7 data-[range-start=true]:text-ink-white data-[range-end=true]:bg-surface-gray-7 data-[range-end=true]:text-ink-white group-data-[focused=true]/day:border-outline-gray-5 group-data-[focused=true]/day:ring-outline-gray-5 dark:hover:text-ink-gray-8 flex aspect-square size-auto w-full min-w-(--cell-size) flex-col gap-1 leading-none font-normal group-data-[focused=true]/day:relative group-data-[focused=true]/day:z-10 group-data-[focused=true]/day:ring-[3px] data-[range-end=true]:rounded-md data-[range-end=true]:rounded-e-md data-[range-middle=true]:rounded-none data-[range-start=true]:rounded-md data-[range-start=true]:rounded-s-md [&>span]:text-xs [&>span]:opacity-70",
         defaultClassNames.day,
         className
       )}

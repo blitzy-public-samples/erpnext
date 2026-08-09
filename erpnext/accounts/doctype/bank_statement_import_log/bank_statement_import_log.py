@@ -23,6 +23,9 @@ from frappe.utils.xlsxutils import (
 from erpnext.accounts.doctype.bank_account.bank_account import (
 	_set_closing_balance_as_per_statement,
 )
+from erpnext.accounts.doctype.bank_transaction.bank_transaction import (
+	refuse_missing_arguments,
+)
 
 
 def read_statement_or_throw(read, message: str, title: str):
@@ -1270,6 +1273,7 @@ def get_file_properties(transactions: list):
 
 
 @frappe.whitelist(methods=["GET"])
+@refuse_missing_arguments
 def get_statement_details(statement_import_id: str):
 	doc = frappe.get_doc("Bank Statement Import Log", statement_import_id)
 
@@ -1325,6 +1329,7 @@ def get_statement_details(statement_import_id: str):
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def update_pdf_tables(statement_import_id: str, tables: list | str):
 	"""
 	Persist the user's per-table edits (column mapping, include/exclude flags) for a PDF
@@ -1344,6 +1349,7 @@ def update_pdf_tables(statement_import_id: str, tables: list | str):
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def reextract_pdf_table(statement_import_id: str, page: int, table_index: int, bbox: list | str):
 	"""
 	Re-extract one PDF table's rows from a user-adjusted bounding box and refresh the preview.
@@ -1425,6 +1431,7 @@ def reextract_pdf_table(statement_import_id: str, page: int, table_index: int, b
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def set_pdf_table_header(statement_import_id: str, page: int, table_index: int, header_index: int):
 	"""
 	Set (or clear) the header row of a PDF table and re-derive its column mapping.
@@ -1475,6 +1482,7 @@ def set_pdf_table_header(statement_import_id: str, page: int, table_index: int, 
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def update_column_mapping(statement_import_id: str, column_mapping: list | str):
 	"""Persist a user-overridden column mapping for a tabular (CSV/XLSX) statement."""
 	doc = frappe.get_doc("Bank Statement Import Log", statement_import_id)
@@ -1491,6 +1499,7 @@ def update_column_mapping(statement_import_id: str, column_mapping: list | str):
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def set_header_index(statement_import_id: str, header_index: int):
 	"""
 	Set (or clear, with -1) the header row of a tabular statement and re-derive its mapping.

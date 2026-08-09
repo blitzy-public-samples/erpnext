@@ -12,7 +12,7 @@ const TransferModal = () => {
 
 	return (
 		<Dialog open={isOpen} onOpenChange={setIsOpen}>
-			<DialogContent className='min-w-7xl'>
+			<DialogContent size='7xl'>
 				<DialogHeader>
 					<DialogTitle>{_("Transfer")}</DialogTitle>
 					<DialogDescription>

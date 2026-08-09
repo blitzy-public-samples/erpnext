@@ -175,7 +175,9 @@ const BankClearanceSummaryView = () => {
                 id: "status",
                 header: _("Status"),
                 size: 200,
-                meta: { truncate: false, truncateTooltip: false } satisfies ListViewColumnMeta,
+                // This is the trailing column and it carries Force Clear, which was off-screen at 768
+                // and 1024. Pinning it keeps the only action on the row reachable at every width.
+                meta: { truncate: false, truncateTooltip: false, stickyEnd: true } satisfies ListViewColumnMeta,
                 cell: ({ row }) => {
                     const r = row.original
                     return r.clearance_date ? (
@@ -219,6 +221,7 @@ const BankClearanceSummaryView = () => {
             <ListView
                 data={data.message.result}
                 columns={clearanceColumns}
+                ariaLabel={_("Bank clearance summary")}
                 getRowId={(row) => `${row.payment_entry}-${row.posting_date}`}
                 maxHeight="calc(100vh - 200px)"
                 scrollAreaClassName="min-h-[calc(100vh-200px)]"
@@ -262,7 +265,7 @@ const SetClearanceDateButton = ({ voucher, bankAccount, companyID, mutate }: { v
                 </TooltipContent>
             </Tooltip>
         </DialogTrigger>
-        <DialogContent className="min-w-2xl">
+        <DialogContent size="2xl">
             {bankAccount && <ForceClearVoucherForm voucher={voucher} bankAccount={bankAccount} companyID={companyID} onClose={onClose} />}
         </DialogContent>
     </Dialog>

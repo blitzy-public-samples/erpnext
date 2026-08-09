@@ -431,6 +431,82 @@ describe('StatementDetails', () => {
 			expect(screen.getByRole('link', { name: 'Back' })).toHaveAttribute('href', '/statement-importer')
 		})
 
+		/*
+		 * FM2's quietest failure, and the one that had no voice at all.
+		 *
+		 * A statement that parses as a FILE but yields no transaction rows is accepted by the framework and
+		 * inserted as an import log with zero of them, left at `Not Started`. The reviewer arrived at a
+		 * screen that looked entirely ordinary apart from a disabled button reading "Import 0
+		 * transactions" - no error, no dialog, no marker, and nothing at all saying whether the file was
+		 * wrong, the mapping was wrong, or the import simply had not happened yet.
+		 *
+		 * Stated INLINE rather than through the shared dialog, deliberately: a dialog reports something
+		 * that just happened to a request, and this is a standing fact about the record being looked at. It
+		 * has to still be here after any dialog would have been dismissed, and after a reload.
+		 */
+		describe('a statement that yielded no transactions', () => {
+
+			const nothingParsed = () => makeStatementDetails({ final_transactions: [] })
+
+			it('says so, and says what to do about it', () => {
+				renderStatementDetails(nothingParsed())
+
+				// Scoped by heading, because the conflicting-transactions notice is an alert on this
+				// screen too and both are legitimately present.
+				const banner = screen.getAllByRole('alert')
+					.find((node) => node.textContent?.includes('No Transactions Found'))
+				expect(banner).toBeDefined()
+				expect(banner).toHaveTextContent(/No transactions could be read from this statement/)
+				expect(banner).toHaveTextContent(/header row or the column mapping/)
+			})
+
+			it('stops telling the reviewer to press a button that cannot be pressed', () => {
+				renderStatementDetails(nothingParsed())
+
+				expect(screen.getByRole('button', { name: 'Import 0 transactions' })).toBeDisabled()
+				expect(
+					screen.queryByText(/click the 'Import' button to proceed/)
+				).not.toBeInTheDocument()
+				expect(
+					screen.getByText(/Nothing could be read from this statement as transactions/)
+				).toBeInTheDocument()
+			})
+
+			it('says the preview is empty rather than promising to import zero transactions', () => {
+				renderStatementDetails(nothingParsed())
+
+				expect(
+					screen.getByText('No transactions were found in this statement file. Adjust the header row or the column mapping above and this preview will update.')
+				).toBeInTheDocument()
+				expect(
+					screen.queryByText(/0 transactions will be imported into the system/)
+				).not.toBeInTheDocument()
+			})
+
+			it('says nothing of the sort for a statement that parsed normally', () => {
+				renderStatementDetails(makeStatementDetails())
+
+				expect(screen.queryByText('No Transactions Found')).not.toBeInTheDocument()
+				// Twice on this screen by design - the header blurb and the preview blurb - which is why
+				// this counts them rather than expecting one.
+				expect(screen.getAllByText(/click the 'Import' button to proceed/)).toHaveLength(2)
+			})
+
+			it('says nothing of the sort for a statement already imported', () => {
+				// A completed import of an empty statement is a completed import. The server's own answer
+				// outranks anything derived from the count.
+				renderStatementDetails(makeStatementDetails({
+					doc: makeImportLog({ status: 'Completed' }),
+					final_transactions: []
+				}))
+
+				expect(screen.queryByText('No Transactions Found')).not.toBeInTheDocument()
+				expect(
+					screen.getByText('This statement has already been imported. The details below are what was read from it.')
+				).toBeInTheDocument()
+			})
+		})
+
 		it('renders a dash when the server resolved no date range for the file', () => {
 			renderStatementDetails(
 				makeStatementDetails({

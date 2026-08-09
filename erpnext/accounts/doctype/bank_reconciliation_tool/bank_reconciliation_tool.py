@@ -12,7 +12,12 @@ from frappe.query_builder.functions import Max, Sum
 from frappe.utils import cint, create_batch, flt, getdate
 
 from erpnext import get_default_cost_center
-from erpnext.accounts.doctype.bank_transaction.bank_transaction import get_total_allocated_amount
+from erpnext.accounts.doctype.bank_transaction.bank_transaction import (
+	get_total_allocated_amount,
+	refuse_arguments,
+	refuse_missing_arguments,
+	refuse_unknown_bank_transaction,
+)
 from erpnext.accounts.party import get_party_account
 from erpnext.accounts.report.bank_reconciliation_statement.bank_reconciliation_statement import (
 	get_amounts_not_reflected_in_system,
@@ -92,6 +97,7 @@ def parse_date_argument(value: str | date) -> date:
 
 
 @frappe.whitelist()
+@refuse_missing_arguments
 def get_bank_transactions(
 	bank_account: str,
 	from_date: str | date | None = None,
@@ -142,6 +148,7 @@ def get_bank_transactions(
 
 
 @frappe.whitelist()
+@refuse_missing_arguments
 def get_account_balance(bank_account: str, till_date: str | date, company: str):
 	# returns account balance till the specified date
 	frappe.has_permission("Bank Account", "read", bank_account, throw=True)
@@ -201,6 +208,7 @@ def get_account_balance(bank_account: str, till_date: str | date, company: str):
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def update_bank_transaction(
 	bank_transaction_name: str, reference_number: str, party_type: str | None = None, party: str | None = None
 ):
@@ -231,6 +239,7 @@ def update_bank_transaction(
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def create_journal_entry_bts(
 	bank_transaction_name: str,
 	reference_number: str | None = None,
@@ -244,12 +253,20 @@ def create_journal_entry_bts(
 	allow_edit: bool | None = None,
 ):
 	# Create a new journal entry based on the bank transaction
-	bank_transaction = frappe.db.get_values(
+	#
+	# Read as a list and checked, rather than indexed straight into: `get_values` returns an EMPTY list
+	# for a name that does not exist, so the original `[0]` raised `IndexError` and the caller was
+	# answered with an HTTP 500 for naming a transaction that simply is not there.
+	bank_transaction_values = frappe.db.get_values(
 		"Bank Transaction",
 		bank_transaction_name,
 		fieldname=["name", "deposit", "withdrawal", "bank_account", "currency"],
 		as_dict=True,
-	)[0]
+	)
+	if not bank_transaction_values:
+		refuse_unknown_bank_transaction(bank_transaction_name)
+
+	bank_transaction = bank_transaction_values[0]
 	company_account = frappe.get_value("Bank Account", bank_transaction.bank_account, "account")
 	account_type = frappe.db.get_value("Account", second_account, "account_type")
 	if account_type in ["Receivable", "Payable"]:
@@ -390,6 +407,7 @@ def create_journal_entry_bts(
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def create_payment_entry_bts(
 	bank_transaction_name: str,
 	reference_number: str | None = None,
@@ -404,12 +422,19 @@ def create_payment_entry_bts(
 	company_bank_account: str | None = None,
 ):
 	# Create a new payment entry based on the bank transaction
-	bank_transaction = frappe.db.get_values(
+	#
+	# Checked before indexing, for the same reason as in `create_journal_entry_bts`: `get_values` answers
+	# an unknown name with an empty list, and `[0]` on that was an HTTP 500.
+	bank_transaction_values = frappe.db.get_values(
 		"Bank Transaction",
 		bank_transaction_name,
 		fieldname=["name", "unallocated_amount", "deposit", "bank_account", "currency"],
 		as_dict=True,
-	)[0]
+	)
+	if not bank_transaction_values:
+		refuse_unknown_bank_transaction(bank_transaction_name)
+
+	bank_transaction = bank_transaction_values[0]
 
 	payment_type = "Receive" if bank_transaction.deposit > 0.0 else "Pay"
 
@@ -470,6 +495,7 @@ def create_payment_entry_bts(
 
 
 @frappe.whitelist(methods=["GET"])
+@refuse_missing_arguments
 def get_older_unreconciled_transactions(bank_account: str, from_date: str):
 	"""
 	Get number of unreconciled transactions before a given date for a bank account
@@ -548,6 +574,7 @@ def validate_clearance_write_permission(payment_document: str, payment_entry: st
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def update_clearance_date(
 	payment_document: str, payment_entry: str, account: str, clearance_date: str | None
 ):
@@ -612,6 +639,7 @@ def update_clearance_date(
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def clear_clearing_date(voucher_type: str, voucher_name: str):
 	"""
 	Clear the clearing date of a voucher
@@ -628,6 +656,7 @@ def clear_clearing_date(voucher_type: str, voucher_name: str):
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def create_bulk_internal_transfer(bank_transaction_names: list[str | int], bank_account: str):
 	"""
 	Create an internal transfer for multiple bank transactions
@@ -641,6 +670,11 @@ def create_bulk_internal_transfer(bank_transaction_names: list[str | int], bank_
 			["name", "withdrawal", "bank_account", "date", "reference_number", "description"],
 			as_dict=True,
 		)
+		# `get_value` answers an unknown name with `None`, so reading `.bank_account` off it raised
+		# `AttributeError: 'NoneType' object has no attribute 'bank_account'` and became an HTTP 500. In a
+		# BULK call the name may be one bad entry among many, so the refusal names the offending one.
+		if not bank_transaction:
+			refuse_unknown_bank_transaction(bank_transaction_name)
 
 		transaction_account = frappe.get_cached_value(
 			"Bank Account", bank_transaction.bank_account, "account"
@@ -672,6 +706,7 @@ def create_bulk_internal_transfer(bank_transaction_names: list[str | int], bank_
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def create_internal_transfer(
 	bank_transaction_name: str | int,
 	posting_date: str | date,
@@ -749,6 +784,7 @@ def create_internal_transfer(
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def create_bulk_bank_entry_and_reconcile(bank_transactions: list[str | int], account: str):
 	"""
 	Create bank entries for all transactions and reconcile them
@@ -773,6 +809,10 @@ def create_bulk_bank_entry_and_reconcile(bank_transactions: list[str | int], acc
 			],
 			as_dict=True,
 		)
+		# Same as in `create_bulk_internal_transfer`: `None` for an unknown name, and every read below
+		# treats this as a row.
+		if not transactions_details:
+			refuse_unknown_bank_transaction(bank_transaction)
 
 		is_credit_card = frappe.get_cached_value(
 			"Bank Account", transactions_details.bank_account, "is_credit_card"
@@ -842,6 +882,7 @@ def create_bulk_bank_entry_and_reconcile(bank_transactions: list[str | int], acc
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def create_bank_entry_and_reconcile(
 	bank_transaction_name: str | int,
 	cheque_date: str | date,
@@ -940,6 +981,7 @@ def create_bank_entry_and_reconcile(
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def create_bulk_payment_entry_and_reconcile(
 	bank_transaction_names: list[str | int],
 	party_type: str,
@@ -1069,6 +1111,7 @@ def create_bulk_payment_entry_and_reconcile(
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def create_payment_entry_and_reconcile(bank_transaction_name: str | int, payment_entry_doc: dict):
 	"""
 	Create a payment entry and reconcile it with the bank transaction
@@ -1102,6 +1145,7 @@ def create_payment_entry_and_reconcile(bank_transaction_name: str | int, payment
 
 
 @frappe.whitelist(methods=["GET"])
+@refuse_missing_arguments
 def search_for_transfer_transaction(transaction_id: str | int):
 	"""
 	When users try to create a transfer, we could help them by searching for the mirror transaction.
@@ -1183,6 +1227,7 @@ def search_for_transfer_transaction(transaction_id: str | int):
 # applied. Both callers already send POST: the SPA through `useFrappePostCall`, and the Desk tool
 # through `frappe.call`, which posts by default.
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def auto_reconcile_vouchers(
 	bank_account: str,
 	from_date: str | date | None = None,
@@ -1469,6 +1514,7 @@ def validate_vouchers_to_reconcile(vouchers: list[dict]) -> None:
 
 
 @frappe.whitelist(methods=["POST"])
+@refuse_missing_arguments
 def reconcile_vouchers(bank_transaction_name: str | int, vouchers: str | list, is_new_voucher: bool = False):
 	# updated clear date of all the vouchers based on the bank transaction
 	vouchers = parse_vouchers_to_reconcile(vouchers)
@@ -1529,6 +1575,7 @@ def filter_permitted_vouchers(vouchers: list[dict]) -> list[dict]:
 
 
 @frappe.whitelist()
+@refuse_missing_arguments
 def get_linked_payments(
 	bank_transaction_name: str,
 	document_types: str | list[str] | None = None,
@@ -1538,6 +1585,22 @@ def get_linked_payments(
 	from_reference_date: bool | None = None,
 	to_reference_date: str | None = None,
 ):
+	"""
+	`document_types` carries a default of `None`, but every path below treats it as required: the
+	candidate query set is assembled entirely from membership tests against it - `"payment_entry" in
+	document_types` and five more - so `None` reached `check_matching` and raised
+	`TypeError: argument of type 'NoneType' is not iterable`, i.e. another HTTP 500 for a caller mistake.
+	It is refused here rather than defaulted, because inventing a document-type set would silently return
+	a DIFFERENT set of candidate vouchers than the caller asked for, and on a reconciliation screen that
+	is worse than being told what was missing. Every existing caller - the SPA, the internal
+	auto-reconcile path and the tests - already passes it explicitly, so nothing is broken by requiring it.
+
+	The default is left in place rather than removed: dropping it would change this method's published
+	signature, which the immutable API contract forbids.
+	"""
+	if document_types is None:
+		refuse_arguments("document_types")
+
 	# get all matching payments for a bank transaction
 	transaction = frappe.get_doc("Bank Transaction", bank_transaction_name)
 

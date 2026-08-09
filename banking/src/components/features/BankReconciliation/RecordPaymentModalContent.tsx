@@ -1,42 +1,42 @@
-import { atom, useAtom, useAtomValue, useSetAtom } from "jotai"
-import { bankRecRecordPaymentModalAtom, bankRecSelectedTransactionsAtom, bankRecUnreconcileModalAtom, SelectedBank, selectedBankAccountAtom } from "./bankRecAtoms"
-import { Dialog, DialogContent, DialogTitle, DialogDescription, DialogHeader, DialogFooter, DialogClose, DialogTrigger } from "@/components/ui/dialog"
+import {atom, useAtom, useAtomValue, useSetAtom} from "jotai"
+import {bankRecRecordPaymentModalAtom, bankRecSelectedTransactionsAtom, bankRecUnreconcileModalAtom, SelectedBank, selectedBankAccountAtom} from "./bankRecAtoms"
+import {Dialog, DialogContent, DialogTitle, DialogDescription, DialogHeader, DialogFooter, DialogClose, DialogTrigger} from "@/components/ui/dialog"
 import _ from "@/lib/translate"
-import { UnreconciledTransaction, useGetRuleForTransaction, useRefreshUnreconciledTransactions, useUpdateActionLog } from "./utils"
-import { useFieldArray, useForm, useFormContext, useWatch } from "react-hook-form"
-import { getCompanyCostCenter, getCompanyCurrency } from "@/lib/company"
-import { FrappeConfig, FrappeContext, useFrappeGetCall, useFrappePostCall } from "frappe-react-sdk"
-import { toast } from "sonner"
+import {UnreconciledTransaction, useGetRuleForTransaction, useRefreshUnreconciledTransactions, useUpdateActionLog} from "./utils"
+import {useFieldArray, useForm, useFormContext, useWatch} from "react-hook-form"
+import {getCompanyCostCenter, getCompanyCurrency} from "@/lib/company"
+import {FrappeConfig, FrappeContext, useFrappeGetCall, useFrappePostCall} from "frappe-react-sdk"
+import {toast} from "sonner"
 import ErrorBanner from "@/components/ui/error-banner"
-import { Button } from "@/components/ui/button"
+import {Button} from "@/components/ui/button"
 import SelectedTransactionDetails from "./SelectedTransactionDetails"
-import { AccountFormField, CurrencyFormField, DataField, DateField, LinkFormField, PartyTypeFormField, SmallTextField } from "@/components/ui/form-elements"
-import { Form } from "@/components/ui/form"
-import { ChangeEvent, useCallback, useContext, useEffect, useMemo, useState } from "react"
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { Checkbox } from "@/components/ui/checkbox"
-import { AlertCircleIcon, Plus, Trash2 } from "lucide-react"
-import { flt, formatCurrency } from "@/lib/numbers"
-import { cn } from "@/lib/utils"
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { PaymentEntry } from "@/types/Accounts/PaymentEntry"
-import { H4 } from "@/components/ui/typography"
-import { usePaymentEntryCalculations } from "@/hooks/usePaymentEntryCalculations"
-import { useMultiFileUploadProgress } from "@/hooks/useMultiFileUploadProgress"
-import { MissingFiltersBanner } from "./MissingFiltersBanner"
-import { formatDate, today } from "@/lib/date"
-import { slug } from "@/lib/frappe"
+import {AccountFormField, CurrencyFormField, DataField, DateField, LinkFormField, PartyTypeFormField, SmallTextField} from "@/components/ui/form-elements"
+import {Form} from "@/components/ui/form"
+import {ChangeEvent, useCallback, useContext, useEffect, useMemo, useState} from "react"
+import {Table, TableBody, TableCell, TableHead, TableHeader, TableRow} from "@/components/ui/table"
+import {Checkbox} from "@/components/ui/checkbox"
+import {AlertCircleIcon, Plus, Trash2} from "lucide-react"
+import {flt, formatCurrency} from "@/lib/numbers"
+import {cn} from "@/lib/utils"
+import {Tooltip, TooltipContent, TooltipTrigger} from "@/components/ui/tooltip"
+import {PaymentEntry} from "@/types/Accounts/PaymentEntry"
+import { H2 } from "@/components/ui/typography"
+import {usePaymentEntryCalculations} from "@/hooks/usePaymentEntryCalculations"
+import {useMultiFileUploadProgress} from "@/hooks/useMultiFileUploadProgress"
+import {MissingFiltersBanner} from "./MissingFiltersBanner"
+import {formatDate, today} from "@/lib/date"
+import {slug} from "@/lib/frappe"
 import MarkdownRenderer from "@/components/ui/markdown"
-import { Separator } from "@/components/ui/separator"
-import { PaymentEntryDeduction } from "@/types/Accounts/PaymentEntryDeduction"
-import { TableLoader } from "@/components/ui/loaders"
+import {Separator} from "@/components/ui/separator"
+import {PaymentEntryDeduction} from "@/types/Accounts/PaymentEntryDeduction"
+import {TableLoader} from "@/components/ui/loaders"
 import SelectedTransactionsTable from "./SelectedTransactionsTable"
-import { useCurrentCompany } from "@/hooks/useCurrentCompany"
-import { Label } from "@/components/ui/label"
-import { FileDropzone } from "@/components/ui/file-dropzone"
-import { BankTransaction } from "@/types/Accounts/BankTransaction"
+import {useCurrentCompany} from "@/hooks/useCurrentCompany"
+import {Label} from "@/components/ui/label"
+import {FileDropzone} from "@/components/ui/file-dropzone"
+import {BankTransaction} from "@/types/Accounts/BankTransaction"
 import FileUploadBanner from "@/components/common/FileUploadBanner"
-import { useHotkeys } from "react-hotkeys-hook"
+import {useHotkeys} from "react-hotkeys-hook"
 const RecordPaymentModalContent = () => {
 
     const selectedBankAccount = useAtomValue(selectedBankAccountAtom)
@@ -401,7 +401,7 @@ const PaymentEntryForm = ({ selectedTransaction, selectedBankAccount }: { select
                 <div className='grid grid-cols-2 gap-4 items-start'>
                     <SelectedTransactionDetails transaction={selectedTransaction} />
                     <div className='flex flex-col gap-2'>
-                        <H4 className="text-base">{isWithdrawal ? _("Paid to") : _("Received from")}</H4>
+                        <H2 className="text-base border-0 p-0">{isWithdrawal ? _("Paid to") : _("Received from")}</H2>
                         <div className='grid grid-cols-4 gap-4'>
                             <div className="col-span-1">
                                 <PartyTypeFormField
@@ -667,7 +667,7 @@ const InvoicesSection = ({ currency }: { currency: string }) => {
 
     return <div className="flex flex-col gap-2">
         <div className="flex gap-4 items-center">
-            <H4 className="text-base">{_("Invoices")}</H4>
+            <H2 className="text-base border-0 p-0">{_("Invoices")}</H2>
             <GetUnpaidInvoicesButton currency={currency} />
         </div>
         <Table>
@@ -776,12 +776,15 @@ const DifferenceButton = ({ index, currency }: { index: number, currency: string
 
         return <Tooltip>
             <TooltipTrigger asChild>
+                {/* The tooltip explains it to a pointer user; the name is what carries the same meaning
+                    to everyone else, since a TooltipTrigger contributes no accessible name of its own. */}
                 <Button
                     variant='ghost'
                     onClick={onPayInFull}
                     isIconButton
+                    aria-label={_("Allocate the full outstanding amount")}
                     className="text-ink-gray-5">
-                    <AlertCircleIcon />
+                    <AlertCircleIcon aria-hidden="true" />
                 </Button>
             </TooltipTrigger>
             <TooltipContent>
@@ -1198,7 +1201,7 @@ const OtherChargesSection = ({ currency }: { currency: string }) => {
 
     return <div className="flex flex-col gap-2">
         <div className="flex gap-2 items-center">
-            <H4 className="text-base">Other Charges / Deductions</H4>
+            <H2 className="text-base border-0 p-0">Other Charges / Deductions</H2>
             <TotalDeductions currency={currency} />
         </div>
         <Table>

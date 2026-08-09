@@ -1,31 +1,31 @@
-import { useAtomValue, useSetAtom } from "jotai"
-import { bankRecClosingBalanceAtom, bankRecDateAtom, SelectedBank, selectedBankAccountAtom } from "./bankRecAtoms"
-import { FrappeConfig, FrappeContext, useFrappeGetDocCount, useFrappeGetDocList, useFrappePostCall, useSWRConfig } from "frappe-react-sdk"
-import { BankTransaction } from "@/types/Accounts/BankTransaction"
-import { Progress } from "@/components/ui/progress"
-import { useGetAccountClosingBalance, useGetAccountClosingBalanceAsPerStatement, useGetAccountOpeningBalance, useGetUnreconciledTransactions } from "./utils"
-import { currencyInputValueToNumber, flt, formatCurrency, getCurrencyFormatInfo } from "@/lib/numbers"
-import { Skeleton } from "@/components/ui/skeleton"
-import { StatContainer, StatLabel, StatValue } from "@/components/ui/stats"
-import { CheckCircle2, Edit, Info, TrendingDown, TrendingUp, Trash2 } from "lucide-react"
-import { H4, Paragraph } from "@/components/ui/typography"
-import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card"
-import { getCompanyCurrency } from "@/lib/company"
+import {useAtomValue, useSetAtom} from "jotai"
+import {bankRecClosingBalanceAtom, bankRecDateAtom, SelectedBank, selectedBankAccountAtom} from "./bankRecAtoms"
+import {FrappeConfig, FrappeContext, useFrappeGetDocCount, useFrappeGetDocList, useFrappePostCall, useSWRConfig} from "frappe-react-sdk"
+import {BankTransaction} from "@/types/Accounts/BankTransaction"
+import {Progress} from "@/components/ui/progress"
+import {useGetAccountClosingBalance, useGetAccountClosingBalanceAsPerStatement, useGetAccountOpeningBalance, useGetUnreconciledTransactions} from "./utils"
+import {currencyInputValueToNumber, flt, formatCurrency, getCurrencyFormatInfo} from "@/lib/numbers"
+import {Skeleton} from "@/components/ui/skeleton"
+import {StatContainer, StatLabel, StatValue} from "@/components/ui/stats"
+import {CheckCircle2, Edit, Info, TrendingDown, TrendingUp, Trash2} from "lucide-react"
+import { H2, Paragraph } from "@/components/ui/typography"
+import {HoverCard, HoverCardContent, HoverCardTrigger} from "@/components/ui/hover-card"
+import {getCompanyCurrency} from "@/lib/company"
 import _ from "@/lib/translate"
-import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { formatDate } from "@/lib/date"
-import { Form } from "@/components/ui/form"
-import { CurrencyFormField } from "@/components/ui/form-elements"
-import { useForm } from "react-hook-form"
-import { Button } from "@/components/ui/button"
-import { useContext, useState } from "react"
-import { Separator } from "@/components/ui/separator"
-import { BankAccountBalance } from "@/types/Accounts/BankAccountBalance"
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { toast } from "sonner"
+import {Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger} from "@/components/ui/dialog"
+import {Tooltip, TooltipContent, TooltipTrigger} from "@/components/ui/tooltip"
+import {formatDate} from "@/lib/date"
+import {Form} from "@/components/ui/form"
+import {CurrencyFormField} from "@/components/ui/form-elements"
+import {useForm} from "react-hook-form"
+import {Button} from "@/components/ui/button"
+import {useContext, useState} from "react"
+import {Separator} from "@/components/ui/separator"
+import {BankAccountBalance} from "@/types/Accounts/BankAccountBalance"
+import {Table, TableBody, TableCell, TableHead, TableHeader, TableRow} from "@/components/ui/table"
+import {toast} from "sonner"
 import ErrorBanner from "@/components/ui/error-banner"
-import { cn } from "@/lib/utils"
+import {cn} from "@/lib/utils"
 
 const BankBalance = () => {
 
@@ -34,9 +34,17 @@ const BankBalance = () => {
     if (!bankAccount) {
         return null
     }
+    /*
+     * The four balances were a `w-[80%]` wrapping flex row with `justify-between`, which is the one
+     * combination that guarantees a void: once the widest label pushed a stat onto a second line, the
+     * remaining items were shoved to opposite ends of an 800px row with nothing between them, and at
+     * 1920 the same rule spread four ~190px stats across a 1500px track. A grid removes the failure
+     * mode outright - equal tracks cannot be spread apart - and reflows on a breakpoint instead of on
+     * whatever the longest translated label happens to measure: two columns up to `xl`, four beyond it.
+     */
     return (
-        <div className="flex justify-between">
-            <div className="w-[80%] flex flex-wrap justify-between gap-2 pe-8 border-e-border border-e">
+        <div className="flex flex-wrap items-start justify-between gap-x-8 gap-y-4">
+            <div className="grid min-w-0 flex-1 grid-cols-2 gap-x-8 gap-y-3 border-e border-e-border pe-8 xl:grid-cols-4">
                 <OpeningBalance />
                 <ClosingBalance />
                 <ClosingBalanceAsPerStatement />
@@ -73,7 +81,7 @@ const ClosingBalance = () => {
                         <Info className="size-3.5 text-ink-gray-6 -mt-px" />
                     </HoverCardTrigger>
                     <HoverCardContent className="w-96" align="start" side="right">
-                        <H4 className="text-base">{_("Closing balance as per system")}</H4>
+                        <H2 className="text-base border-0 p-0">{_("Closing balance as per system")}</H2>
                         <Paragraph className="mt-2 text-p-sm">
                             {_("This is what the system expects the closing balance to be in your bank statement.")}
                             <br />
@@ -227,7 +235,13 @@ const ReconcileProgress = () => {
      * "not known" without asserting anything, and matches the four sibling balance stats.
      */
 
-    return <div className="w-[18%] flex flex-col gap-1 items-end">
+    /*
+     * A definite width rather than `w-[18%]`: as a percentage the bar measured 184px at 1024 (too
+     * narrow to read its own hint without wrapping) and 345px at 1920 (wider than it needs to be, and
+     * the source of the trailing gap the strip was criticised for). 16rem is enough for the bar plus
+     * "x / y reconciled" at every supported width.
+     */
+    return <div className="flex w-64 shrink-0 flex-col items-end gap-1">
         <div className="w-full">
             {isProgressUnknown
                 ? <Skeleton className="w-full h-5 rounded-sm" />
@@ -292,7 +306,7 @@ const ClosingBalanceAsPerStatement = () => {
                         </TooltipContent>
                     </Tooltip>
                 </DialogTrigger>
-                <DialogContent className="min-w-xl">
+                <DialogContent size="xl">
                     <ClosingBalanceForm
                         defaultBalance={data?.message?.balance ?? 0}
                         date={dates.toDate}

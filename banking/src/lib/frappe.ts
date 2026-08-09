@@ -106,6 +106,37 @@ export const getErrorMessages = (error?: FrappeError | null): ParsedErrorMessage
 
 }
 
+/**
+ * A refusal the CLIENT decided, shaped so it travels the same path as one the server decided.
+ *
+ * Almost every refusal in this app is the server's, and that is the right default - the server is the
+ * authority on whether an operation is allowed. But a small number are knowable here and are worth
+ * refusing here, because sending the request would produce a WORSE answer than not sending it: an empty
+ * statement file is the case this exists for. Frappe's own `File` insert reads the bytes off disk and
+ * raises `OSError` for a zero-byte upload, which reaches the browser as an HTTP 500 carrying a Python
+ * traceback and no import log - so the reviewer is shown a server crash for a mistake they could have
+ * been told about in a sentence, and there is no record left of the attempt.
+ *
+ * Built in `_server_messages` form on purpose, rather than as a new error shape. `getErrorMessages`
+ * reads that field first, so a refusal made here renders through the SAME parser, the SAME banner and
+ * the SAME dismissible dialog as a server refusal, carries a real title and severity, and persists and
+ * re-renders identically wherever a refusal is recorded. One error path, not two.
+ *
+ * `httpStatus` is deliberately absent and that is safe: the transport-failure branch of
+ * `getErrorMessages` is reached only when NO message could be parsed, and this always parses.
+ */
+export const makeClientRefusal = (message: string, title: string): FrappeError => ({
+    // A translated sentence and a translated title, as the reviewer will read them.
+    _server_messages: JSON.stringify([JSON.stringify({ message, title, indicator: 'red' })]),
+    /*
+     * Named as a client-side refusal rather than borrowed from Frappe's exception vocabulary. Nothing
+     * renders it - `exc_type` is not shown to the reviewer - but it is what a developer reading a
+     * console log or a persisted marker sees, and it should not claim the server said something.
+     */
+    exc_type: 'ClientValidationError',
+    message
+} as FrappeError)
+
 export const slug = (name?: string) => {
     return name?.toLowerCase().replace(/ /g, "-") ?? "";
 }

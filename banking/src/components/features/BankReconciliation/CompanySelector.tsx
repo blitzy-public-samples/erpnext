@@ -44,19 +44,27 @@ const CompanySelector = ({ onChange }: { onChange?: (company: string) => void })
 
     return (<Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
+            {/*
+                The name states the PURPOSE as well as the value. On its own the control announced only
+                "_Test Company, combo box" - the value with nothing to say what choosing a different one
+                would change, on a screen where a second combobox beside it announces a date range the
+                same way. The value is folded into the name because `aria-label` replaces an element's
+                text content in the name computation, so it has to carry both.
+            */}
             <Button
                 variant="outline"
                 type='button'
                 role="combobox"
                 size='md'
                 aria-expanded={open}
+                aria-label={_("Company: {0}", [selectedCompany ?? ''])}
                 className="justify-between"
             >
                 <div className="flex items-center gap-2">
-                    <Building2 />
+                    <Building2 aria-hidden="true" />
                     {selectedCompany}
                 </div>
-                <ChevronDown className="text-ink-gray-4" />
+                <ChevronDown aria-hidden="true" className="text-ink-gray-4" />
             </Button>
         </PopoverTrigger>
         <PopoverContent className="min-w-56 w-fit p-0">

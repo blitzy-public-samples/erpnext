@@ -46,6 +46,37 @@ interface FormElementProps {
 
 }
 
+type FormElementRules = FormElementProps["rules"]
+
+/**
+ * Makes `isRequired` mean required to the FORM as well as to the reader.
+ *
+ * `isRequired` and `rules` were two independent switches for one constraint: the flag drew the
+ * asterisk and set `aria-required`, while only a separate `rules={{ required: ... }}` actually stopped
+ * a submission. Seventeen fields across the modal forms set the flag and never set the rule, so they
+ * announced themselves as required, showed the asterisk, and then submitted empty - the Transfer
+ * modal's Posting Date, Reference Date, Reference, Paid From and Paid To among them. Nothing marked
+ * the control invalid and no message appeared, because react-hook-form had no rule to violate.
+ *
+ * Deriving the rule here rather than adding it at seventeen call sites is the point: it removes the
+ * possibility of the two drifting apart again, and it means a new field cannot be marked required
+ * without being validated.
+ *
+ * A caller's own `required` always wins, including `required: false`, so a field that is required in
+ * appearance but conditionally optional in validation remains expressible. The default message names
+ * the field, because `FormMessage` renders beside a control whose label may be `sr-only` - a bare
+ * "This field is required" would be ambiguous in a form of twelve inputs.
+ */
+const withRequiredRule = (
+    rules: FormElementRules,
+    label: string,
+    isRequired?: boolean,
+): FormElementRules => {
+    if (!isRequired) return rules
+    if (rules && "required" in rules) return rules
+    return { ...rules, required: _("{0} is required", [label]) }
+}
+
 interface DataFieldProps extends FormElementProps {
     inputProps?: Omit<ComponentProps<"input">, "value" | "onChange" | "onBlur" | "name" | "ref">
 }
@@ -57,7 +88,7 @@ export const DataField = ({ name, rules, label, isRequired, formDescription, inp
         control={control}
         disabled={disabled}
         name={name}
-        rules={rules}
+        rules={withRequiredRule(rules, label, isRequired)}
         render={({ field }) => (
             <FormItem className='flex flex-col'>
                 <FormLabel className={hideLabel ? 'sr-only' : ''}>{label}{isRequired && <FormRequiredIndicator />}</FormLabel>
@@ -83,12 +114,20 @@ export const SelectFormField = ({ name, rules, label, isRequired, formDescriptio
         control={control}
         name={name}
         disabled={disabled}
-        rules={rules}
+        rules={withRequiredRule(rules, label, isRequired)}
         render={({ field }) => (
             <FormItem>
                 <FormLabel className={hideLabel ? 'sr-only' : ''}>{label}{isRequired && <FormRequiredIndicator />}</FormLabel>
                 <FormControl>
-                    <Select onValueChange={field.onChange} value={field.value} disabled={disabled || readOnly} aria-readonly={readOnly}>
+                    {/*
+                        `?? ''` keeps the Select CONTROLLED from its first render. React Hook Form hands
+                        back `undefined` for a field with no default, and Radix's Select is controlled or
+                        not according to whether `value` is undefined - so the first real value flipped it
+                        from uncontrolled to controlled and React logged that as a warning. `''` is not a
+                        workaround: Radix's own placeholder test is `value === "" || value === undefined`,
+                        so the two are indistinguishable on screen and only one of them is stable.
+                    */}
+                    <Select onValueChange={field.onChange} value={field.value ?? ''} disabled={disabled || readOnly} aria-readonly={readOnly}>
                         <FormControl>
                             <SelectTrigger className="w-full" aria-required={isRequired || undefined}>
                                 <SelectValue />
@@ -200,7 +239,7 @@ export const DateField = ({ name, rules, label, isRequired, formDescription, inp
         control={control}
         name={name}
         disabled={disabled}
-        rules={rules}
+        rules={withRequiredRule(rules, label, isRequired)}
         render={({ field }) => (
             <FormItem className='flex flex-col'>
                 <FormLabel className={hideLabel ? 'sr-only' : ''}>{label}{isRequired && <FormRequiredIndicator />}</FormLabel>
@@ -224,7 +263,7 @@ export const SmallTextField = ({ name, rules, label, isRequired, formDescription
         control={control}
         name={name}
         disabled={disabled}
-        rules={rules}
+        rules={withRequiredRule(rules, label, isRequired)}
         render={({ field }) => (
             <FormItem className='flex flex-col'>
                 <FormLabel className={hideLabel ? 'sr-only' : ''}>{label}{isRequired && <FormRequiredIndicator />}</FormLabel>
@@ -249,7 +288,7 @@ export const AccountFormField = (props: AccountFormFieldProps) => {
         control={control}
         disabled={props.disabled}
         name={props.name}
-        rules={props.rules}
+        rules={withRequiredRule(props.rules, props.label, props.isRequired)}
         render={({ field }) => (
             <FormItem className='flex flex-col'>
                 <FormLabel className={props.hideLabel ? 'sr-only' : ''}>{props.label}{props.isRequired && <FormRequiredIndicator />}</FormLabel>
@@ -273,7 +312,7 @@ export const PartyTypeFormField = ({ name, rules, label, isRequired, formDescrip
         control={control}
         disabled={disabled}
         name={name}
-        rules={rules}
+        rules={withRequiredRule(rules, label, isRequired)}
         render={({ field }) => (
             <FormItem className='flex flex-col'>
                 <FormLabel className={hideLabel ? 'sr-only' : ''}>{label}{isRequired && <FormRequiredIndicator />}</FormLabel>
@@ -382,7 +421,7 @@ export const CurrencyFormField = ({ name, rules, label, isRequired, formDescript
         control={control}
         disabled={disabled}
         name={name}
-        rules={rules}
+        rules={withRequiredRule(rules, label, isRequired)}
         render={({ field }) => (
             <FormItem className='flex flex-col'>
                 <FormLabel className={hideLabel ? 'sr-only' : ''}>{label}{isRequired && <FormRequiredIndicator />}</FormLabel>
@@ -409,7 +448,7 @@ export const LinkFormField = ({ name, rules, label, isRequired, formDescription,
         control={control}
         name={name}
         disabled={disabled}
-        rules={rules}
+        rules={withRequiredRule(rules, label, isRequired)}
         render={({ field }) => (
             <FormItem className='flex flex-col'>
                 <FormLabel className={hideLabel ? 'sr-only' : ''}>{label}{isRequired && <FormRequiredIndicator />}</FormLabel>

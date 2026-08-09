@@ -247,7 +247,7 @@ const LinkFieldCombobox = ({
             "data-[state=open]:bg-surface-white data-[state=open]:border-outline-gray-4 data-[state=open]:shadow-sm",
             readOnly ? "bg-surface-gray-1" : "",
             // Placeholder and value styling
-            linkTitle ? "text-ink-gray-7" : "text-ink-gray-4",
+            linkTitle ? "text-ink-gray-7" : "text-ink-gray-5",
             buttonClassName)
     } as const
 
@@ -256,9 +256,25 @@ const LinkFieldCombobox = ({
             <PopoverTrigger asChild>
                 {useInForm ? <FormControl>
                     <Button {...buttonProps}>
-                        {linkTitle || placeholder}
+                        {/*
+                         * `truncate min-w-0` on the label and `shrink-0` on the icon cluster are load-bearing,
+                         * not cosmetic. The trigger is `w-full justify-between`, so it is a flex container whose
+                         * two children are this label and the icon cluster. A flex item's default `min-width` is
+                         * `auto`, which refuses to shrink below its content, and `Button` already sets
+                         * `whitespace-nowrap` - so a long value or placeholder could not wrap AND could not
+                         * shrink, and `justify-between` therefore pushed the icon cluster straight past the
+                         * button's right edge. Measured in the Record Payment dialog at a 768px viewport: the
+                         * chevron wrapper reported `right` 48px beyond its own parent button, clipping the
+                         * chevron at the dialog's padding edge and putting 24px of horizontal overflow into the
+                         * dialog's scroll container. `min-w-0` lets the label shrink, `truncate` ellipsises it
+                         * instead of overflowing, and `shrink-0` keeps the affordance itself at full size so the
+                         * chevron never becomes the thing that gets squeezed. `text-start` is needed because the
+                         * span becomes the flex item that the parent's `justify-between` positions, and without
+                         * it the ellipsised text would inherit the button's centring.
+                         */}
+                        <span className="truncate min-w-0 text-start">{linkTitle || placeholder}</span>
 
-                        <div className="flex items-center gap-1">
+                        <div className="flex items-center gap-1 shrink-0">
                             {value && <a href={`/desk/${slug(doctype)}/${value}`} target="_blank" className="group-hover:block hidden">
                                 <ExternalLink className="size-4 shrink-0 opacity-50" />
                             </a>}
@@ -267,8 +283,9 @@ const LinkFieldCombobox = ({
                     </Button>
                 </FormControl>
                     : <Button {...buttonProps}>
-                        {linkTitle || placeholder}
-                        <div className="flex items-center gap-1">
+                        {/* Same flex-shrink reasoning as the in-form branch above. */}
+                        <span className="truncate min-w-0 text-start">{linkTitle || placeholder}</span>
+                        <div className="flex items-center gap-1 shrink-0">
                             {value && <a href={`/desk/${slug(doctype)}/${value}`} target="_blank" className="group-hover:block hidden">
                                 <ExternalLink className="size-4 shrink-0 opacity-50" />
                             </a>}

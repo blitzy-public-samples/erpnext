@@ -313,4 +313,162 @@ describe('BankReconciliation page', () => {
 			expect(routes.some((route) => route.getAttribute('data-slot') === 'tooltip-trigger')).toBe(true)
 		})
 	})
+
+	/**
+	 * Structure and ARIA wiring of the page shell.
+	 *
+	 * Radix derives a tab's `aria-controls` and its panel's `aria-labelledby` from the tab's VALUE, and
+	 * the five values were display labels containing spaces - so `aria-controls` came out as
+	 * "radix-:r0:-content-Match and Reconcile". An ID reference list is space-separated, which made that
+	 * a list of FOUR ids, none of which existed, and the tab therefore pointed at nothing. The values are
+	 * now slugs and the visible labels are unchanged.
+	 */
+	describe('its accessibility structure', () => {
+
+		it('points every tab at a panel that actually exists', async () => {
+			renderPage()
+
+			await waitFor(() => {
+				expect(screen.getAllByRole('tab')).toHaveLength(5)
+			})
+
+			for (const tab of screen.getAllByRole('tab')) {
+				const controls = tab.getAttribute('aria-controls') ?? ''
+
+				// A single token: the moment it contains whitespace it is parsed as a list of ids.
+				expect(controls).not.toBe('')
+				expect(controls.trim().split(/\s+/)).toHaveLength(1)
+
+				/*
+				 * Radix mounts only the ACTIVE panel, so an inactive tab legitimately points at an id
+				 * that is not in the document yet - that is lazy rendering, not a dangling reference.
+				 * The active one must resolve.
+				 */
+				if (tab.getAttribute('aria-selected') === 'true') {
+					expect(document.getElementById(controls)).not.toBeNull()
+				}
+			}
+		})
+
+		it('keeps the visible tab labels the reviewer knows', async () => {
+			// The slug change is invisible: it moved the value, not the label.
+			renderPage()
+
+			await waitFor(() => {
+				expect(screen.getAllByRole('tab')).toHaveLength(5)
+			})
+
+			expect(screen.getAllByRole('tab').map((tab) => tab.textContent?.trim())).toEqual([
+				'Match and Reconcile',
+				'Bank Reconciliation Statement',
+				'Bank Transactions',
+				'Bank Clearance Summary',
+				'Incorrectly Cleared Entries'
+			])
+		})
+
+		it('wraps the page in a single main landmark with one level-one heading', async () => {
+			renderPage()
+
+			await waitFor(() => {
+				expect(screen.getAllByRole('tab')).toHaveLength(5)
+			})
+
+			expect(screen.getAllByRole('main')).toHaveLength(1)
+
+			const headings = screen.getAllByRole('heading', { level: 1 })
+			expect(headings).toHaveLength(1)
+			expect(headings[0]).toHaveTextContent('Bank Reconciliation')
+		})
+
+		it('names the breadcrumb home link, which was the first unnamed stop in the tab order', async () => {
+			renderPage()
+
+			await waitFor(() => {
+				expect(screen.getAllByRole('tab')).toHaveLength(5)
+			})
+
+			expect(screen.getByRole('link', { name: 'ERPNext home' })).toBeInTheDocument()
+		})
+
+		it('puts the site header in a banner landmark OUTSIDE main, so the skip link skips something', async () => {
+			/*
+			 * `header` only takes the `banner` role when it is not nested inside `main`. While `main`
+			 * wrapped the whole page there was no banner landmark at all, and the skip link - though it
+			 * moved focus correctly - skipped nothing: measured in the browser, the first Tab after
+			 * activating it was still the first header control. Both halves are asserted, because a banner
+			 * that is inside main satisfies the first and fails the second.
+			 */
+			renderPage()
+
+			await waitFor(() => {
+				expect(screen.getAllByRole('tab')).toHaveLength(5)
+			})
+
+			const banner = screen.getByRole('banner')
+			const main = screen.getByRole('main')
+
+			expect(main).not.toContainElement(banner)
+			expect(banner).toContainElement(screen.getByRole('link', { name: 'ERPNext home' }))
+			// The content the link jumps to is on the other side of the header.
+			expect(main).toContainElement(screen.getByRole('tab', { name: 'Match and Reconcile' }))
+		})
+
+		it('starts the heading outline at h1 and continues at h2, with nothing skipped', async () => {
+			/*
+			 * The page's only `h1` is its title, and every section heading under it used to be an `h4` -
+			 * so the outline jumped h1 to h4 with no h2 or h3 between, which is what both axe and
+			 * Lighthouse flagged and what a screen-reader user navigating by heading has to work with.
+			 */
+			renderPage()
+
+			await waitFor(() => {
+				expect(screen.getAllByRole('tab')).toHaveLength(5)
+			})
+
+			const levels = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6'))
+				.map((heading) => Number(heading.tagName.slice(1)))
+
+			expect(levels[0]).toBe(1)
+			// No step may increase by more than one.
+			for (let index = 1; index < levels.length; index += 1) {
+				expect(levels[index] - Math.min(...levels.slice(0, index))).toBeLessThanOrEqual(1)
+			}
+			expect(levels).not.toContain(4)
+		})
+
+		it('keeps the workbench visible at 200% zoom, by width and by pointer type', async () => {
+			/*
+			 * Browser zoom shrinks the CSS viewport - 1440px at 100% becomes 720px at 200% - so the
+			 * original `md` (768px) gate could not tell a phone from a zoomed desktop, and it chose
+			 * "phone": measured in the browser, the whole workbench went `display:none` at 200% and the
+			 * reviewer was shown "This screen is not supported on mobile devices.", with the last working
+			 * zoom being 187.5%.
+			 *
+			 * Two signals, because either alone leaves a hole. `sm` (640px) covers zoom by width for every
+			 * common desktop baseline (1280 -> 640, 1440 -> 720, 1920 -> 960) while keeping 360-430px
+			 * handsets below the breakpoint; `(pointer: fine)` covers a smaller desktop window or zoom past
+			 * 200%, where width alone would fall back to "phone". Asserted as classes because jsdom
+			 * evaluates no media query, and the browser check is recorded in the phase evidence.
+			 */
+			renderPage()
+
+			await waitFor(() => {
+				expect(screen.getAllByRole('tab')).toHaveLength(5)
+			})
+
+			const workbench = screen.getByRole('banner').parentElement as HTMLElement
+			expect(workbench.className).toContain('sm:flex')
+			expect(workbench.className).toContain('pointer-fine:flex')
+			// The 768px gate is what blocked 200% zoom from a 1440px baseline; it must not come back.
+			expect(workbench.className).not.toContain('md:flex')
+
+			const notice = screen.getByText('This screen is not supported on mobile devices.')
+				.closest('div.sm\\:hidden') as HTMLElement
+			expect(notice).not.toBeNull()
+			expect(notice.className).toContain('pointer-fine:hidden')
+			// Exact inverse of the gate above, so the two can never both show.
+			expect(notice.className).not.toContain('md:hidden')
+		})
+	})
 })

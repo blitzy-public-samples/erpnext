@@ -346,14 +346,54 @@ describe('BankPicker', () => {
 			expect(screen.getByTitle('Select Current')).toHaveAttribute('aria-pressed', 'false')
 		})
 
-		it('scrolls the selected card into view, because the strip starts at the far left', async () => {
-			/*
-			 * The selection is persisted, so a reload can restore an account sitting outside the strip's
-			 * visible scroll range - where it looked unselected.
-			 */
+		/**
+		 * The reveal scroll, and the guard in front of it.
+		 *
+		 * The scroll itself is needed: the selection is persisted, so a reload can restore an account
+		 * sitting outside the strip's visible scroll range, where it looked unselected.
+		 *
+		 * The guard is needed for a reason that has nothing to do with scrolling. Chrome moves the
+		 * document's sequential-focus-navigation starting point to the target of a programmatic
+		 * `scrollIntoView`, so calling it unconditionally on mount - which nearly always scrolled by zero
+		 * pixels - moved the first Tab press to just after the selected card. Measured in the browser: the
+		 * first Tab landed on the SECOND account card, skipping nine controls including the skip link and
+		 * the whole header toolbar, which left the skip link unreachable by the one gesture it exists for.
+		 *
+		 * So both branches are specified: scroll when the card is genuinely out of view, and do nothing at
+		 * all when it is already there.
+		 */
+		const stubStripGeometry = ({ cardVisible }: { cardVisible: boolean }) => {
+			const original = HTMLElement.prototype.getBoundingClientRect
+
+			HTMLElement.prototype.getBoundingClientRect = function () {
+				const isCard = this.getAttribute('role') === 'button'
+				const box = isCard
+					// A card either sits inside the strip's 0-1000 range, or well past its trailing edge.
+					? (cardVisible ? { left: 100, right: 340 } : { left: 1200, right: 1440 })
+					: { left: 0, right: 1000 }
+
+				return {
+					...box,
+					top: 0,
+					bottom: 100,
+					width: box.right - box.left,
+					height: 100,
+					x: box.left,
+					y: 0,
+					toJSON: () => ({})
+				} as DOMRect
+			}
+
+			return () => {
+				HTMLElement.prototype.getBoundingClientRect = original
+			}
+		}
+
+		it('scrolls the selected card into view when it sits outside the strip', async () => {
 			const scrollIntoView = vi.fn()
-			const original = HTMLElement.prototype.scrollIntoView
+			const originalScroll = HTMLElement.prototype.scrollIntoView
 			HTMLElement.prototype.scrollIntoView = scrollIntoView
+			const restoreGeometry = stubStripGeometry({ cardVisible: false })
 
 			try {
 				answerAccounts([
@@ -370,7 +410,31 @@ describe('BankPicker', () => {
 				// Only the selected card asks to be revealed.
 				expect(scrollIntoView).toHaveBeenCalledTimes(1)
 			} finally {
-				HTMLElement.prototype.scrollIntoView = original
+				restoreGeometry()
+				HTMLElement.prototype.scrollIntoView = originalScroll
+			}
+		})
+
+		it('does NOT scroll when the selected card is already in view, so the tab order is left alone', async () => {
+			const scrollIntoView = vi.fn()
+			const originalScroll = HTMLElement.prototype.scrollIntoView
+			HTMLElement.prototype.scrollIntoView = scrollIntoView
+			const restoreGeometry = stubStripGeometry({ cardVisible: true })
+
+			try {
+				answerAccounts([
+					bank({ name: 'Current', account_name: 'Current' }),
+					bank({ name: 'Savings', account_name: 'Savings' })
+				])
+
+				renderPicker(bank({ name: 'Savings', account_name: 'Savings' }))
+
+				await screen.findByTitle('Select Savings')
+				expect(screen.getByTitle('Select Savings')).toHaveAttribute('aria-pressed', 'true')
+				expect(scrollIntoView).not.toHaveBeenCalled()
+			} finally {
+				restoreGeometry()
+				HTMLElement.prototype.scrollIntoView = originalScroll
 			}
 		})
 	})
@@ -422,6 +486,24 @@ describe('BankPicker', () => {
 				.find(([method]) => method === BANK_ACCOUNTS)
 
 			expect(call?.[1]).toMatchObject({ company: TEST_COMPANY })
+		})
+
+		/*
+		 * The strip asks for accounts and NOTHING ELSE.
+		 *
+		 * Every card used to call `useGetUnreconciledTransactions()` for its `mutate` alone, which is a
+		 * query hook: calling it subscribes to the workbench's transaction key and therefore fetches it -
+		 * once per card. This strip is also mounted on the statement importer route, where that list is
+		 * never rendered, so merely opening the importer pulled roughly 40KB of transactions down several
+		 * times over to reach a function that only needed to invalidate a cache entry.
+		 */
+		it('issues no transaction query, because a card only needs to INVALIDATE one', () => {
+			renderPicker()
+
+			const transactionCalls = frappeSDKMock.useFrappeGetCall.mock.calls
+				.filter(([method]) => String(method).endsWith('get_bank_transactions'))
+
+			expect(transactionCalls).toHaveLength(0)
 		})
 
 		it('QUIRK - declares NO explicit cache key, so SWR derives one from the arguments', () => {

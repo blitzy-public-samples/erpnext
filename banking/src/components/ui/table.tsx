@@ -1,12 +1,54 @@
 import * as React from "react"
 
+import { useScrollOverflow } from "@/hooks/use-scroll-overflow"
+import _ from "@/lib/translate"
 import { cn } from "@/lib/utils"
 
-function Table({ className, containerClassName, ...props }: React.ComponentProps<"table"> & { containerClassName?: string }) {
+function Table({
+  className,
+  containerClassName,
+  containerLabel,
+  ...props
+}: React.ComponentProps<"table"> & {
+  containerClassName?: string
+  /**
+   * Accessible name for the scroll container, used only when the table actually overflows
+   * horizontally and the container therefore becomes a focusable scroll region.
+   */
+  containerLabel?: string
+}) {
+  /**
+   * Horizontal overflow is silent by default: overlay scrollbars are invisible at rest, so a wide
+   * table (the statement preview grid at narrow widths hides several hundred pixels of columns)
+   * looks complete while part of it is unreachable without a discovered gesture.
+   */
+  const { ref: containerRef, ...overflow } = useScrollOverflow<HTMLDivElement>()
+
   return (
     <div
+      ref={containerRef}
       data-slot="table-container"
-      className={cn("relative w-full overflow-x-auto rounded border-outline-gray-1 border", containerClassName)}
+      data-overflowing={overflow.overflows ? "" : undefined}
+      className={cn(
+        "relative w-full overflow-x-auto rounded border-outline-gray-1 border",
+        // Marks the edge that content disappears behind, so the truncation is visible at rest.
+        overflow.overflows && !overflow.atEnd && "ltr:border-r-2 rtl:border-l-2 border-r-outline-gray-3",
+        overflow.overflows && !overflow.atStart && "ltr:border-l-2 rtl:border-r-2 border-l-outline-gray-3",
+        containerClassName,
+      )}
+      /**
+       * A scrollable region needs to be operable from the keyboard, but only while it scrolls -
+       * an unconditional tab stop would add an interaction-free stop to every table that fits.
+       */
+      {...(overflow.overflows
+        ? {
+          role: "region",
+          tabIndex: 0,
+          "aria-label": containerLabel
+            ? _("{0} (scrollable)", [containerLabel])
+            : _("Scrollable table"),
+        }
+        : {})}
     >
       <table
         data-slot="table"

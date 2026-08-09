@@ -174,11 +174,13 @@ describe('RuleForm', () => {
 			// disabled rather than merely discouraged.
 			renderRuleForm()
 
-			const deletes = screen.getAllByRole('button', { name: '' })
-			const rowDelete = deletes.find((button) => button.hasAttribute('disabled'))
-
-			expect(rowDelete).toBeDefined()
-			expect(rowDelete).toBeDisabled()
+			/*
+			 * Addressed by name and by ordinal. The old query hunted through
+			 * `getAllByRole('button', { name: '' })` for whichever one happened to be disabled, so it
+			 * asserted nothing about WHICH control was disabled - and it only found anything at all
+			 * because these buttons were unnamed.
+			 */
+			expect(screen.getByRole('button', { name: 'Remove condition 1' })).toBeDisabled()
 		})
 
 		it('adds a further description condition on request', async () => {
@@ -206,11 +208,8 @@ describe('RuleForm', () => {
 
 			expect(screen.getAllByPlaceholderText('Bank Fee, Salary, etc.')).toHaveLength(2)
 
-			const rowDeletes = screen
-				.getAllByRole('button', { name: '' })
-				.filter((button) => !button.hasAttribute('disabled'))
-
-			await user.click(rowDeletes[rowDeletes.length - 1])
+			// The second condition's own remove control, named for its position in the list.
+			await user.click(screen.getByRole('button', { name: 'Remove condition 2' }))
 
 			await waitFor(() => {
 				expect(screen.getAllByPlaceholderText('Bank Fee, Salary, etc.')).toHaveLength(1)
@@ -281,7 +280,7 @@ describe('RuleForm', () => {
 			// The accessible name carries the required indicator - an asterisk for the eye and the word
 			// for a screen reader - and it must be anchored so that "Party Type*" in the same section is
 			// not matched instead.
-			expect(screen.getByLabelText(/^Party\* \(required\)$/)).toBeDisabled()
+			expect(screen.getByLabelText(/^Party\*, required$/)).toBeDisabled()
 		})
 
 		it('opens the party field once a party type names the doctype to search', () => {
@@ -296,7 +295,7 @@ describe('RuleForm', () => {
 			// stops advertising itself as required, because the search itself enforces the choice -
 			// which is why the asterisk that the disabled variant carries is absent here.
 			expect(screen.getByLabelText(/^Party$/)).toBeEnabled()
-			expect(screen.queryByLabelText(/^Party\* \(required\)$/)).not.toBeInTheDocument()
+			expect(screen.queryByLabelText(/^Party\*, required$/)).not.toBeInTheDocument()
 		})
 	})
 

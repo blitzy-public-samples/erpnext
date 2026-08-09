@@ -210,6 +210,64 @@ export const bankRecImportFailuresAtom = atomWithStorage<Record<string, FrappeEr
     { getOnInit: true }
 )
 
+/**
+ * A statement file whose UPLOAD was refused, before any `Bank Statement Import Log` came into being.
+ *
+ * Distinct from `bankRecImportFailuresAtom`, which is keyed by import-log name, because these refusals
+ * happen EARLIER than that: the framework's `File` insert can refuse the content, and the import log's
+ * own `before_insert` can fail to parse it, both before a name exists. There is no row to hang a marker
+ * from, so the file itself has to be the key.
+ */
+export interface BankRecUploadRefusal {
+    /** The file's name, as the reviewer chose it, so a refusal can be attributed to a file by sight. */
+    fileName: string
+    /** The rejection as it was received, so the server's own wording is what gets re-rendered. */
+    error: FrappeError
+    /** When it was refused, so several refusals can be ordered and the oldest retired. */
+    at: number
+}
+
+/**
+ * The identity of a chosen file, for keying a refusal against it.
+ *
+ * Name alone will not do: a reviewer whose statement was refused frequently corrects the file and
+ * uploads it again under the same name, and a marker keyed on the name alone would then be shown
+ * against the corrected file. Size and modification time change when the file does, so the corrected
+ * file is a different key and starts clean, while re-selecting the SAME unmodified file re-shows the
+ * refusal it already earned - which is the behaviour that makes the indicator durable rather than
+ * merely sticky.
+ */
+export const uploadRefusalKey = (file: { name: string, size: number, lastModified: number }) =>
+    `${file.name}::${file.size}::${file.lastModified}`
+
+/** How many refusals are kept. Enough to show a short history; bounded so storage cannot grow without end. */
+export const MAX_UPLOAD_REFUSALS = 5
+
+const uploadRefusalStorage = createJSONStorage<Record<string, BankRecUploadRefusal>>(() => sessionStorage, {
+    // Same traceback narrowing as the import-failure store above, and for the same reason. See there.
+    replacer: (key, value) => (key === 'exc' && typeof value === 'string' ? undefined : value)
+})
+
+/**
+ * Upload refusals observed in this sitting, keyed by {@link uploadRefusalKey}.
+ *
+ * PERSISTED for the same reason the import-failure map is: the server keeps no record of a refused
+ * upload - no import log was created, so there is nothing to re-read and nothing for a later load to
+ * correct - so if the marker does not survive, the only record that the file was refused is gone. It
+ * used to be component state cleared at the start of every attempt AND by choosing another file, which
+ * meant the reviewer could lose the answer to "which of these files failed" by doing the obvious next
+ * thing.
+ *
+ * `sessionStorage` and bounded to {@link MAX_UPLOAD_REFUSALS}, so it describes this sitting and cannot
+ * accumulate indefinitely.
+ */
+export const bankRecUploadRefusalsAtom = atomWithStorage<Record<string, BankRecUploadRefusal>>(
+    'bank-rec-upload-refusals',
+    {},
+    uploadRefusalStorage,
+    { getOnInit: true }
+)
+
 /** A refusal the reviewer has already been shown, kept so the reason outlives the dialog. */
 export interface BankRecRefusal {
     /** The rejection exactly as the SDK produced it, so the server's own wording can be re-rendered. */
@@ -230,3 +288,24 @@ export interface BankRecRefusal {
  * re-checked.
  */
 export const bankRecLastRefusalAtom = atom<BankRecRefusal | null>(null)
+
+/**
+ * The bank transaction whose reconciliation is CURRENTLY BEING POSTED, or null when none is.
+ *
+ * Shared deliberately, and this is the whole point of it. `useReconcileTransaction` wraps
+ * `useFrappePostCall`, whose `loading` flag belongs to the hook INSTANCE - and the hook is called
+ * inside each candidate voucher row, so every row got its own flag. Measured consequence: clicking
+ * Reconcile on one candidate disabled that one button and left every sibling candidate for the same
+ * transaction fully live for the whole round trip, so a second candidate could be posted against a
+ * transaction whose first post had not yet answered. The server rejects the second attempt - the
+ * already-reconciled guard is the first statement of the first method `reconcile_vouchers` reaches -
+ * so no double posting was ever possible; what the reviewer got instead was an avoidable refusal
+ * dialog for an action the interface had invited them to take.
+ *
+ * One atom, so every candidate row reads the same answer. It carries the transaction NAME rather than
+ * a boolean purely so the state is diagnosable - a stuck flag says which transaction it is stuck on.
+ *
+ * In memory only, and not persisted for the same reason a request cannot be: a reload has no request
+ * in flight, so a flag that survived one would disable Reconcile permanently with nothing to clear it.
+ */
+export const bankRecReconcileInFlightAtom = atom<string | null>(null)

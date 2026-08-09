@@ -159,7 +159,21 @@ function TabsContent({
   return (
     <TabsPrimitive.Content
       data-slot="tabs-content"
-      className={cn("flex-1 outline-none group-data-[orientation=vertical]/tabs:px-2 group-data-[orientation=horizontal]/tabs:py-2 group-data-[orientation=vertical]/tabs:h-full", className)}
+      /*
+       * Radix places `tabindex="0"` on the active panel (the APG pattern), which makes it a stop in
+       * the tab sequence - and `outline-none` left that stop unmarked. The indicator is drawn as an
+       * *inset* outline so it cannot be clipped by the panel's own overflow or spill over a
+       * neighbour, and only on `focus-visible` so a pointer user never sees it.
+       *
+       * `focus-visible:outline-solid` is load-bearing and is NOT redundant with `outline-2`. Tailwind
+       * declares `--tw-outline-style` with an initial value of `solid` and compiles every
+       * `outline-<width>` utility to `outline-style: var(--tw-outline-style)`, while `outline-none`
+       * sets that variable to `none`. So the base `outline-none` here silences the variant's own
+       * width and colour: measured in the browser, this panel reported `outline-style: none` beside
+       * `outline-width: 2px` and painted ZERO pixels of the declared colour along the entire ring.
+       * Restoring the variable on focus is what makes the ring real.
+       */
+      className={cn("flex-1 outline-none focus-visible:outline-2 focus-visible:outline-solid focus-visible:-outline-offset-2 focus-visible:outline-outline-gray-5 group-data-[orientation=vertical]/tabs:px-2 group-data-[orientation=horizontal]/tabs:py-2 group-data-[orientation=vertical]/tabs:h-full", className)}
       {...props}
     />
   )

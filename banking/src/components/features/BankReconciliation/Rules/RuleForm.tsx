@@ -1,25 +1,25 @@
-import { Button } from "@/components/ui/button"
-import { Checkbox } from "@/components/ui/checkbox"
-import { Dialog, DialogTitle, DialogContent, DialogHeader, DialogDescription } from "@/components/ui/dialog"
-import { FormField, FormItem, FormLabel, FormControl } from "@/components/ui/form"
-import { AccountFormField, CurrencyFormField, DataField, LinkFormField, PartyTypeFormField, SelectFormField, SmallTextField } from "@/components/ui/form-elements"
-import { Label } from "@/components/ui/label"
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
-import { SelectItem } from "@/components/ui/select"
-import { Separator } from "@/components/ui/separator"
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { H4, Paragraph } from "@/components/ui/typography"
-import { today } from "@/lib/date"
-import { evaluateAmountFormula } from "@/lib/amountFormula"
+import {Button} from "@/components/ui/button"
+import {Checkbox} from "@/components/ui/checkbox"
+import {Dialog, DialogTitle, DialogContent, DialogHeader, DialogDescription} from "@/components/ui/dialog"
+import {FormField, FormItem, FormLabel, FormControl} from "@/components/ui/form"
+import {AccountFormField, CurrencyFormField, DataField, LinkFormField, PartyTypeFormField, SelectFormField, SmallTextField} from "@/components/ui/form-elements"
+import {Label} from "@/components/ui/label"
+import {RadioGroup, RadioGroupItem} from "@/components/ui/radio-group"
+import {SelectItem} from "@/components/ui/select"
+import {Separator} from "@/components/ui/separator"
+import {Table, TableBody, TableCell, TableHead, TableHeader, TableRow} from "@/components/ui/table"
+import {Tooltip, TooltipContent, TooltipTrigger} from "@/components/ui/tooltip"
+import { H2, Paragraph } from "@/components/ui/typography"
+import {today} from "@/lib/date"
+import {evaluateAmountFormula} from "@/lib/amountFormula"
 import _ from "@/lib/translate"
-import { cn } from "@/lib/utils"
-import { BankTransactionRule } from "@/types/Accounts/BankTransactionRule"
-import { BankTransactionRuleAccounts } from "@/types/Accounts/BankTransactionRuleAccounts"
-import { FrappeConfig, FrappeContext } from "frappe-react-sdk"
-import { ArrowDownRight, ArrowDownUp, ArrowRightLeftIcon, ArrowUpRight, LandmarkIcon, Plus, PlusCircleIcon, ReceiptIcon, Settings, Trash2 } from "lucide-react"
-import { ChangeEvent, useCallback, useContext, useMemo, useRef, useState } from "react"
-import { useFieldArray, useFormContext, useWatch } from "react-hook-form"
+import {cn} from "@/lib/utils"
+import {BankTransactionRule} from "@/types/Accounts/BankTransactionRule"
+import {BankTransactionRuleAccounts} from "@/types/Accounts/BankTransactionRuleAccounts"
+import {FrappeConfig, FrappeContext} from "frappe-react-sdk"
+import {ArrowDownRight, ArrowDownUp, ArrowRightLeftIcon, ArrowUpRight, LandmarkIcon, Plus, PlusCircleIcon, ReceiptIcon, Settings, Trash2} from "lucide-react"
+import {ChangeEvent, useCallback, useContext, useMemo, useRef, useState} from "react"
+import {useFieldArray, useFormContext, useWatch} from "react-hook-form"
 
 export const RuleForm = ({ isEdit = false }: { isEdit?: boolean }) => {
 
@@ -225,8 +225,12 @@ const DescriptionRules = () => {
                         />
                     </div>
                     <div>
-                        <Button variant="ghost" theme='red' type='button' isIconButton onClick={() => remove(index)} disabled={fields.length === 1}>
-                            <Trash2 />
+                        {/* Numbered, because the form repeats this control once per condition and every
+                            instance otherwise announces itself identically. */}
+                        <Button variant="ghost" theme='red' type='button' isIconButton
+                            aria-label={_("Remove condition {0}", [(index + 1).toString()])}
+                            onClick={() => remove(index)} disabled={fields.length === 1}>
+                            <Trash2 aria-hidden="true" />
                         </Button>
                     </div>
                 </div>
@@ -266,7 +270,7 @@ const RuleAction = () => {
 
     return (
         <div className="flex flex-col gap-4">
-            <H4 className="text-base text-ink-gray-7">{_("If rule matches, then:")}</H4>
+            <H2 className="text-base text-ink-gray-7 border-0 p-0">{_("If rule matches, then:")}</H2>
 
             <SelectFormField
                 name='classify_as'
@@ -491,7 +495,7 @@ const ConfigureAccountsModal = ({ open, onClose }: { open: boolean, onClose: () 
         open={open}
         onOpenChange={onClose}
     >
-        <DialogContent className='min-w-[95vw]'>
+        <DialogContent size='wide'>
             <ConfigureAccountsModalContent />
         </DialogContent>
     </Dialog>
@@ -747,7 +751,7 @@ const ConfigureAccountsModalContent = () => {
             </div>
 
             <div className="flex flex-col gap-2">
-                <H4 className="text-base text-ink-gray-7">{_("Help")}</H4>
+                <H2 className="text-base text-ink-gray-7 border-0 p-0">{_("Help")}</H2>
 
                 <Paragraph className="text-p-sm">{(_("You can set up the rule to split the transaction across multiple accounts."))}
                     <br />{_("You can also add credit or debit values to pre-fill - these support both static values (like 200) or formulas (like transaction_amount * 0.25).")}

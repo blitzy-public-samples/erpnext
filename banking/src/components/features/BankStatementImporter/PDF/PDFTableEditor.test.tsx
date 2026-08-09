@@ -240,11 +240,16 @@ describe('PDFTableEditor', () => {
 			expect(screen.getByText('Page 1 of 2')).toBeInTheDocument()
 		})
 
+		/*
+		 * These three cases used to resolve the pager by INDEX into
+		 * `getAllByRole('button', { name: '' })` - a query that could only match because both arrows
+		 * were unnamed, and that would have started clicking the wrong control the moment any other
+		 * unnamed button appeared. The arrows now carry names, so they are addressed by name.
+		 */
 		it('cannot page back from the first page', () => {
 			renderEditor(makeDetails({ pdf_tables: [makePDFTable(), SECOND_PAGE_TABLE] }))
 
-			const [back] = screen.getAllByRole('button', { name: '' })
-			expect(back).toBeDisabled()
+			expect(screen.getByRole('button', { name: 'Previous page' })).toBeDisabled()
 		})
 
 		it('moves to the next page and back again', async () => {
@@ -252,14 +257,11 @@ describe('PDFTableEditor', () => {
 				makeDetails({ pdf_tables: [makePDFTable(), SECOND_PAGE_TABLE] })
 			)
 
-			const iconButtons = screen.getAllByRole('button', { name: '' })
-			const forward = iconButtons[1]
-
-			await user.click(forward)
+			await user.click(screen.getByRole('button', { name: 'Next page' }))
 
 			expect(await screen.findByText('Page 2 of 2')).toBeInTheDocument()
 
-			await user.click(screen.getAllByRole('button', { name: '' })[0])
+			await user.click(screen.getByRole('button', { name: 'Previous page' }))
 
 			expect(await screen.findByText('Page 1 of 2')).toBeInTheDocument()
 		})
@@ -269,10 +271,10 @@ describe('PDFTableEditor', () => {
 				makeDetails({ pdf_tables: [makePDFTable(), SECOND_PAGE_TABLE] })
 			)
 
-			await user.click(screen.getAllByRole('button', { name: '' })[1])
+			await user.click(screen.getByRole('button', { name: 'Next page' }))
 			await screen.findByText('Page 2 of 2')
 
-			expect(screen.getAllByRole('button', { name: '' })[1]).toBeDisabled()
+			expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled()
 		})
 	})
 
